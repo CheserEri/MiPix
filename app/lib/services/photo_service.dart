@@ -1,0 +1,546 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:path_provider/path_provider.dart';
+import 'package:photo_manager/photo_manager.dart';
+
+import '../models/models.dart';
+
+/// 本地媒体库的访问状态。
+enum LocalAccess {
+  /// 完全授权。
+  authorized,
+
+  /// 部分授权（Android 14+ 用户仅选择了部分照片）。
+  limited,
+
+  /// 未授权 / 被用户拒绝。
+  denied,
+
+  /// 被系统限制（如家长控制），用户无法自行修改。
+  restricted,
+}
+
+/// 扩展：是否可读取资源。
+extension LocalAccessX on LocalAccess {
+  bool get canRead =>
+      this == LocalAccess.authorized || this == LocalAccess.limited;
+}
+
+/// 系统相册中的虚拟相册 id（MediaStore 里并不存在对应的 bucket）。
+///
+/// 与 MIUI 相册的「系统相册」区保持一致：全部照片 / 视频 / 截屏录屏。
+class SystemAlbum {
+  static const String all = 'sys:all';
+  static const String videos = 'sys:videos';
+  static const String screenshots = 'sys:screens';
+
+  const SystemAlbum._();
+}
+
+/// 本地媒体库分组视图，对齐 MIUI 相册的三段结构。
+class LocalLibraryView {
+  /// 系统相册：全部照片 / 相机 / 视频 / 截屏录屏。
+  final List<Album> system;
+
+  /// 我的相册：位于 `Pictures/Gallery/` 下的相册。
+  final List<Album> mine;
+
+  /// 更多相册：其余目录（DCIM/Download/Pictures 等）。
+  final List<Album> more;
+
+  const LocalLibraryView({
+    required this.system,
+    required this.mine,
+    required this.more,
+  });
+
+  bool get isEmpty => system.isEmpty && mine.isEmpty && more.isEmpty;
+}
+
+/// 本地相册 / 照片的读取与写入。
+///
+/// 设计目标：与 MIUI 系统相册保持一致
+///  * 只返回真实的相册目录，不合成"全部 / 最近"相册；
+///  * 读取类型为 [RequestType.common]（图片 + 视频），数量与系统相册一致；
+///  * 相册按"最近一张照片的时间"倒序排列；
+///  * 相册内资源按创建时间倒序（最新在前）。
+class PhotoService {
+  PhotoService._();
+
+  /// 统一排序：创建时间倒序。
+  static final FilterOptionGroup _descOrder = FilterOptionGroup(
+    orders: const [OrderOption(type: OrderOptionType.createDate, asc: false)],
+  );
+
+  /// 请求（必要时弹出系统授权对话框）并返回媒体访问状态。
+  static Future<LocalAccess> ensurePermission() async {
+    final PermissionState state = await PhotoManager.requestPermissionExtend();
+    switch (state) {
+      case PermissionState.authorized:
+        return LocalAccess.authorized;
+      case PermissionState.limited:
+        return LocalAccess.limited;
+      case PermissionState.restricted:
+        return LocalAccess.restricted;
+      case PermissionState.notDetermined:
+      case PermissionState.denied:
+        return LocalAccess.denied;
+    }
+  }
+
+  /// 是否能读到任意一张图片。
+  ///
+  /// MIUI 上存在"显示已授权、实际读不到任何资源"的情况（用户授予了空白权限），
+  /// 借助该检查可以识别并引导用户到系统设置中重新授权。
+  static Future<bool> hasAnyAsset() async {
+    try {
+      final paths = await PhotoManager.getAssetPathList(
+        type: RequestType.common,
+        hasAll: true,
+        onlyAll: true,
+      );
+      if (paths.isEmpty) return false;
+      return await paths.first.assetCountAsync > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 跳转到系统的应用权限设置页。
+  static Future<void> openSettings() => PhotoManager.openSetting();
+
+  /// 读取本地媒体库，并按 MIUI 相册的结构分为「系统 / 我的 / 更多」三组。
+  static Future<LocalLibraryView> getLocalLibrary() async {
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.common,
+      hasAll: false,
+      filterOption: _descOrder,
+    );
+
+    Album? cameraAlbum;
+    final screenshotAlbums = <Album>[];
+    final mineEntries = <({Album album, DateTime? at})>[];
+    final moreEntries = <({Album album, DateTime? at})>[];
+
+    for (final path in paths) {
+      final name = path.name.trim();
+      // 跳过没有名字的桶（例如根目录 / 或 bucket_display_name 为空的项）。
+      if (name.isEmpty) continue;
+
+      final count = await path.assetCountAsync;
+      if (count <= 0) continue;
+
+      String? coverPath;
+      DateTime? latestAt;
+      String? relativePath;
+      final assets = await path.getAssetListRange(start: 0, end: 1);
+      if (assets.isNotEmpty) {
+        final asset = assets.first;
+        latestAt = asset.modifiedDateTime;
+        relativePath = asset.relativePath;
+        final file = await _resolveFile(asset);
+        coverPath = file?.path;
+      }
+
+      final rawName = name.toLowerCase();
+      final album = Album(
+        id: path.id,
+        name: _displayName(name),
+        source: MediaSource.local(),
+        coverPath: coverPath,
+        count: count,
+      );
+
+      if (rawName == 'camera') {
+        // 相机归入「系统相册」并本地化名称。
+        cameraAlbum = album;
+      } else if (rawName == 'screenshots' ||
+          rawName == 'screenrecorder' ||
+          _isScreenshotPath(relativePath)) {
+        // 截屏与录屏在 MIUI 中合并为一个"截屏录屏"相册。
+        screenshotAlbums.add(album);
+      } else if (_isMinePath(relativePath)) {
+        mineEntries.add((album: album, at: latestAt));
+      } else {
+        moreEntries.add((album: album, at: latestAt));
+      }
+    }
+
+    final system = await _buildSystemAlbums(cameraAlbum, screenshotAlbums);
+    return LocalLibraryView(
+      system: system,
+      mine: _sortedAlbums(mineEntries),
+      more: _sortedAlbums(moreEntries),
+    );
+  }
+
+  /// 读取某个相册下的资源，按时间倒序分页。
+  static Future<List<MediaItem>> getMediaItems(
+    String albumId, {
+    int page = 0,
+    int pageSize = 200,
+  }) async {
+    if (pageSize <= 0) return [];
+
+    switch (albumId) {
+      case SystemAlbum.all:
+        return _allMedia(RequestType.common, count: (page + 1) * pageSize);
+      case SystemAlbum.videos:
+        return _toMediaItems(await _videoAssets((page + 1) * pageSize));
+      case SystemAlbum.screenshots:
+        // 截屏录屏合并自 Screenshots + ScreenRecorder 两个桶。
+        return _allMedia(
+          RequestType.common,
+          count: 2000,
+          filter: _isScreenshotPath,
+        );
+    }
+
+    final path = await AssetPathEntity.fromId(
+      albumId,
+      filterOption: _descOrder,
+    );
+    final assets = await path.getAssetListPaged(page: page, size: pageSize);
+    return _toMediaItems(assets);
+  }
+
+  /// 读取"所有照片"（含视频），按时间倒序。
+  static Future<List<MediaItem>> getRecentPhotos({int count = 500}) async {
+    if (count <= 0) return [];
+    return _allMedia(RequestType.common, count: count);
+  }
+
+  /// 把磁盘上的文件写入系统相册（写入 MediaStore），使 MIUI 相册也能看到。
+  ///
+  /// [relativePath] 形如 `Pictures/MiPix`；不传则使用系统默认目录。
+  static Future<MediaItem?> saveFileToGallery({
+    required String filePath,
+    String? relativePath,
+  }) async {
+    final asset = await PhotoManager.editor.saveImageWithPath(
+      filePath,
+      relativePath: relativePath,
+    );
+    return _toMediaItem(asset);
+  }
+
+  /// 把内存中的图片写入系统相册（写入 MediaStore）。
+  ///
+  /// [filename] 需要带扩展名以便推断 MIME 类型。
+  static Future<MediaItem?> saveBytesToGallery(
+    Uint8List data, {
+    required String filename,
+    String? relativePath,
+  }) async {
+    final asset = await PhotoManager.editor.saveImage(
+      data,
+      filename: filename,
+      relativePath: relativePath,
+    );
+    return _toMediaItem(asset);
+  }
+
+  /// 组装「系统相册」区：全部照片 / 相机 / 视频 / 截屏录屏。
+  static Future<List<Album>> _buildSystemAlbums(
+    Album? cameraAlbum,
+    List<Album> screenshotAlbums,
+  ) async {
+    final albums = <Album>[];
+
+    final allPath = await _allPath(RequestType.common);
+    if (allPath != null) {
+      final count = await allPath.assetCountAsync;
+      if (count > 0) {
+        albums.add(Album(
+          id: SystemAlbum.all,
+          name: '全部照片',
+          source: MediaSource.local(),
+          coverPath: await _coverPath(allPath),
+          count: count,
+        ));
+      }
+    }
+
+    if (cameraAlbum != null) albums.add(cameraAlbum);
+
+    // 视频相册：与 MIUI 保持一致地保留该入口。
+    // 注意：部分 MIUI 版本并不提供「全部视频」虚拟相册（或计数恒为 0），
+    // 因此计数改为「虚拟相册优先、回退遍历所有视频目录」。
+    final videoCount = await _videoCount();
+    albums.add(Album(
+      id: SystemAlbum.videos,
+      name: '视频',
+      source: MediaSource.local(),
+      coverPath: await _videoCoverPath(),
+      count: videoCount,
+    ));
+
+    final screensCount =
+        screenshotAlbums.fold<int>(0, (sum, a) => sum + a.count);
+    if (screensCount > 0) {
+      albums.add(Album(
+        id: SystemAlbum.screenshots,
+        name: '截屏录屏',
+        source: MediaSource.local(),
+        coverPath: screenshotAlbums.first.coverPath,
+        count: screensCount,
+      ));
+    }
+
+    return albums;
+  }
+
+  static Future<AssetPathEntity?> _allPath(RequestType type) async {
+    final paths = await PhotoManager.getAssetPathList(
+      type: type,
+      hasAll: true,
+      onlyAll: true,
+      filterOption: _descOrder,
+    );
+    return paths.isEmpty ? null : paths.first;
+  }
+
+  /// 视频总数：先试「全部视频」虚拟相册，读不到时遍历所有视频目录求和。
+  static Future<int> _videoCount() async {
+    final allPath = await _allPath(RequestType.video);
+    if (allPath != null) {
+      final count = await allPath.assetCountAsync;
+      if (count > 0) return count;
+    }
+    final buckets = await PhotoManager.getAssetPathList(
+      type: RequestType.video,
+      hasAll: false,
+      filterOption: _descOrder,
+    );
+    var total = 0;
+    for (final bucket in buckets) {
+      total += await bucket.assetCountAsync;
+    }
+    return total;
+  }
+
+  /// 取视频资源（时间倒序）：同样优先虚拟相册，为空则合并所有视频目录。
+  static Future<List<AssetEntity>> _videoAssets(int count) async {
+    if (count <= 0) return [];
+
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.video,
+      hasAll: true,
+      onlyAll: true,
+      filterOption: _descOrder,
+    );
+    if (paths.isNotEmpty) {
+      final assets = await paths.first.getAssetListRange(start: 0, end: count);
+      if (assets.isNotEmpty) return assets;
+    }
+
+    final buckets = await PhotoManager.getAssetPathList(
+      type: RequestType.video,
+      hasAll: false,
+      filterOption: _descOrder,
+    );
+    final merged = <AssetEntity>[];
+    for (final bucket in buckets) {
+      merged.addAll(await bucket.getAssetListRange(start: 0, end: count));
+    }
+    merged.sort((a, b) => b.createDateTime.compareTo(a.createDateTime));
+    return merged.length > count ? merged.sublist(0, count) : merged;
+  }
+
+  /// 视频相册封面：取最新一个视频的首帧缩略图，缓存到应用临时目录。
+  ///
+  /// 视频文件本身无法直接被 Image 渲染，因此需要先用 photo_manager
+  /// 抽帧并落盘成一张图片，再作为相册封面路径返回。
+  static Future<String?> _videoCoverPath() async {
+    final assets = await _videoAssets(1);
+    if (assets.isEmpty) return null;
+
+    final asset = assets.first;
+    try {
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/mipix_video_cover_${asset.id}.jpg');
+      if (await file.exists() && await file.length() > 0) return file.path;
+
+      final data = await asset.thumbnailDataWithSize(
+        const ThumbnailSize(512, 512),
+        quality: 85,
+      );
+      if (data == null || data.isEmpty) return null;
+      await file.writeAsBytes(data, flush: true);
+      return file.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<String?> _coverPath(AssetPathEntity path) async {
+    final assets = await path.getAssetListRange(start: 0, end: 1);
+    if (assets.isEmpty) return null;
+    if (assets.first.type == AssetType.video) return null;
+    final file = await _resolveFile(assets.first);
+    return file?.path;
+  }
+
+  static Future<List<MediaItem>> _allMedia(
+    RequestType type, {
+    required int count,
+    bool Function(String?)? filter,
+  }) async {
+    final paths = await PhotoManager.getAssetPathList(
+      type: type,
+      hasAll: true,
+      onlyAll: true,
+      filterOption: _descOrder,
+    );
+    if (paths.isEmpty) return [];
+
+    final assets = await paths.first.getAssetListRange(start: 0, end: count);
+    if (filter == null) return _toMediaItems(assets);
+
+    final items = <MediaItem>[];
+    for (final asset in assets) {
+      if (!filter(asset.relativePath)) continue;
+      final item = await _toMediaItem(asset);
+      if (item != null) items.add(item);
+    }
+    return items;
+  }
+
+  static List<Album> _sortedAlbums(
+      List<({Album album, DateTime? at})> entries) {
+    // 与系统相册一致：最近有更新的相册排在前面。
+    entries.sort((a, b) {
+      final x = a.at;
+      final y = b.at;
+      if (x == null && y == null) return b.album.count.compareTo(a.album.count);
+      if (x == null) return 1;
+      if (y == null) return -1;
+      return y.compareTo(x);
+    });
+    return entries.map((e) => e.album).toList();
+  }
+
+  /// 相册名本地化，与 MIUI 相册显示一致。
+  static String _displayName(String raw) {
+    switch (raw.toLowerCase()) {
+      case 'camera':
+        return '相机';
+      case 'screenshots':
+      case 'screenrecorder':
+        return '截屏录屏';
+      case 'weixin':
+      case 'wechat':
+        return '微信';
+      default:
+        return raw;
+    }
+  }
+
+  /// 我的相册：位于 Pictures/Gallery/ 下的目录。
+  static bool _isMinePath(String? relativePath) {
+    if (relativePath == null) return false;
+    final r = relativePath.toLowerCase();
+    return r.startsWith('pictures/gallery/') || r == 'pictures/gallery';
+  }
+
+  /// 截屏 / 录屏目录。
+  static bool _isScreenshotPath(String? relativePath) {
+    if (relativePath == null) return false;
+    final r = relativePath.toLowerCase();
+    return r.startsWith('dcim/screenshots') ||
+        r.startsWith('dcim/screenrecorder');
+  }
+
+  static Future<List<MediaItem>> _toMediaItems(List<AssetEntity> assets) async {
+    final items = <MediaItem>[];
+    for (final asset in assets) {
+      final item = await _toMediaItem(asset);
+      if (item != null) items.add(item);
+    }
+    return items;
+  }
+
+  static Future<MediaItem?> _toMediaItem(AssetEntity asset) async {
+    final path = await _resolvePath(asset);
+    if (path == null) return null;
+
+    int bytes = 0;
+    try {
+      bytes = await File(path).length();
+    } catch (_) {
+      bytes = 0;
+    }
+
+    final size = asset.size;
+    return MediaItem(
+      id: asset.id,
+      name: (asset.title != null && asset.title!.isNotEmpty)
+          ? asset.title!
+          : path.split(Platform.pathSeparator).last,
+      path: path,
+      source: MediaSource.local(),
+      mimeType: asset.mimeType ?? 'image/jpeg',
+      size: bytes,
+      width: size.width.toInt(),
+      height: size.height.toInt(),
+      modifiedAt: asset.modifiedDateTime,
+    );
+  }
+
+  /// Android 主存储根目录，用于把相册相对路径拼成绝对路径。
+  static const String _primaryStorageRoot = '/storage/emulated/0';
+
+  /// 解析资源在磁盘上的绝对路径。
+  ///
+  /// 优先用 `relativePath` + `title` 直接拼出路径：photo_manager 的
+  /// `AssetEntity.file` 每张都要单独向 MediaStore 查一次记录，逐张解析
+  /// 几百张照片会让首屏多等好几秒。拼接结果不存在时（例如外置存储卡）
+  /// 再回退到 `asset.file`。
+  static Future<String?> _resolvePath(AssetEntity asset) async {
+    final direct = _directPath(asset);
+    if (direct != null) {
+      try {
+        if (File(direct).existsSync()) return direct;
+      } catch (_) {
+        // 忽略，继续回退。
+      }
+    }
+    final file = await _resolveFile(asset);
+    return file?.path;
+  }
+
+  /// 由 `relativePath` 与 `title`（Android 上为 DISPLAY_NAME）拼出绝对路径。
+  ///
+  /// * Android 10+：`relativePath` 形如 `DCIM/Camera/`；
+  /// * Android 9 及以下：`relativePath` 是 `_data` 的父目录，本身已带盘符。
+  static String? _directPath(AssetEntity asset) {
+    final rel = asset.relativePath;
+    final title = asset.title;
+    if (rel == null || rel.isEmpty || title == null || title.isEmpty) {
+      return null;
+    }
+    if (rel.startsWith('/')) {
+      return rel.endsWith('/') ? '$rel$title' : '$rel/$title';
+    }
+    final dir = rel.endsWith('/') ? rel : '$rel/';
+    return '$_primaryStorageRoot/$dir$title';
+  }
+
+  /// 获取资源的真实文件路径，优先使用可直接显示的文件，失败时回退到原图。
+  static Future<File?> _resolveFile(AssetEntity asset) async {
+    try {
+      final file = await asset.file;
+      if (file != null && file.path.isNotEmpty) return file;
+    } catch (_) {
+      // 忽略，继续尝试 originFile。
+    }
+    try {
+      final origin = await asset.originFile;
+      if (origin != null && origin.path.isNotEmpty) return origin;
+    } catch (_) {
+      // 忽略。
+    }
+    return null;
+  }
+}
