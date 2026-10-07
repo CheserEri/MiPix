@@ -1,0 +1,98 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </linearGradient>
+    <linearGradient id="g_body" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#EEF7FD" stop-opacity="0.97"/>
+      <stop offset="35%" stop-color="#C2DFF5" stop-opacity="0.82"/>
+      <stop offset="100%" stop-color="#7BB8E0" stop-opacity="0.65"/>
+    </linearGradient>
+    <radialGradient id="g_lens" cx="38%" cy="32%" r="60%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.90"/>
+      <stop offset="30%" stop-color="#D8EEFA" stop-opacity="0.70"/>
+      <stop offset="70%" stop-color="#6AACD8" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#2A72A8" stop-opacity="0.75"/>
+    </radialGradient>
+    <radialGradient id="g_rim" cx="40%" cy="30%" r="65%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#4A8EC0" stop-opacity="0.9"/>
+    </radialGradient>
+    <linearGradient id="g_top" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#B8D9F2" stop-opacity="0.60"/>
+    </linearGradient>
+    <linearGradient id="g_side" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#5A9DC8" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#3378A8" stop-opacity="0.95"/>
+    </linearGradient>
+    <linearGradient id="g_bot" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7BB8E0" stop-opacity="0.70"/>
+      <stop offset="100%" stop-color="#2A5F8A" stop-opacity="0.90"/>
+    </linearGradient>
+    <linearGradient id="g_net" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#78C4F0" stop-opacity="0.0"/>
+      <stop offset="50%" stop-color="#78C4F0" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#78C4F0" stop-opacity="0.0"/>
+    </linearGradient>
+    <linearGradient id="g_refract" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.0"/>
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.0"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="28" stdDeviation="30" flood-color="#12324A" flood-opacity="0.38"/>
+    </filter>
+    <clipPath id="front_clip">
+      <rect x="292" y="356" width="316" height="226" rx="18"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1024" height="1024" rx="240" fill="url(#bg)"/>
+
+  <g opacity="0.95">
+    <path d="M 400 280 Q 512 214 624 280" fill="none" stroke="url(#g_net)" stroke-width="16" stroke-linecap="round"/>
+    <path d="M 372 252 Q 512 170 652 252" fill="none" stroke="url(#g_net)" stroke-width="12" stroke-linecap="round" opacity="0.7"/>
+    <path d="M 346 220 Q 512 122 678 220" fill="none" stroke="url(#g_net)" stroke-width="8" stroke-linecap="round" opacity="0.45"/>
+    <circle cx="512" cy="194" r="11" fill="#78C4F0" filter="url(#glow)"/>
+    <circle cx="512" cy="194" r="5" fill="#FFFFFF"/>
+  </g>
+
+  <g filter="url(#shadow)">
+    <polygon points="608,356 676,394 676,584 608,584" fill="url(#g_side)" stroke="#5A9DC8" stroke-opacity="0.7"/>
+    <polygon points="292,582 608,582 676,622 360,622" fill="url(#g_bot)" stroke="#4A88B8" stroke-opacity="0.6"/>
+    <rect x="292" y="356" width="316" height="226" rx="18" fill="url(#g_body)" stroke="#9DCAE8" stroke-width="1.5"/>
+    <polygon points="292,356 360,318 676,318 608,356" fill="url(#g_top)" stroke="#C8E6F8" stroke-width="1.2"/>
+    <rect x="230" y="390" width="440" height="52" fill="url(#g_refract)" clip-path="url(#front_clip)"/>
+
+    <circle cx="452" cy="470" r="82" fill="url(#g_rim)" stroke="#FFFFFF" stroke-width="2" stroke-opacity="0.6"/>
+    <circle cx="452" cy="470" r="70" fill="url(#g_lens)"/>
+    <circle cx="452" cy="470" r="58" fill="none" stroke="#FFFFFF" stroke-width="1.2" stroke-opacity="0.4"/>
+    <circle cx="452" cy="470" r="46" fill="none" stroke="#FFFFFF" stroke-width="1" stroke-opacity="0.3"/>
+    <circle cx="452" cy="470" r="32" fill="#1E5A88" fill-opacity="0.65"/>
+    <circle cx="452" cy="470" r="25" fill="#0A3A60" fill-opacity="0.8"/>
+    <g stroke="#FFFFFF" stroke-width="1.2" stroke-opacity="0.35">
+      <line x1="452" y1="438" x2="452" y2="502"/>
+      <line x1="425" y1="453" x2="479" y2="487"/>
+      <line x1="425" y1="487" x2="479" y2="453"/>
+    </g>
+    <ellipse cx="434" cy="448" rx="18" ry="10" fill="#FFFFFF" fill-opacity="0.55" transform="rotate(-20 434 448)"/>
+    <ellipse cx="428" cy="443" rx="8" ry="4" fill="#FFFFFF" fill-opacity="0.85" transform="rotate(-20 428 443)"/>
+
+    <polyline points="318,382 318,402 338,402" fill="none" stroke="#FFFFFF" stroke-width="2.3" stroke-opacity="0.65" stroke-linecap="round" stroke-linejoin="round"/>
+    <polyline points="582,382 582,402 562,402" fill="none" stroke="#FFFFFF" stroke-width="2.3" stroke-opacity="0.65" stroke-linecap="round" stroke-linejoin="round"/>
+    <polyline points="318,558 318,538 338,538" fill="none" stroke="#FFFFFF" stroke-width="2.3" stroke-opacity="0.65" stroke-linecap="round" stroke-linejoin="round"/>
+    <polyline points="582,558 582,538 562,538" fill="none" stroke="#FFFFFF" stroke-width="2.3" stroke-opacity="0.65" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <line x1="292" y1="356" x2="608" y2="356" stroke="#FFFFFF" stroke-width="2.2" stroke-opacity="0.7"/>
+    <line x1="292" y1="356" x2="292" y2="582" stroke="#FFFFFF" stroke-width="1.6" stroke-opacity="0.5"/>
+    <line x1="292" y1="356" x2="360" y2="318" stroke="#FFFFFF" stroke-width="2.2" stroke-opacity="0.8"/>
+    <line x1="360" y1="318" x2="676" y2="318" stroke="#FFFFFF" stroke-width="2" stroke-opacity="0.75"/>
+    <line x1="608" y1="356" x2="676" y2="318" stroke="#FFFFFF" stroke-width="1.4" stroke-opacity="0.55"/>
+  </g>
+</svg>

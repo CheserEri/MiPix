@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 启动窗口只铺一层纯色背景：与照片页的 miuiBackground(纯白) 保持一致，
+     不显示任何图标，避免启动瞬间闪现 logo。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/white"/>
+</layer-list>
