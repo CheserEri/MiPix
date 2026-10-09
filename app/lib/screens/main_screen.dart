@@ -6,8 +6,10 @@ import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
 import '../utils/mipix_theme.dart';
+import '../widgets/animations.dart';
 import 'albums_screen.dart';
 import 'photos_screen.dart';
+import 'settings_screen.dart';
 import 'smb_screen.dart';
 import 'transfers_screen.dart';
 
@@ -21,14 +23,13 @@ class MainScreen extends ConsumerStatefulWidget {
 
 class _MainScreenState extends ConsumerState<MainScreen>
     with SingleTickerProviderStateMixin {
-  static const _tabCount = 4;
+  static const _tabCount = 3;
 
   late final TabController _tabController;
 
   final _screens = const [
     PhotosScreen(),
     AlbumsScreen(),
-    SmbScreen(),
     TransfersScreen(),
   ];
 
@@ -54,21 +55,19 @@ class _MainScreenState extends ConsumerState<MainScreen>
   @override
   Widget build(BuildContext context) {
     final activeCount = ref.watch(activeTransferCountProvider);
-    final index = _tabController.index;
-    // 「照片 / 相册」与小米相册一致使用浅色，其余页面保持深色沉浸风。
-    final isLight = index <= 1;
-    final background = isLight ? MiPixColors.miuiBackground : Colors.black;
-    final foreground = isLight ? MiPixColors.miuiText : Colors.white;
+    // 与小米相册一致：所有主页面统一使用色板配色，随主题明暗切换。
+    final palette = MiPixPalette.of(context);
+    final background = palette.background;
+    final foreground = palette.textPrimary;
 
     final labels = <String>[
       '照片',
       '相册',
-      'SMB',
       activeCount > 0 ? '传输 $activeCount' : '传输',
     ];
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
-      value: isLight ? SystemUiOverlayStyle.dark : SystemUiOverlayStyle.light,
+      value: MiPixTheme.overlayStyle(context),
       child: Scaffold(
         backgroundColor: background,
         appBar: PreferredSize(
@@ -80,23 +79,28 @@ class _MainScreenState extends ConsumerState<MainScreen>
               bottom: false,
               child: SizedBox(
                 height: kToolbarHeight,
-                child: Row(
+                // 仿小米相册：左侧搜索、标签组整体居中、右侧「⋮」。
+                child: Stack(
                   children: [
-                    Expanded(
+                    Center(
                       child: TabBar(
                         controller: _tabController,
+                        isScrollable: true,
+                        tabAlignment: TabAlignment.center,
                         indicatorColor: Colors.transparent,
                         dividerColor: Colors.transparent,
-                        indicatorSize: TabBarIndicatorSize.tab,
-                        labelColor: MiPixColors.miuiBlue,
-                        unselectedLabelColor: foreground,
+                        overlayColor: WidgetStateProperty.all(Colors.transparent),
+                        indicatorSize: TabBarIndicatorSize.label,
+                        labelPadding: const EdgeInsets.symmetric(horizontal: 16),
+                        labelColor: palette.accent,
+                        unselectedLabelColor: palette.textPrimary,
                         labelStyle: const TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.w600,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
                         ),
                         unselectedLabelStyle: const TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.w400,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w500,
                         ),
                         tabs: [
                           for (final label in labels)
@@ -104,8 +108,12 @@ class _MainScreenState extends ConsumerState<MainScreen>
                         ],
                       ),
                     ),
-                    _buildMoreMenu(foreground),
-                    const SizedBox(width: 2),
+                    Positioned(
+                      right: 2,
+                      top: 0,
+                      bottom: 0,
+                      child: _buildMoreMenu(foreground),
+                    ),
                   ],
                 ),
               ),
@@ -120,29 +128,44 @@ class _MainScreenState extends ConsumerState<MainScreen>
     );
   }
 
-  /// 右上角的刷新菜单（对应小米相册顶栏右侧的「⋮」）。
+  /// 右上角的菜单（对应小米相册顶栏右侧的「⋮」）。
   Widget _buildMoreMenu(Color foreground) {
     return PopupMenuButton<String>(
       icon: Icon(Icons.more_vert, color: foreground),
       tooltip: '更多',
       onSelected: (value) {
         switch (value) {
+          case 'smb':
+            // 配置 SMB 服务器入口收进「⋮」设置中，不再占用顶部导航栏。
+            Navigator.push(
+              context,
+              PageSlideTransition(child: const SmbScreen()),
+            );
+            break;
           case 'photos':
             ref.read(localPhotosProvider.notifier).load();
             break;
           case 'albums':
             ref.read(localLibraryProvider.notifier).load();
             break;
-          case 'smb':
+          case 'refresh_smb':
             ref.invalidate(allSmbAlbumsProvider);
             ref.invalidate(smbServersProvider);
+            break;
+          case 'settings':
+            Navigator.push(
+              context,
+              PageSlideTransition(child: const SettingsScreen()),
+            );
             break;
         }
       },
       itemBuilder: (_) => const [
+        PopupMenuItem(value: 'smb', child: Text('SMB 服务器')),
+        PopupMenuItem(value: 'settings', child: Text('设置')),
         PopupMenuItem(value: 'photos', child: Text('刷新照片')),
         PopupMenuItem(value: 'albums', child: Text('刷新相册')),
-        PopupMenuItem(value: 'smb', child: Text('刷新 SMB')),
+        PopupMenuItem(value: 'refresh_smb', child: Text('刷新 SMB')),
       ],
     );
   }

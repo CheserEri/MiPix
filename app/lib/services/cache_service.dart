@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as path;
@@ -11,28 +12,104 @@ class CacheService {
   static const _cacheMetadataKey = 'cache_metadata';
   static const _albumCachePrefix = 'album_cache_';
   static const _imageCachePrefix = 'image_cache_';
-  static const _thumbnailCachePrefix = 'thumb_cache_';
+  static const _thumbnailCachePrefix = 'thumb2_cache_';
   static const _defaultCacheDuration = Duration(days: 7);
   static const _thumbnailSize = 200;
+  static const _cacheLimitKey = 'cache_limit_bytes';
 
-  late Directory _cacheDir;
+  /// 默认缓存上限：500 MB。
+  static const int defaultCacheLimitBytes = 500 * 1024 * 1024;
+
+  Directory? _cacheDirRef;
+  Directory get _cacheDir => _cacheDirRef!;
   SharedPreferences? _prefs;
+  bool _initialized = false;
 
-  Future<void> init() async {
-    _cacheDir = await getTemporaryDirectory();
-    _prefs = await SharedPreferences.getInstance();
-  }
+  Future<void> init() => ensureInitialized();
 
   Future<void> ensureInitialized() async {
+    if (_initialized) return;
     _prefs ??= await SharedPreferences.getInstance();
-    if (!_cacheDir.existsSync()) {
-      await _cacheDir.create(recursive: true);
+    // 使用 Application Support 目录（应用私有、不会被系统随意清理），
+    // 保证缩略图/原图缓存在应用重启后依然可用。
+    final dir = await getApplicationSupportDirectory();
+    if (!dir.existsSync()) {
+      await dir.create(recursive: true);
+    }
+    _cacheDirRef = dir;
+    _initialized = true;
+  }
+
+  /// 当前缓存占用（原图 + 缩略图，字节）。
+  Future<int> getCacheSize() async {
+    await ensureInitialized();
+    var total = 0;
+    for (final entity in _cacheDir.listSync()) {
+      if (entity is File && _isCacheFile(entity.path)) {
+        total += await entity.length();
+      }
+    }
+    return total;
+  }
+
+  Future<int> getCacheLimit() async {
+    await ensureInitialized();
+    return _prefs!.getInt(_cacheLimitKey) ?? defaultCacheLimitBytes;
+  }
+
+  Future<void> setCacheLimit(int bytes) async {
+    await ensureInitialized();
+    await _prefs!.setInt(_cacheLimitKey, bytes);
+    await enforceCacheLimit();
+  }
+
+  bool _isCacheFile(String filePath) =>
+      filePath.contains(_imageCachePrefix) || filePath.contains(_thumbnailCachePrefix);
+
+  /// 超出上限时按「最久未修改优先」删除缓存文件。
+  /// 缩略图体积很小、命中收益高，优先淘汰原图。
+  Future<void> enforceCacheLimit() async {
+    await ensureInitialized();
+    final limit = await getCacheLimit();
+    final files = _cacheDir
+        .listSync()
+        .whereType<File>()
+        .where((f) => _isCacheFile(f.path))
+        .toList();
+    if (files.isEmpty) return;
+
+    final entries = <MapEntry<File, int>>[];
+    var total = 0;
+    for (final file in files) {
+      final length = await file.length();
+      total += length;
+      entries.add(MapEntry(file, length));
+    }
+    if (total <= limit) return;
+
+    // 先淘汰原图（大且可从 SMB 重新获取），再淘汰缩略图；同类按最后修改时间升序。
+    entries.sort((a, b) {
+      final aOriginal = a.key.path.contains(_imageCachePrefix);
+      final bOriginal = b.key.path.contains(_imageCachePrefix);
+      if (aOriginal != bOriginal) return aOriginal ? -1 : 1;
+      return a.key.lastModifiedSync().compareTo(b.key.lastModifiedSync());
+    });
+
+    for (final entry in entries) {
+      if (total <= limit) break;
+      try {
+        await entry.key.delete();
+        total -= entry.value;
+      } catch (_) {
+        // 忽略单个文件删除失败，继续清理其余文件。
+      }
     }
   }
 
   Future<void> cacheAlbumMediaItems(String serverId, String albumPath, List<MediaItem> items) async {
     await ensureInitialized();
-    final key = '$_albumCachePrefix${serverId}_$albumPath';
+    // v3：排序依据改为 EXIF 拍摄时间，旧的 mtime 缓存需失效以重新探测。
+    final key = '$_albumCachePrefix${serverId}_${albumPath}_v3';
     final data = {
       'timestamp': DateTime.now().millisecondsSinceEpoch,
       'items': items.map((e) => e.toJson()).toList(),
@@ -42,7 +119,7 @@ class CacheService {
 
   Future<List<MediaItem>?> getCachedAlbumMediaItems(String serverId, String albumPath) async {
     await ensureInitialized();
-    final key = '$_albumCachePrefix${serverId}_$albumPath';
+    final key = '$_albumCachePrefix${serverId}_${albumPath}_v2';
     final data = _prefs!.getString(key);
     if (data == null) return null;
 
@@ -95,6 +172,7 @@ class CacheService {
     final safeName = _sanitizePath(imagePath);
     final file = File(path.join(_cacheDir.path, '$_imageCachePrefix${serverId}_$safeName'));
     await file.writeAsBytes(bytes);
+    await _maybeEnforceLimit();
     return file;
   }
 
@@ -124,24 +202,40 @@ class CacheService {
     return await file.readAsBytes();
   }
 
+  Future<void> cacheThumbnail(String serverId, String imagePath, Uint8List bytes) async {
+    await ensureInitialized();
+    final safeName = _sanitizePath(imagePath);
+    final file = File(path.join(_cacheDir.path, '$_thumbnailCachePrefix${serverId}_$safeName'));
+    await file.writeAsBytes(bytes);
+    await _maybeEnforceLimit();
+  }
+
+  /// 每写入若干次才检查一次上限，避免批量下载时反复扫描目录。
+  int _writesSinceLimitCheck = 0;
+  static const _limitCheckInterval = 20;
+
+  Future<void> _maybeEnforceLimit() async {
+    _writesSinceLimitCheck++;
+    if (_writesSinceLimitCheck < _limitCheckInterval) return;
+    _writesSinceLimitCheck = 0;
+    await enforceCacheLimit();
+  }
+
   Future<Uint8List> generateAndCacheThumbnail(String serverId, String imagePath, Uint8List originalBytes) async {
     await ensureInitialized();
     try {
-      final image = img.decodeImage(originalBytes);
-      if (image == null) return originalBytes;
-
-      final thumbnail = img.copyResize(
-        image,
-        width: _thumbnailSize,
-        height: _thumbnailSize,
-        maintainAspect: true,
-        interpolation: img.Interpolation.average,
+      // 解码+缩放+编码是 CPU 密集操作，在主线程执行会造成网格滚动掉帧。
+      // 整体搬到独立 Isolate，主线程只收发字节，避免卡顿。
+      final thumbnailBytes = await Isolate.run(
+        () => _generateThumbnailInIsolate(originalBytes, _thumbnailSize),
       );
+      // 空列表表示解码失败，回退原图。
+      if (thumbnailBytes.isEmpty) return originalBytes;
 
-      final thumbnailBytes = img.encodeJpg(thumbnail, quality: 70);
       final safeName = _sanitizePath(imagePath);
       final file = File(path.join(_cacheDir.path, '$_thumbnailCachePrefix${serverId}_$safeName'));
       await file.writeAsBytes(thumbnailBytes);
+      await _maybeEnforceLimit();
       return thumbnailBytes;
     } catch (_) {
       return originalBytes;
@@ -193,4 +287,35 @@ class CacheService {
   String _sanitizePath(String input) {
     return input.replaceAll(RegExp(r'[^\w\-_\. ]'), '_');
   }
+}
+
+/// 在独立 Isolate 中解码原图并缩放生成缩略图 JPEG。
+///
+/// 必须为顶层函数（不可捕获实例状态），供 [Isolate.run] 调用。
+/// 按原始宽高比缩放到 [thumbnailSize] 以内、不补齐成正方形，
+/// 避免 copyResize 的 maintainAspect 产生上下黑边。
+/// 解码失败返回空列表，由调用方回退原图。
+Uint8List _generateThumbnailInIsolate(Uint8List originalBytes, int thumbnailSize) {
+  final image = img.decodeImage(originalBytes);
+  if (image == null) return Uint8List(0);
+
+  final srcW = image.width;
+  final srcH = image.height;
+  final int targetW;
+  final int targetH;
+  if (srcW >= srcH) {
+    targetW = thumbnailSize;
+    targetH = (srcH * thumbnailSize / srcW).round().clamp(1, thumbnailSize);
+  } else {
+    targetH = thumbnailSize;
+    targetW = (srcW * thumbnailSize / srcH).round().clamp(1, thumbnailSize);
+  }
+
+  final thumbnail = img.copyResize(
+    image,
+    width: targetW,
+    height: targetH,
+    interpolation: img.Interpolation.average,
+  );
+  return Uint8List.fromList(img.encodeJpg(thumbnail, quality: 70));
 }

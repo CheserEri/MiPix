@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../models/models.dart';
 import '../services/smb_service.dart';
 import '../utils/smb_form_logic.dart';
+import '../utils/mipix_theme.dart';
 
 Future<void> showSmbServerDialog(
   BuildContext context, {
@@ -83,16 +84,17 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     final isEditing = widget.initial != null;
     final draft = _draft;
     final canSave = SmbFormLogic.canSave(draft) && !_submitting;
 
     return AlertDialog(
-      backgroundColor: const Color(0xFF0F172A),
+      backgroundColor: palette.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
       title: Text(
         isEditing ? '编辑 SMB 服务器' : '添加 SMB 服务器',
-        style: const TextStyle(color: Colors.white),
+        style: TextStyle(color: palette.textPrimary),
       ),
       content: SizedBox(
         width: 420,
@@ -147,7 +149,7 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
                 alignment: Alignment.centerLeft,
                 child: Text(
                   'eg: storage/photos (no \'/\' or \'\\\' at the start)',
-                  style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 11),
+                  style: TextStyle(color: palette.textSecondary, fontSize: 11),
                 ),
               ),
             ],
@@ -158,7 +160,8 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
         OutlinedButton(
           onPressed: _testingConnection || _submitting ? null : _testConnection,
           style: OutlinedButton.styleFrom(
-            side: BorderSide(color: Colors.white.withValues(alpha: 0.2)),
+            foregroundColor: palette.accent,
+            side: BorderSide(color: palette.divider),
           ),
           child: _testingConnection
               ? const SizedBox(
@@ -169,6 +172,10 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
               : const Text('测试连接'),
         ),
         FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: palette.accent,
+            foregroundColor: Colors.white,
+          ),
           onPressed: canSave ? _submit : null,
           child: _submitting
               ? const SizedBox(
@@ -223,7 +230,7 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
       final selected = await showDialog<String>(
         context: context,
         builder: (ctx) => AlertDialog(
-          backgroundColor: const Color(0xFFEFF7F5),
+          backgroundColor: MiPixPalette.of(context).surface,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
           title: const Text('Select share'),
           content: SizedBox(
@@ -370,15 +377,15 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
         controller: controller,
         obscureText: obscure,
         keyboardType: keyboard,
-        style: const TextStyle(color: Colors.white),
+        style: TextStyle(color: MiPixPalette.of(context).textPrimary),
         decoration: InputDecoration(
           labelText: label,
           hintText: hint,
           suffixIcon: suffixIcon,
-          labelStyle: const TextStyle(color: Color(0x99FFFFFF)),
-          hintStyle: const TextStyle(color: Color(0x61FFFFFF)),
+          labelStyle: TextStyle(color: MiPixPalette.of(context).textSecondary),
+          hintStyle: TextStyle(color: MiPixPalette.of(context).textSecondary),
           filled: true,
-          fillColor: Colors.white.withValues(alpha: 0.06),
+          fillColor: MiPixPalette.of(context).fill,
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(14),
             borderSide: BorderSide.none,
@@ -429,7 +436,7 @@ class _RootPathDialogState extends State<_RootPathDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      backgroundColor: const Color(0xFFEFF7F5),
+      backgroundColor: MiPixPalette.of(context).surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
       title: const Text('Select root path'),
       content: SizedBox(

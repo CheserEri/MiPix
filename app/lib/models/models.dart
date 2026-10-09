@@ -48,6 +48,30 @@ class MediaItem {
   /// 是否为视频资源。
   bool get isVideo => mimeType.startsWith('video/');
 
+  MediaItem copyWith({
+    String? id,
+    String? name,
+    String? path,
+    MediaSource? source,
+    String? mimeType,
+    int? size,
+    int? width,
+    int? height,
+    DateTime? modifiedAt,
+  }) {
+    return MediaItem(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      path: path ?? this.path,
+      source: source ?? this.source,
+      mimeType: mimeType ?? this.mimeType,
+      size: size ?? this.size,
+      width: width ?? this.width,
+      height: height ?? this.height,
+      modifiedAt: modifiedAt ?? this.modifiedAt,
+    );
+  }
+
   factory MediaItem.fromJson(Map<String, dynamic> json) {
     final sourceJson = json['source'] as Map<String, dynamic>;
     MediaSource source;

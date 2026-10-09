@@ -17,15 +17,40 @@ class BackupResult {
 }
 
 final transfersProvider = StateNotifierProvider<TransfersNotifier, AsyncValue<List<TransferTask>>>(
-  (ref) => TransfersNotifier(),
+  (ref) => TransfersNotifier(ref),
 );
 
+/// 已成功备份到 SMB 的本地图片路径集合。
+final syncedPhotosProvider =
+    StateNotifierProvider<SyncedPhotosNotifier, Set<String>>(
+  (ref) => SyncedPhotosNotifier(),
+);
+
+class SyncedPhotosNotifier extends StateNotifier<Set<String>> {
+  final _storage = LocalStorageService();
+
+  SyncedPhotosNotifier() : super(<String>{}) {
+    load();
+  }
+
+  Future<void> load() async {
+    state = await _storage.getSyncedPhotos();
+  }
+
+  Future<void> markSynced(List<String> localPaths) async {
+    if (localPaths.isEmpty) return;
+    await _storage.markSynced(localPaths);
+    state = {...state, ...localPaths};
+  }
+}
+
 class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
+  final Ref _ref;
   final _storage = LocalStorageService();
   final _smbService = SmbService();
   final Map<String, StreamController<double>> _progressControllers = {};
 
-  TransfersNotifier() : super(const AsyncValue.loading()) {
+  TransfersNotifier(this._ref) : super(const AsyncValue.loading()) {
     load();
   }
 
@@ -136,6 +161,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     final server = servers.firstWhere((s) => s.id == serverId);
     var successCount = 0;
     var failedCount = 0;
+    final syncedPaths = <String>[];
 
     for (final path in localPaths) {
       final taskId = DateTime.now().millisecondsSinceEpoch.toString();
@@ -183,6 +209,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
 
         _updateTaskComplete(taskId, TransferStatus.done);
         successCount += 1;
+        syncedPaths.add(path);
       } catch (e) {
         _updateTaskComplete(taskId, TransferStatus.failed, errorMessage: e.toString());
         failedCount += 1;
@@ -192,6 +219,10 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     }
 
     await load();
+    // 标记成功备份（上传）的本地图片为「已同步」。
+    if (syncedPaths.isNotEmpty) {
+      await _ref.read(syncedPhotosProvider.notifier).markSynced(syncedPaths);
+    }
     return BackupResult(successCount: successCount, failedCount: failedCount);
   }
 

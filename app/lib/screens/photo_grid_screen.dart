@@ -76,38 +76,38 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   }
 
   Widget _buildLocalGrid() {
+    final palette = MiPixPalette.of(context);
     final itemsAsync = ref.watch(albumItemsProvider(widget.albumId));
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
-      value: SystemUiOverlayStyle.dark,
+      value: MiPixTheme.overlayStyle(context),
       child: Scaffold(
-        backgroundColor: MiPixColors.miuiBackground,
+        backgroundColor: palette.background,
         appBar: AppBar(
-          backgroundColor: MiPixColors.miuiBackground,
+          backgroundColor: palette.background,
           elevation: 0,
           scrolledUnderElevation: 0,
           title: Text(
             widget.albumName,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 18,
               fontWeight: FontWeight.w600,
-              color: MiPixColors.miuiText,
+              color: palette.textPrimary,
             ),
           ),
-          iconTheme: const IconThemeData(color: MiPixColors.miuiText),
+          iconTheme: IconThemeData(color: palette.textPrimary),
         ),
         body: itemsAsync.when(
-          loading: () => const Center(
-            child: CircularProgressIndicator(color: MiPixColors.miuiBlue),
+          loading: () => Center(
+            child: CircularProgressIndicator(color: palette.accent),
           ),
           error: (err, _) => Center(
             child: Text('加载失败: $err',
-                style: const TextStyle(color: MiPixColors.miuiSubText)),
+                style: TextStyle(color: palette.textSecondary)),
           ),
           data: (items) {
             if (items.isEmpty) {
-              return const EmptyStateWidget(
-                light: true,
+              return EmptyStateWidget(
                 icon: Icons.photo_library_outlined,
                 title: '暂无照片',
                 subtitle: '该相册里还没有可显示的内容',
@@ -148,13 +148,15 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
                             ),
                           );
                         },
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      border: isSelected
-                          ? Border.all(color: MiPixColors.miuiBlue, width: 3)
-                          : null,
+                  child: RepaintBoundary(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        border: isSelected
+                            ? Border.all(color: palette.accent, width: 3)
+                            : null,
+                      ),
+                      child: LocalMediaThumb(item: item),
                     ),
-                    child: LocalMediaThumb(item: item),
                   ),
                 );
               },
@@ -188,7 +190,7 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
                 },
                 icon: const Icon(Icons.check),
                 label: const Text('设为封面'),
-                backgroundColor: MiPixColors.miuiBlue,
+                backgroundColor: palette.accent,
               )
             : null,
       ),
@@ -196,123 +198,122 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   }
 
   Widget _buildRemoteGrid() {
+    final palette = MiPixPalette.of(context);
     final path = ref.watch(smbCurrentPathProvider);
     final pagedAsync = ref.watch(smbItemsPagedProvider((serverId: widget.albumId, path: path)));
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        title: Text(
-          widget.albumName,
-          style: const TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.w700,
-            color: Colors.white,
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: MiPixTheme.overlayStyle(context),
+      child: Scaffold(
+        backgroundColor: palette.background,
+        appBar: AppBar(
+          backgroundColor: palette.background,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          title: Text(
+            widget.albumName,
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+              color: palette.textPrimary,
+            ),
           ),
+          iconTheme: IconThemeData(color: palette.textPrimary),
         ),
-        iconTheme: const IconThemeData(color: Colors.white),
-      ),
-      body: pagedAsync.when(
-        loading: () => const Center(
-          child: CircularProgressIndicator(color: Colors.white),
-        ),
-        error: (err, _) => Center(
-          child: Text('加载失败: $err', style: const TextStyle(color: Colors.white70)),
-        ),
-        data: (page) {
-          final items = page.items;
-          if (items.isEmpty) {
-            return const Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.photo_library_outlined, size: 64, color: Colors.white24),
-                  SizedBox(height: 16),
-                  Text('暂无照片', style: TextStyle(color: Colors.white38)),
-                ],
-              ),
-            );
-          }
-          return NotificationListener<ScrollNotification>(
-            onNotification: (notification) {
-              if (notification is ScrollEndNotification) {
-                if (notification.metrics.pixels >=
-                    notification.metrics.maxScrollExtent - 500) {
-                  _loadMore();
+        body: pagedAsync.when(
+          loading: () => Center(
+            child: CircularProgressIndicator(color: palette.accent),
+          ),
+          error: (err, _) => Center(
+            child: Text('加载失败: $err',
+                style: TextStyle(color: palette.textSecondary)),
+          ),
+          data: (page) {
+            final items = page.items;
+            if (items.isEmpty) {
+              return EmptyStateWidget(
+                icon: Icons.photo_library_outlined,
+                title: '暂无照片',
+                subtitle: '该相册里还没有可显示的内容',
+              );
+            }
+            return NotificationListener<ScrollNotification>(
+              onNotification: (notification) {
+                if (notification is ScrollEndNotification) {
+                  if (notification.metrics.pixels >=
+                      notification.metrics.maxScrollExtent - 500) {
+                    _loadMore();
+                  }
                 }
-              }
-              return false;
-            },
-            child: GridView.builder(
-              controller: _scrollController,
-              padding: const EdgeInsets.fromLTRB(16, 100, 16, 120),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                crossAxisSpacing: 4,
-                mainAxisSpacing: 4,
-              ),
-              itemCount: items.length + (page.hasMore ? 1 : 0),
-              itemBuilder: (context, index) {
-                if (index >= items.length) {
-                  return const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(16),
-                      child: CircularProgressIndicator(
-                        color: Colors.white54,
-                        strokeWidth: 2,
+                return false;
+              },
+              child: GridView.builder(
+                controller: _scrollController,
+                padding: const EdgeInsets.fromLTRB(2, 2, 2, 24),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 3,
+                  crossAxisSpacing: 2,
+                  mainAxisSpacing: 2,
+                ),
+                itemCount: items.length + (page.hasMore ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index >= items.length) {
+                    return Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: CircularProgressIndicator(
+                          color: palette.accent,
+                          strokeWidth: 2,
+                        ),
+                      ),
+                    );
+                  }
+                  final item = items[index];
+                  final isSelected = _selectedPhotoName == item.name;
+                  return BounceTap(
+                    onTap: widget.isSettingCover
+                        ? () {
+                            setState(() {
+                              if (isSelected) {
+                                _selectedPhotoName = null;
+                              } else {
+                                _selectedPhotoName = item.name;
+                              }
+                            });
+                          }
+                        : () {
+                            Navigator.push(
+                              context,
+                              PageFadeTransition(
+                                child: PhotoViewerScreen(
+                                  photos: items,
+                                  initialIndex: index,
+                                  isRemote: true,
+                                  serverId: widget.albumId,
+                                ),
+                              ),
+                            );
+                          },
+                    child: RepaintBoundary(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          border: isSelected
+                              ? Border.all(
+                                  color: palette.accent, width: 3)
+                              : null,
+                        ),
+                        child: _RemoteImage(
+                          serverId: widget.albumId,
+                          remotePath: item.path,
+                        ),
                       ),
                     ),
                   );
-                }
-                final item = items[index];
-                final isSelected = _selectedPhotoName == item.name;
-                return BounceTap(
-                  onTap: widget.isSettingCover
-                      ? () {
-                          setState(() {
-                            if (isSelected) {
-                              _selectedPhotoName = null;
-                            } else {
-                              _selectedPhotoName = item.name;
-                            }
-                          });
-                        }
-                      : () {
-                          Navigator.push(
-                            context,
-                            PageFadeTransition(
-                              child: PhotoViewerScreen(
-                                photos: items,
-                                initialIndex: index,
-                                isRemote: true,
-                              ),
-                            ),
-                          );
-                        },
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(12),
-                      border: isSelected
-                          ? Border.all(color: Colors.blueAccent, width: 3)
-                          : null,
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: _RemoteImage(
-                        serverId: widget.albumId,
-                        remotePath: item.path,
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          );
-        },
-      ),
+                },
+              ),
+            );
+          },
+        ),
       floatingActionButton: widget.isSettingCover && _selectedPhotoName != null
           ? FloatingActionButton.extended(
               onPressed: () async {
@@ -340,9 +341,10 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
               },
               icon: const Icon(Icons.check),
               label: const Text('设为封面'),
-              backgroundColor: Colors.blueAccent,
+              backgroundColor: palette.accent,
             )
           : null,
+      ),
     );
   }
 }
@@ -368,7 +370,14 @@ class _RemoteImageState extends State<_RemoteImage> {
   @override
   void initState() {
     super.initState();
-    _load();
+    // 内存缓存命中时同步展示，避免列表滚动/重建时重复加载。
+    final cached = SmbService.peekThumbnail(widget.serverId, widget.remotePath);
+    if (cached != null && cached.isNotEmpty) {
+      _imageData = cached;
+      _loading = false;
+    } else {
+      _load();
+    }
   }
 
   Future<void> _load() async {
@@ -389,18 +398,20 @@ class _RemoteImageState extends State<_RemoteImage> {
 
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     if (_loading) {
       return Container(
-        color: const Color(0xFF1A1A2E),
-        child: const Center(
-          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+        color: palette.fill,
+        child: Center(
+          child: CircularProgressIndicator(color: palette.accent, strokeWidth: 2),
         ),
       );
     }
     if (_imageData == null) {
       return Container(
-        color: const Color(0xFF1A1A2E),
-        child: const Icon(Icons.broken_image, color: Colors.white24),
+        color: palette.fill,
+        child: Icon(Icons.broken_image,
+            color: palette.textSecondary.withValues(alpha: 0.6)),
       );
     }
     return Image.memory(
@@ -408,15 +419,16 @@ class _RemoteImageState extends State<_RemoteImage> {
       fit: BoxFit.cover,
       cacheWidth: 400,
       errorBuilder: (_, __, ___) => Container(
-        color: const Color(0xFF1A1A2E),
-        child: const Icon(Icons.broken_image, color: Colors.white24),
+        color: palette.fill,
+        child: Icon(Icons.broken_image,
+            color: palette.textSecondary.withValues(alpha: 0.6)),
       ),
     );
   }
 }
 
 class _ImageLoadingController {
-  static const int maxConcurrent = 4;
+  static const int maxConcurrent = 8;
   int _activeRequests = 0;
   final Queue<_PendingImageRequest> _queue = Queue<_PendingImageRequest>();
 
@@ -439,7 +451,8 @@ class _ImageLoadingController {
   Future<Uint8List> _doLoadImage(SmbConfig server, String remotePath) async {
     final smbService = SmbService();
     try {
-      return await smbService.readFile(server, remotePath);
+      // 网格只需缩略图，避免下载整张原图。
+      return await smbService.readThumbnail(server, remotePath);
     } catch (_) {
       return Uint8List(0);
     }

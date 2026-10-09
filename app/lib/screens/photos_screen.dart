@@ -32,6 +32,7 @@ class _AlbumSelectorItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: album.coverPath != null
@@ -53,8 +54,9 @@ class _AlbumSelectorItem extends StatelessWidget {
                       errorBuilder: (_, __, ___) => Container(
                         width: 48,
                         height: 48,
-                        color: Colors.white10,
-                        child: const Icon(Icons.folder, size: 24),
+                        color: palette.fill,
+                        child: Icon(Icons.folder,
+                            size: 24, color: palette.textSecondary),
                       ),
                     ),
             )
@@ -62,15 +64,18 @@ class _AlbumSelectorItem extends StatelessWidget {
               width: 48,
               height: 48,
               decoration: BoxDecoration(
-                color: Colors.white10,
+                color: palette.fill,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: const Icon(Icons.folder, size: 24),
+              child: Icon(Icons.folder,
+                  size: 24, color: palette.textSecondary),
             ),
-      title: Text(album.name, style: const TextStyle(color: Colors.white)),
-      subtitle: Text('${album.count} 张照片', style: const TextStyle(color: Colors.white60)),
+      title: Text(album.name,
+          style: TextStyle(color: palette.textPrimary)),
+      subtitle: Text('${album.count} 张照片',
+          style: TextStyle(color: palette.textSecondary)),
       trailing: selected
-          ? const Icon(Icons.check_circle, color: Colors.blue)
+          ? Icon(Icons.check_circle, color: palette.accent)
           : null,
       onTap: onTap,
     );
@@ -84,8 +89,14 @@ class PhotosScreen extends ConsumerStatefulWidget {
   ConsumerState<PhotosScreen> createState() => _PhotosScreenState();
 }
 
-class _PhotosScreenState extends ConsumerState<PhotosScreen> {
+class _PhotosScreenState extends ConsumerState<PhotosScreen>
+    with AutomaticKeepAliveClientMixin {
   final ScrollController _scrollController = ScrollController();
+
+  /// 标签页切换时不销毁本页。否则每次回到「照片」都会重新挂载 →
+  /// initState 再次 load() → 重新扫描媒体库并闪一次转圈。
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void initState() {
@@ -104,25 +115,28 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // AutomaticKeepAliveClientMixin 要求先调用
+    final palette = MiPixPalette.of(context);
     final photosAsync = ref.watch(localPhotosProvider);
     final access = ref.watch(localAccessProvider).valueOrNull;
     final isMultiSelect = ref.watch(isMultiSelectProvider);
     final selected = ref.watch(selectedPhotosProvider);
+    final synced = ref.watch(syncedPhotosProvider);
 
     return Scaffold(
-      backgroundColor: MiPixColors.miuiBackground,
+      backgroundColor: palette.background,
       appBar: isMultiSelect
           ? AppBar(
               title: Text(
                 '已选择 ${selected.length} 项',
-                style: const TextStyle(
+                style: TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.w600,
-                    color: MiPixColors.miuiText),
+                    color: palette.textPrimary),
               ),
-              backgroundColor: MiPixColors.miuiBackground,
+              backgroundColor: palette.background,
               elevation: 0,
-              iconTheme: const IconThemeData(color: MiPixColors.miuiText),
+              iconTheme: IconThemeData(color: palette.textPrimary),
               actions: [
                 IconButton(
                   icon: const Icon(Icons.select_all),
@@ -140,16 +154,15 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
             )
           : null,
       body: photosAsync.when(
-        loading: () => const Center(
-            child: CircularProgressIndicator(color: MiPixColors.miuiBlue)),
+        loading: () => Center(
+            child: CircularProgressIndicator(color: palette.accent)),
         error: (err, _) => Center(
           child: Text('加载失败: $err',
-              style: const TextStyle(color: MiPixColors.miuiSubText)),
+              style: TextStyle(color: palette.textSecondary)),
         ),
         data: (photos) {
           if (access != null && !access.canRead) {
             return EmptyStateWidget(
-              light: true,
               icon: Icons.lock_outline,
               title: '需要相册访问权限',
               subtitle: access == LocalAccess.restricted
@@ -174,7 +187,6 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
           }
           if (photos.isEmpty) {
             return const EmptyStateWidget(
-              light: true,
               icon: Icons.photo_library_outlined,
               title: '暂无照片',
               subtitle: '设备上还没有可显示的图片或视频',
@@ -206,6 +218,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                           photo: photo,
                           isMultiSelect: isMultiSelect,
                           isSelected: isSelected,
+                          isSynced: synced.contains(photo.path),
                           onTap: () {
                             if (isMultiSelect) {
                               togglePhotoSelection(ref, photo.id);
@@ -286,6 +299,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
   }
 
     void _showBackupDialog(List<String> photoIds) {
+    final palette = MiPixPalette.of(context);
     final photos = ref.read(localPhotosProvider).valueOrNull ?? [];
     final paths = photoIds
         .map((id) => photos.firstWhere((p) => p.id == id).path)
@@ -313,7 +327,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF0F172A),
+      backgroundColor: palette.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
@@ -338,17 +352,31 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                 children: [
                   Text(
                     '备份到 SMB',
-                    style: Theme.of(context).textTheme.displayMedium?.copyWith(fontSize: 22),
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                      color: palette.textPrimary,
+                    ),
                   ),
                   const SizedBox(height: 20),
-                  Text('选择服务器', style: Theme.of(context).textTheme.labelLarge),
+                  Text('选择服务器',
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: palette.textSecondary)),
                   const SizedBox(height: 10),
                   Wrap(
                     spacing: 8,
                     children: servers.map((s) {
                       return ChoiceChip(
-                        label: Text(s.name),
+                        label: Text(s.name,
+                            style: TextStyle(
+                                color: selectedServer == s.id
+                                    ? Colors.white
+                                    : palette.textPrimary)),
                         selected: selectedServer == s.id,
+                        selectedColor: palette.accent,
+                        backgroundColor: palette.fill,
                         onSelected: (_) {
                           setState(() {
                             selectedServer = s.id;
@@ -360,7 +388,11 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                     }).toList(),
                   ),
                   const SizedBox(height: 20),
-                  Text('选择相册（可选）', style: Theme.of(context).textTheme.labelLarge),
+                  Text('选择相册（可选）',
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: palette.textSecondary)),
                   const SizedBox(height: 10),
                   ...albums.map((album) => _AlbumSelectorItem(
                         album: album,
@@ -383,24 +415,26 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                       width: 48,
                       height: 48,
                       decoration: BoxDecoration(
-                        color: Colors.white10,
+                        color: palette.fill,
                         borderRadius: BorderRadius.circular(8),
                       ),
                       child: isCreating
-                          ? const SizedBox(
+                          ? SizedBox(
                               width: 20,
                               height: 20,
                               child: CircularProgressIndicator(
                                 strokeWidth: 2,
-                                color: Colors.white,
+                                color: palette.accent,
                               ),
                             )
-                          : const Icon(Icons.create_new_folder, color: Colors.white54),
+                          : Icon(Icons.create_new_folder,
+                              color: palette.textSecondary),
                     ),
-                    title: const Text('新建相册', style: TextStyle(color: Colors.white)),
+                    title: Text('新建相册',
+                        style: TextStyle(color: palette.textPrimary)),
                     trailing: isCreating
                         ? null
-                        : const Icon(Icons.add, color: Colors.white54),
+                        : Icon(Icons.add, color: palette.textSecondary),
                     onTap: isCreating
                         ? null
                         : () async {
@@ -501,8 +535,9 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                           });
                         },
                       ),
-                      const Expanded(
-                        child: Text('或手动输入目录（不选择相册时使用）', style: TextStyle(color: Colors.white60)),
+                      Expanded(
+                        child: Text('或手动输入目录（不选择相册时使用）',
+                            style: TextStyle(color: palette.textSecondary)),
                       ),
                     ],
                   ),
@@ -514,12 +549,12 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                         setState(() => selectedAlbumId.clear());
                       }
                     },
-                    style: const TextStyle(color: Colors.white),
+                    style: TextStyle(color: palette.textPrimary),
                     decoration: InputDecoration(
                       hintText: '/MiPixBackup 或选择的相册路径',
-                      hintStyle: const TextStyle(color: Colors.white38),
+                      hintStyle: TextStyle(color: palette.textSecondary),
                       filled: true,
-                      fillColor: Colors.white.withValues(alpha: 0.06),
+                      fillColor: palette.fill,
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(14),
                         borderSide: BorderSide.none,
@@ -528,7 +563,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen> {
                   ),
                   const SizedBox(height: 16),
                   Text('共 ${paths.length} 张照片',
-                      style: const TextStyle(color: Colors.white60)),
+                      style: TextStyle(color: palette.textSecondary)),
                   const SizedBox(height: 20),
                   SizedBox(
                     width: double.infinity,
@@ -577,6 +612,7 @@ class _PhotoTile extends StatelessWidget {
   final MediaItem photo;
   final bool isMultiSelect;
   final bool isSelected;
+  final bool isSynced;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
@@ -584,32 +620,52 @@ class _PhotoTile extends StatelessWidget {
     required this.photo,
     required this.isMultiSelect,
     required this.isSelected,
+    this.isSynced = false,
     required this.onTap,
     required this.onLongPress,
   });
 
   @override
   Widget build(BuildContext context) {
-    return BounceTap(
-      onTap: onTap,
-      onLongPress: onLongPress,
-      child: PhotoFadeIn(
+    // RepaintBoundary 隔离每个网格单元：单张图片解码完成时只重绘自己，
+    // 不会触发整个网格重绘（滚动时不掉帧）。
+    // 同时不再对每个单元做 Opacity 淡入：Opacity 会为每个单元创建
+    // saveLayer 离屏图层，滚动时数十个图层同时动画是主要卡顿来源。
+    final palette = MiPixPalette.of(context);
+    return RepaintBoundary(
+      child: BounceTap(
+        onTap: onTap,
+        onLongPress: onLongPress,
         child: Stack(
           fit: StackFit.expand,
           children: [
-          LocalMediaThumb(item: photo),
-          if (isMultiSelect)
-            Container(
-              color: isSelected
-                  ? Colors.black.withValues(alpha: 0.45)
-                  : Colors.transparent,
-              child: Align(
-                alignment: Alignment.topRight,
-                child: Padding(
-                  padding: const EdgeInsets.all(6),
-                  child: AnimatedScale(
-                    scale: isSelected ? 1.0 : 0.85,
-                    duration: const Duration(milliseconds: 150),
+            LocalMediaThumb(item: photo),
+            // 同步状态角标：已备份到 SMB 为蓝色云勾，未同步为白色云叉。
+            Positioned(
+              right: 3,
+              bottom: 3,
+              child: Container(
+                padding: const EdgeInsets.all(2),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.35),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Icon(
+                  isSynced ? Icons.cloud_done : Icons.cloud_off,
+                  size: 13,
+                  color: isSynced ? palette.accent : Colors.white,
+                ),
+              ),
+            ),
+            if (isMultiSelect)
+              Container(
+                color: isSelected
+                    ? Colors.black.withValues(alpha: 0.45)
+                    : Colors.transparent,
+                child: Align(
+                  alignment: Alignment.topRight,
+                  child: Padding(
+                    padding: const EdgeInsets.all(6),
                     child: Icon(
                       isSelected
                           ? Icons.check_circle
@@ -622,7 +678,6 @@ class _PhotoTile extends StatelessWidget {
                   ),
                 ),
               ),
-            ),
           ],
         ),
       ),
@@ -643,10 +698,11 @@ class _MultiSelectBottomBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     return Container(
-      decoration: const BoxDecoration(
-        color: MiPixColors.miuiBackground,
-        border: Border(top: BorderSide(color: MiPixColors.miuiDivider)),
+      decoration: BoxDecoration(
+        color: palette.background,
+        border: Border(top: BorderSide(color: palette.divider)),
       ),
       child: SafeArea(
         top: false,
@@ -657,7 +713,7 @@ class _MultiSelectBottomBar extends StatelessWidget {
               Expanded(
                 child: FilledButton.icon(
                   style: FilledButton.styleFrom(
-                    backgroundColor: MiPixColors.miuiBlue,
+                    backgroundColor: palette.accent,
                     foregroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(vertical: 12),
                     shape: RoundedRectangleBorder(
@@ -672,7 +728,7 @@ class _MultiSelectBottomBar extends StatelessWidget {
               const SizedBox(width: 12),
               IconButton(
                 onPressed: onClear,
-                icon: const Icon(Icons.clear_all, color: MiPixColors.miuiSubText),
+                icon: Icon(Icons.clear_all, color: palette.textSecondary),
                 tooltip: '清除选择',
               ),
             ],

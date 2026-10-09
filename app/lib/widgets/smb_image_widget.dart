@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../services/smb_service.dart';
 import '../services/local_storage_service.dart';
+import '../utils/mipix_theme.dart';
 
 /// SMB 远程图片加载Widget（用于显示 SMB 服务器上的图片封面）
 class SmbRemoteImage extends StatefulWidget {
@@ -34,7 +35,14 @@ class _SmbRemoteImageState extends State<SmbRemoteImage> {
   @override
   void initState() {
     super.initState();
-    _load();
+    // 内存缓存命中时同步展示，避免列表重建时重复加载。
+    final cached = SmbService.peekThumbnail(widget.serverId, widget.remotePath);
+    if (cached != null && cached.isNotEmpty) {
+      _imageData = cached;
+      _loading = false;
+    } else {
+      _load();
+    }
   }
 
   Future<void> _load() async {
@@ -60,13 +68,14 @@ class _SmbRemoteImageState extends State<SmbRemoteImage> {
 
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     if (_loading) {
       return Container(
         width: widget.width,
         height: widget.height,
-        color: const Color(0xFF1A1A2E),
-        child: const Center(
-          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+        color: palette.fill,
+        child: Center(
+          child: CircularProgressIndicator(color: palette.accent, strokeWidth: 2),
         ),
       );
     }
@@ -74,8 +83,9 @@ class _SmbRemoteImageState extends State<SmbRemoteImage> {
       return Container(
         width: widget.width,
         height: widget.height,
-        color: const Color(0xFF1A1A2E),
-        child: const Icon(Icons.broken_image, color: Colors.white24),
+        color: palette.fill,
+        child: Icon(Icons.broken_image,
+            color: palette.textSecondary.withValues(alpha: 0.6)),
       );
     }
     return Image.memory(
@@ -86,8 +96,9 @@ class _SmbRemoteImageState extends State<SmbRemoteImage> {
       errorBuilder: (_, __, ___) => Container(
         width: widget.width,
         height: widget.height,
-        color: const Color(0xFF1A1A2E),
-        child: const Icon(Icons.broken_image, color: Colors.white24),
+        color: palette.fill,
+        child: Icon(Icons.broken_image,
+            color: palette.textSecondary.withValues(alpha: 0.6)),
       ),
     );
   }

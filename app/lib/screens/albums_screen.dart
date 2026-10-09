@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/album_provider.dart';
@@ -8,66 +7,8 @@ import '../widgets/glass_container.dart';
 import '../widgets/animations.dart';
 import 'photo_grid_screen.dart';
 import '../services/photo_service.dart';
-import '../services/smb_service.dart';
-import '../services/local_storage_service.dart';
 import '../utils/mipix_theme.dart';
 import '../widgets/smb_image_widget.dart';
-
-/// SMB 远程图片加载Widget
-
-class SmbRemoteImageState extends State<SmbRemoteImage> {
-  Uint8List? _imageData;
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    try {
-      final servers = await LocalStorageService().getSmbServers();
-      final server = servers.firstWhere((s) => s.id == widget.serverId);
-      final data = await SmbService().readFile(server, widget.remotePath);
-      if (mounted) {
-        setState(() {
-          _imageData = data;
-          _loading = false;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) {
-      return Container(
-        color: const Color(0xFF1A1A2E),
-        child: const Center(
-          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
-        ),
-      );
-    }
-    if (_imageData == null) {
-      return Container(
-        color: const Color(0xFF1A1A2E),
-        child: const Icon(Icons.broken_image, color: Colors.white24),
-      );
-    }
-    return Image.memory(
-      _imageData!,
-      fit: BoxFit.cover,
-      cacheWidth: 400,
-      errorBuilder: (_, __, ___) => Container(
-        color: const Color(0xFF1A1A2E),
-        child: const Icon(Icons.broken_image, color: Colors.white24),
-      ),
-    );
-  }
-}
 
 class AlbumsScreen extends ConsumerStatefulWidget {
   const AlbumsScreen({super.key});
@@ -76,7 +17,12 @@ class AlbumsScreen extends ConsumerStatefulWidget {
   ConsumerState<AlbumsScreen> createState() => _AlbumsScreenState();
 }
 
-class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
+class _AlbumsScreenState extends ConsumerState<AlbumsScreen>
+    with AutomaticKeepAliveClientMixin {
+  /// 标签页切换时不销毁本页，避免每次回到「相册」重新加载相册列表。
+  @override
+  bool get wantKeepAlive => true;
+
   @override
   void initState() {
     super.initState();
@@ -88,22 +34,24 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // AutomaticKeepAliveClientMixin 要求先调用
+    final palette = MiPixPalette.of(context);
     final localLibrary = ref.watch(localLibraryProvider);
 
     return Scaffold(
-      backgroundColor: MiPixColors.miuiBackground,
+      backgroundColor: palette.background,
       body: CustomScrollView(
         slivers: [
           const SliverToBoxAdapter(child: SizedBox(height: 8)),
           localLibrary.when(
-            loading: () => const SliverFillRemaining(
+            loading: () => SliverFillRemaining(
               child: Center(
-                  child: CircularProgressIndicator(color: MiPixColors.miuiBlue)),
+                  child: CircularProgressIndicator(color: palette.accent)),
             ),
             error: (err, _) => SliverFillRemaining(
               child: Center(
                 child: Text('加载失败: $err',
-                    style: const TextStyle(color: MiPixColors.miuiSubText)),
+                    style: TextStyle(color: palette.textSecondary)),
               ),
             ),
             data: (library) {
@@ -111,7 +59,6 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                 return SliverFillRemaining(
                   hasScrollBody: false,
                   child: EmptyStateWidget(
-                    light: true,
                     icon: Icons.lock_outline,
                     title: '需要相册访问权限',
                     subtitle: library.access == LocalAccess.restricted
@@ -140,7 +87,6 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                 return SliverFillRemaining(
                   hasScrollBody: false,
                   child: EmptyStateWidget(
-                    light: true,
                     icon: Icons.visibility_off_outlined,
                     title: '读不到任何照片',
                     subtitle: '已获得权限但仍读不到照片。MIUI 可能授予了"空白权限"，'
@@ -165,11 +111,10 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
               }
 
               if (library.view.isEmpty) {
-                return const SliverToBoxAdapter(
+                return SliverToBoxAdapter(
                   child: Padding(
-                    padding: EdgeInsets.all(48),
+                    padding: const EdgeInsets.all(48),
                     child: EmptyStateWidget(
-                      light: true,
                       icon: Icons.photo_library_outlined,
                       title: '暂无本地相册',
                       subtitle: '设备上还没有可显示的图片或视频',
@@ -186,11 +131,11 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
             },
           ),
           const SliverToBoxAdapter(child: SizedBox(height: 24)),
-          const SliverToBoxAdapter(
+          SliverToBoxAdapter(
             child: Divider(
               height: 1,
               thickness: 1,
-              color: MiPixColors.miuiDivider,
+              color: palette.divider,
             ),
           ),
           SliverToBoxAdapter(
@@ -198,41 +143,40 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
               padding: const EdgeInsets.fromLTRB(16, 14, 8, 4),
               child: Row(
                 children: [
-                  const Text(
+                  Text(
                     'SMB 相册',
                     style: TextStyle(
                       fontSize: 14,
                       fontWeight: FontWeight.w500,
-                      color: MiPixColors.miuiSubText,
+                      color: palette.textSecondary,
                     ),
                   ),
                   const Spacer(),
                   TextButton.icon(
                     onPressed: () { ref.invalidate(allSmbAlbumsProvider); },
-                    icon: const Icon(Icons.refresh, size: 18, color: MiPixColors.miuiSubText),
-                    label: const Text('刷新', style: TextStyle(color: MiPixColors.miuiSubText)),
+                    icon: Icon(Icons.refresh, size: 18, color: palette.textSecondary),
+                    label: Text('刷新', style: TextStyle(color: palette.textSecondary)),
                   ),
                 ],
               ),
             ),
           ),
           ref.watch(allSmbAlbumsProvider).when(
-            loading: () => const SliverToBoxAdapter(
+            loading: () => SliverToBoxAdapter(
               child: SizedBox(
                 height: 200,
-                child: Center(child: CircularProgressIndicator(color: MiPixColors.miuiBlue)),
+                child: Center(child: CircularProgressIndicator(color: palette.accent)),
               ),
             ),
             error: (err, _) => SliverToBoxAdapter(
-              child: Center(child: Text('加载失败: $err', style: const TextStyle(color: MiPixColors.miuiSubText))),
+              child: Center(child: Text('加载失败: $err', style: TextStyle(color: palette.textSecondary))),
             ),
             data: (albums) {
               if (albums.isEmpty) {
-                return const SliverToBoxAdapter(
+                return SliverToBoxAdapter(
                   child: Padding(
-                    padding: EdgeInsets.all(48),
+                    padding: const EdgeInsets.all(48),
                     child: EmptyStateWidget(
-                      light: true,
                       icon: Icons.folder_off,
                       title: '暂无线 SMB 相册',
                       subtitle: '请检查服务器 rootPath 设置是否正确',
@@ -263,7 +207,7 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
     ref.read(smbCurrentPathProvider.notifier).state = album.id;
     Navigator.push(
       context,
-      PageFadeTransition(
+      PageSlideTransition(
         child: PhotoGridScreen(
           albumId: serverId,
           albumName: album.name,
@@ -299,7 +243,7 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
 
     final result = await Navigator.push(
       context,
-      PageFadeTransition(
+      PageSlideTransition(
         child: PhotoGridScreen(
           albumId: serverId,
           albumName: album.name,
@@ -330,15 +274,16 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
   List<Widget> _albumSection(String? title, List<Album> albums,
       {required bool divider}) {
     if (albums.isEmpty) return const [];
+    final palette = MiPixPalette.of(context);
     return [
       if (divider)
-        const SliverToBoxAdapter(
+        SliverToBoxAdapter(
           child: Padding(
-            padding: EdgeInsets.only(top: 16),
+            padding: const EdgeInsets.only(top: 16),
             child: Divider(
               height: 1,
               thickness: 1,
-              color: MiPixColors.miuiDivider,
+              color: palette.divider,
             ),
           ),
         ),
@@ -349,10 +294,10 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
               ? const SizedBox.shrink()
               : Text(
                   title,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 14,
                     fontWeight: FontWeight.w500,
-                    color: MiPixColors.miuiSubText,
+                    color: palette.textSecondary,
                   ),
                 ),
         ),
@@ -409,7 +354,7 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
   void _openAlbum(Album album) {
     Navigator.push(
       context,
-      PageFadeTransition(
+      PageSlideTransition(
         child: PhotoGridScreen(
           albumId: album.id,
           albumName: album.name,
@@ -439,10 +384,11 @@ class _AlbumCard extends StatelessWidget {
     this.onLongPress,
   });
 
-  /// 与小米相册一致：封面在上（约 1.15 宽高比、圆角 12），
+  /// 与小米相册一致：封面为正方形（1:1、圆角 12），
   /// 相册名与张数排在封面下方（名称近黑、数量灰色）。
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     return BounceTap(
       onTap: onTap,
       onLongPress: onLongPress,
@@ -451,7 +397,7 @@ class _AlbumCard extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           AspectRatio(
-            aspectRatio: 1.15,
+            aspectRatio: 1.0,
             child: ClipRRect(
               borderRadius: BorderRadius.circular(12),
               child: Stack(
@@ -468,10 +414,10 @@ class _AlbumCard extends StatelessWidget {
                         File(coverPath!),
                         fit: BoxFit.cover,
                         cacheWidth: 400,
-                        errorBuilder: (_, __, ___) => _placeholder(),
+                        errorBuilder: (_, __, ___) => _placeholder(context),
                       )
                   else
-                    _placeholder(),
+                    _placeholder(context),
                   if (icon == Icons.videocam)
                     const Positioned(
                       left: 6,
@@ -489,10 +435,10 @@ class _AlbumCard extends StatelessWidget {
           const SizedBox(height: 8),
           Text(
             name,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 15,
               fontWeight: FontWeight.w500,
-              color: MiPixColors.miuiText,
+              color: palette.textPrimary,
               height: 1.2,
             ),
             maxLines: 2,
@@ -501,9 +447,9 @@ class _AlbumCard extends StatelessWidget {
           const SizedBox(height: 1),
           Text(
             '$count',
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 13,
-              color: MiPixColors.miuiSubText,
+              color: palette.textSecondary,
               height: 1.2,
             ),
           ),
@@ -512,14 +458,15 @@ class _AlbumCard extends StatelessWidget {
     );
   }
 
-  Widget _placeholder() {
+  Widget _placeholder(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     return Container(
-      color: MiPixColors.miuiGridFill,
+      color: palette.fill,
       child: Center(
         child: Icon(
           icon ?? Icons.folder,
           size: 40,
-          color: MiPixColors.miuiSubText.withValues(alpha: 0.6),
+          color: palette.textSecondary.withValues(alpha: 0.6),
         ),
       ),
     );
