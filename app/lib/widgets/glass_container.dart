@@ -3,13 +3,6 @@ import 'package:flutter/material.dart';
 
 import '../utils/mipix_theme.dart';
 
-class GlassNavItem {
-  final Widget icon;
-  final Widget? selectedIcon;
-  final String label;
-  const GlassNavItem({required this.icon, this.selectedIcon, required this.label});
-}
-
 /// 玻璃拟态容器
 /// 支持模糊、半透明背景、边框光效
 class GlassContainer extends StatelessWidget {
@@ -62,143 +55,6 @@ class GlassContainer extends StatelessWidget {
   }
 }
 
-/// 玻璃拟态底部栏
-///
-/// [light] 为 true 时切换为小米相册的浅色导航栏（白底 + MIUI 蓝选中态）。
-class GlassBottomBar extends StatelessWidget {
-  final int selectedIndex;
-  final ValueChanged<int> onDestinationSelected;
-  final List<GlassNavItem> destinations;
-  final bool light;
-
-  const GlassBottomBar({
-    super.key,
-    required this.selectedIndex,
-    required this.onDestinationSelected,
-    required this.destinations,
-    this.light = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    if (light) return _buildLight();
-
-    return Container(
-      decoration: BoxDecoration(
-        border: Border(
-          top: BorderSide(color: Colors.white.withValues(alpha: 0.06)),
-        ),
-      ),
-      child: ClipRRect(
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-          child: Container(
-            color: Colors.black.withValues(alpha: 0.4),
-            child: SafeArea(
-              top: false,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: destinations.asMap().entries.map((entry) {
-                    final index = entry.key;
-                    final dest = entry.value;
-                    final isSelected = index == selectedIndex;
-                    return GestureDetector(
-                      onTap: () => onDestinationSelected(index),
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        curve: Curves.easeOut,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        decoration: BoxDecoration(
-                          color: isSelected
-                              ? Colors.white.withValues(alpha: 0.1)
-                              : Colors.transparent,
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            isSelected ? (dest.selectedIcon ?? dest.icon) : dest.icon,
-                            const SizedBox(height: 2),
-                            Text(
-                              dest.label,
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400,
-                                color: isSelected
-                                    ? Colors.white
-                                    : Colors.white.withValues(alpha: 0.5),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  }).toList(),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 小米相册风格导航栏：白底、顶部细分割线、选中项为 MIUI 蓝。
-  Widget _buildLight() {
-    return Container(
-      decoration: const BoxDecoration(
-        color: MiPixColors.miuiBackground,
-        border: Border(top: BorderSide(color: MiPixColors.miuiDivider)),
-      ),
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: destinations.asMap().entries.map((entry) {
-              final index = entry.key;
-              final dest = entry.value;
-              final isSelected = index == selectedIndex;
-              final color =
-                  isSelected ? MiPixColors.miuiBlue : MiPixColors.miuiSubText;
-              return GestureDetector(
-                onTap: () => onDestinationSelected(index),
-                behavior: HitTestBehavior.opaque,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconTheme(
-                        data: IconThemeData(color: color),
-                        child:
-                            isSelected ? (dest.selectedIcon ?? dest.icon) : dest.icon,
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        dest.label,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight:
-                              isSelected ? FontWeight.w600 : FontWeight.w400,
-                          color: color,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 /// 日期分组标题（照片页）。
 ///
 /// 采用小米相册的样式：小字号、加粗、近黑色、左对齐。
@@ -212,10 +68,10 @@ class DateGroupHeader extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
       child: Text(
         text,
-        style: const TextStyle(
+        style: TextStyle(
           fontSize: 17,
           fontWeight: FontWeight.w600,
-          color: MiPixColors.miuiText,
+          color: MiPixPalette.of(context).textPrimary,
           height: 1.2,
         ),
       ),
@@ -273,28 +129,20 @@ class EmptyStateWidget extends StatelessWidget {
   final String? subtitle;
   final Widget? action;
 
-  /// 浅色页面（MIUI 相册风格）下使用深色文字。
-  final bool light;
-
   const EmptyStateWidget({
     super.key,
     required this.icon,
     required this.title,
     this.subtitle,
     this.action,
-    this.light = false,
   });
 
   @override
   Widget build(BuildContext context) {
-    final iconColor = light
-        ? MiPixColors.miuiSubText.withValues(alpha: 0.5)
-        : Colors.white.withValues(alpha: 0.3);
-    final titleColor =
-        light ? MiPixColors.miuiText : Colors.white.withValues(alpha: 0.6);
-    final subtitleColor = light
-        ? MiPixColors.miuiSubText
-        : Colors.white.withValues(alpha: 0.35);
+    final palette = MiPixPalette.of(context);
+    final iconColor = palette.textSecondary.withValues(alpha: 0.5);
+    final titleColor = palette.textPrimary;
+    final subtitleColor = palette.textSecondary;
 
     return Center(
       child: Column(
@@ -304,9 +152,7 @@ class EmptyStateWidget extends StatelessWidget {
             width: 80,
             height: 80,
             decoration: BoxDecoration(
-              color: light
-                  ? MiPixColors.miuiGridFill
-                  : Colors.white.withValues(alpha: 0.05),
+              color: palette.fill,
               shape: BoxShape.circle,
             ),
             child: Icon(icon, size: 36, color: iconColor),

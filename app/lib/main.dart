@@ -32,7 +32,7 @@ class MiPixApp extends ConsumerWidget {
       title: '米影相册',
       debugShowCheckedModeBanner: false,
       themeMode: themeMode,
-      theme: MiPixTheme.darkTheme,
+      theme: MiPixTheme.lightTheme,
       darkTheme: MiPixTheme.darkTheme,
       home: const MainScreen(),
     );

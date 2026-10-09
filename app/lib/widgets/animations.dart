@@ -117,7 +117,10 @@ class PhotoFadeIn extends StatelessWidget {
   }
 }
 
-/// 页面切换动画 — 淡入 + 轻微上滑
+/// 页面切换动画 — 淡入 + 轻微上滑。
+///
+/// 适用于前后底色反差明显的跳转（例如白底缩略图 → 黑色大图查看页），
+/// 此时淡入清晰可见。若前后都是白底页面请改用 [PageSlideTransition]。
 class PageFadeTransition extends PageRouteBuilder {
   final Widget child;
 
@@ -142,6 +145,39 @@ class PageFadeTransition extends PageRouteBuilder {
             );
           },
           transitionDuration: const Duration(milliseconds: 250),
+        );
+}
+
+/// 页面下钻切换动画 — 新页面自右侧滑入，被覆盖的旧页面同步左移让出（视差）。
+///
+/// 为什么不复用 [PageFadeTransition]：本应用主界面各页背景都是纯白，
+/// 白底页面之间做淡入淡出几乎察觉不到，观感等同于「没有过渡动画」。
+/// 横向滑动即便前后同为白底也清晰可见，与 MIUI 相册逐级下钻的转场一致。
+class PageSlideTransition extends PageRouteBuilder {
+  final Widget child;
+
+  PageSlideTransition({required this.child})
+      : super(
+          transitionDuration: const Duration(milliseconds: 300),
+          reverseTransitionDuration: const Duration(milliseconds: 260),
+          pageBuilder: (context, animation, secondaryAnimation) => child,
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            const curve = Curves.easeOutCubic;
+            // 本页面入场：自屏幕右侧整屏滑入。
+            final enter =
+                Tween(begin: const Offset(1.0, 0.0), end: Offset.zero)
+                    .chain(CurveTween(curve: curve))
+                    .animate(animation);
+            // 本页面被新页面覆盖时：向左让出 25% 宽度，形成层次感。
+            final exit =
+                Tween(begin: Offset.zero, end: const Offset(-0.25, 0.0))
+                    .chain(CurveTween(curve: curve))
+                    .animate(secondaryAnimation);
+            return SlideTransition(
+              position: exit,
+              child: SlideTransition(position: enter, child: child),
+            );
+          },
         );
 }
 

@@ -57,8 +57,12 @@ class LocalLibraryNotifier extends StateNotifier<AsyncValue<LocalLibrary>> {
 
   final Ref _ref;
 
+  /// 读取本地相册库。
+  ///
+  /// 已有数据时保持旧数据静默刷新（不回到 loading），
+  /// 避免切页或手动刷新时闪出一次转圈。
   Future<void> load() async {
-    state = const AsyncValue.loading();
+    if (!state.hasValue) state = const AsyncValue.loading();
     try {
       final access = await _ref.read(localAccessProvider.notifier).ensure();
       if (!access.canRead) {

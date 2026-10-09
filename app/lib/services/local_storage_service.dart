@@ -5,6 +5,31 @@ import '../models/models.dart';
 class LocalStorageService {
   static const _smbServersKey = 'smb_servers';
   static const _transfersKey = 'transfers';
+  static const _syncedPhotosKey = 'synced_photos';
+
+  /// 已成功备份到 SMB 的本地图片路径集合（用于区分已同步 / 未同步）。
+  Future<Set<String>> getSyncedPhotos() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(_syncedPhotosKey)?.toSet() ?? <String>{};
+  }
+
+  Future<bool> isSynced(String localPath) async {
+    final synced = await getSyncedPhotos();
+    return synced.contains(localPath);
+  }
+
+  Future<void> markSynced(List<String> localPaths) async {
+    if (localPaths.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final synced = prefs.getStringList(_syncedPhotosKey)?.toSet() ?? <String>{};
+    synced.addAll(localPaths);
+    await prefs.setStringList(_syncedPhotosKey, synced.toList());
+  }
+
+  Future<void> clearSynced() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_syncedPhotosKey);
+  }
 
   Future<List<SmbConfig>> getSmbServers() async {
     final prefs = await SharedPreferences.getInstance();
