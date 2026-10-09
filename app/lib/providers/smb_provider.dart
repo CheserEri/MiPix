@@ -63,6 +63,27 @@ class SmbServersNotifier extends StateNotifier<AsyncValue<List<SmbConfig>>> {
 final selectedSmbServerProvider = StateProvider<String?>((ref) => null);
 final smbCurrentPathProvider = StateProvider<String>((ref) => '');
 
+/// SMB 相册首次加载时的扫描（EXIF 拍摄时间探测）进度。
+class SmbScanProgress {
+  /// 是否正在扫描。
+  final bool scanning;
+
+  /// 已处理项数。
+  final int done;
+
+  /// 总项数；未知时为 0（进度条显示为不确定态）。
+  final int total;
+
+  const SmbScanProgress({this.scanning = false, this.done = 0, this.total = 0});
+
+  double get fraction => total > 0 ? (done / total).clamp(0.0, 1.0) : 0.0;
+}
+
+final smbScanProgressProvider =
+    StateProvider.family<SmbScanProgress, ({String serverId, String path})>(
+  (ref, params) => const SmbScanProgress(),
+);
+
 final smbAlbumsProvider = FutureProvider.family<List<Album>, String>(
   (ref, serverId) async {
     final path = ref.watch(smbCurrentPathProvider);
@@ -86,6 +107,13 @@ class SmbItemsPagedNotifier extends StateNotifier<AsyncValue<MediaItemPage>> {
     load();
   }
 
+  ({String serverId, String path}) get _progressKey =>
+      (serverId: server.id, path: path);
+
+  void _setProgress(SmbScanProgress progress) {
+    ref.read(smbScanProgressProvider(_progressKey).notifier).state = progress;
+  }
+
   Future<void> load() async {
     state = const AsyncValue.loading();
     try {
@@ -94,10 +122,19 @@ class SmbItemsPagedNotifier extends StateNotifier<AsyncValue<MediaItemPage>> {
         path: path,
         offset: 0,
         limit: pageSize,
+        onProgress: (done, total) {
+          _setProgress(SmbScanProgress(
+            scanning: done < total,
+            done: done,
+            total: total,
+          ));
+        },
       );
       state = AsyncValue.data(page);
     } catch (e, st) {
       state = AsyncValue.error(e, st);
+    } finally {
+      _setProgress(const SmbScanProgress());
     }
   }
 
