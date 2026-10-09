@@ -221,9 +221,12 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
           iconTheme: IconThemeData(color: palette.textPrimary),
         ),
         body: pagedAsync.when(
-          loading: () => Center(
-            child: CircularProgressIndicator(color: palette.accent),
-          ),
+          loading: () {
+            final progress = ref.watch(
+              smbScanProgressProvider((serverId: widget.albumId, path: path)),
+            );
+            return _buildScanProgress(palette, progress);
+          },
           error: (err, _) => Center(
             child: Text('加载失败: $err',
                 style: TextStyle(color: palette.textSecondary)),
@@ -344,6 +347,46 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
               backgroundColor: palette.accent,
             )
           : null,
+      ),
+    );
+  }
+
+  /// 远程相册首次进入需全量探测 EXIF 拍摄时间（大相册耗时较久），
+  /// 用带百分比的进度条替代单纯转圈，让用户明确知道还要等多久。
+  Widget _buildScanProgress(MiPixPalette palette, SmbScanProgress progress) {
+    final hasTotal = progress.total > 0;
+    final percent = (progress.fraction * 100).round();
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              hasTotal ? '正在读取拍摄时间' : '正在加载',
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w500,
+                color: palette.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 16),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: hasTotal ? progress.fraction : null,
+                minHeight: 6,
+                backgroundColor: palette.fill,
+                valueColor: AlwaysStoppedAnimation<Color>(palette.accent),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              hasTotal ? '$percent%  ·  ${progress.done}/${progress.total}' : '',
+              style: TextStyle(fontSize: 13, color: palette.textSecondary),
+            ),
+          ],
+        ),
       ),
     );
   }

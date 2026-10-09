@@ -22,6 +22,9 @@ class MediaItemPage {
   MediaItemPage({required this.items, required this.total, required this.hasMore});
 }
 
+/// 相册扫描进度回调：`done` 为已处理项数，`total` 为总项数。
+typedef ScanProgressCallback = void Function(int done, int total);
+
 class SmbService {
   final Map<String, _ConnectionWrapper> _connections = {};
   static const _maxConnectionAge = Duration(minutes: 1);
@@ -70,18 +73,13 @@ class SmbService {
     if (_connections.containsKey(key)) {
       final wrapper = _connections[key]!;
       if (wrapper.isValid && now.difference(wrapper.lastUsed) < _maxConnectionAge) {
-        try {
-          await wrapper.connect.listShares();
-          wrapper.lastUsed = now;
-          return wrapper.connect;
-        } catch (_) {
-          await wrapper.connect.close();
-          _connections.remove(key);
-        }
-      } else {
-        await wrapper.connect.close();
-        _connections.remove(key);
+        // 不再每次调用都做一次 listShares() 探活：该往返在批量扫描（如逐文件读头）
+        // 时会被放大成主要开销。连接失效由各调用方的重试与 _invalidateConnection 兜底。
+        wrapper.lastUsed = now;
+        return wrapper.connect;
       }
+      await wrapper.connect.close();
+      _connections.remove(key);
     }
 
     try {
@@ -159,7 +157,12 @@ class SmbService {
     return [];
   }
 
-  Future<List<MediaItem>> getAllMediaItems(SmbConfig config, {String path = '', bool useCache = true}) async {
+  Future<List<MediaItem>> getAllMediaItems(
+    SmbConfig config, {
+    String path = '',
+    bool useCache = true,
+    ScanProgressCallback? onProgress,
+  }) async {
     await _ensureCacheInitialized();
     if (useCache) {
       final cached = await _cacheService.getCachedAlbumMediaItems(config.id, path);
@@ -197,9 +200,10 @@ class SmbService {
           }
         }
         // 按 EXIF 拍摄时间校准排序：优先 DateTimeOriginal，回退文件 mtime。
-        await _enrichWithExifDates(config, items);
-        await _cacheService.cacheAlbumMediaItems(config.id, path, _sortByDateDesc(items));
-        return items;
+        await _enrichWithExifDates(config, path, items, onProgress: onProgress);
+        final sorted = _sortByDateDesc(items);
+        await _cacheService.cacheAlbumMediaItems(config.id, path, sorted);
+        return sorted;
       } on SmbException catch (e) {
         final msg = e.toString().toLowerCase();
         final isConnectionError = msg.contains('network name') ||
@@ -225,38 +229,116 @@ class SmbService {
     return items;
   }
 
-  /// 用 EXIF 拍摄时间校准列表中各项的 modifiedAt（JPEG 才有 EXIF）。
+  /// 扫描时同时建立的独立连接数。同一条 SMB 连接上的读操作无法真正并行，
+  /// 必须用多条连接才能把逐文件读头的耗时分摊开（NAS 连接数上限较低时会自动降级）。
+  static const int _exifScanConnections = 8;
+
+  /// 扫描进度落盘间隔（每处理这么多项写一次 EXIF 缓存），
+  /// 兼顾中断续传与避免高频序列化整个映射表。
+  static const int _exifPersistEvery = 256;
+
+  /// 用 EXIF 拍摄时间校准列表中各项的 modifiedAt（仅 JPEG 才有 EXIF）。
   ///
-  /// 仅探测文件头部（与缩略图探测共用同一局部读取），并发数受限以免压垮 SMB。
+  /// - 已缓存的探测结果直接复用，只处理尚未知的文件；
+  /// - 用一组独立连接并行读文件头，真正分摊网络耗时；
+  /// - 每处理若干项即增量写入缓存，扫描被中断后下次可续传；
+  /// - 通过 [onProgress] 汇报进度，供 UI 显示进度条。
   /// 任一项失败都静默回退到已有的文件 mtime，不影响列表可用性。
-  Future<void> _enrichWithExifDates(SmbConfig config, List<MediaItem> items) async {
+  Future<void> _enrichWithExifDates(
+    SmbConfig config,
+    String albumPath,
+    List<MediaItem> items, {
+    ScanProgressCallback? onProgress,
+  }) async {
     if (items.isEmpty) return;
-    const concurrency = 4;
-    var cursor = 0;
-    while (cursor < items.length) {
-      final end = (cursor + concurrency > items.length) ? items.length : cursor + concurrency;
-      final results = await Future.wait(
-        List.generate(end - cursor, (i) => _probeExifDate(config, items[cursor + i])),
-      );
-      for (var i = 0; i < results.length; i++) {
-        if (results[i] != null) {
-          items[cursor + i] = items[cursor + i].copyWith(modifiedAt: results[i]);
+    final total = items.length;
+
+    final dates = await _cacheService.getCachedExifDates(config.id, albumPath);
+
+    // 先应用缓存结果，并筛出仍需探测的项；非 JPEG 无 EXIF，直接算作已处理。
+    final needProbe = <int>[];
+    var done = 0;
+    for (var i = 0; i < items.length; i++) {
+      final ms = dates[items[i].path];
+      if (ms != null) {
+        items[i] = items[i].copyWith(modifiedAt: DateTime.fromMillisecondsSinceEpoch(ms));
+        done++;
+      } else if (items[i].mimeType.startsWith('image/jpeg')) {
+        needProbe.add(i);
+      } else {
+        done++;
+      }
+    }
+    onProgress?.call(done, total);
+    if (needProbe.isEmpty) return;
+
+    // 为本次扫描建立一批独立连接。若 NAS 限制并发连接数，则用已建立的数量降级运行。
+    final connections = <SmbConnect>[];
+    try {
+      for (var i = 0; i < _exifScanConnections; i++) {
+        try {
+          connections.add(await SmbConnect.connectAuth(
+            host: config.host,
+            domain: config.domain,
+            username: config.username,
+            password: config.password ?? '',
+          ));
+        } catch (_) {
+          break;
         }
       }
-      cursor = end;
+      // 一条连接都建不起来时（网络异常等）直接放弃探测，列表仍按 mtime 展示。
+      if (connections.isEmpty) return;
+
+      var next = 0;
+      var sincePersist = 0;
+
+      Future<void> worker(SmbConnect conn) async {
+        while (true) {
+          // 无 await 间隔，索引分配在事件循环中天然原子，无并发竞争。
+          final local = next;
+          if (local >= needProbe.length) break;
+          next = local + 1;
+
+          final idx = needProbe[local];
+          try {
+            final date = await _probeExifDateVia(conn, config, items[idx]);
+            if (date != null) {
+              items[idx] = items[idx].copyWith(modifiedAt: date);
+              dates[items[idx].path] = date.millisecondsSinceEpoch;
+            }
+          } catch (_) {
+            // 单个文件探测失败静默回退文件 mtime，不中断整体扫描。
+          }
+
+          done++;
+          onProgress?.call(done, total);
+          if (++sincePersist >= _exifPersistEvery) {
+            sincePersist = 0;
+            await _cacheService.cacheExifDates(config.id, albumPath, dates);
+          }
+        }
+      }
+
+      await Future.wait(connections.map(worker));
+      await _cacheService.cacheExifDates(config.id, albumPath, dates);
+    } finally {
+      for (final conn in connections) {
+        try {
+          await conn.close();
+        } catch (_) {
+          // 关闭失败无需处理，连接已随扫描结束废弃。
+        }
+      }
     }
   }
 
-  /// 读取文件头部并解析 EXIF 拍摄时间；失败/无 EXIF 时返回 null。
-  Future<DateTime?> _probeExifDate(SmbConfig config, MediaItem item) async {
+  /// 用指定连接读取文件头部并解析 EXIF 拍摄时间；失败/无 EXIF 时返回 null。
+  Future<DateTime?> _probeExifDateVia(SmbConnect connect, SmbConfig config, MediaItem item) async {
     if (!item.mimeType.startsWith('image/jpeg')) return null;
-    try {
-      final header = await _readHeader(config, item.path, _thumbnailProbeBytes);
-      if (header.isEmpty) return null;
-      return _parseExifDateTime(header);
-    } catch (_) {
-      return null;
-    }
+    final header = await _readHeaderVia(connect, config, item.path, _exifDateProbeBytes);
+    if (header.isEmpty) return null;
+    return _parseExifDateTime(header);
   }
 
   Future<MediaItemPage> getMediaItems(
@@ -265,8 +347,14 @@ class SmbService {
     int offset = 0,
     int limit = _pageSize,
     bool useCache = true,
+    ScanProgressCallback? onProgress,
   }) async {
-    final allItems = await getAllMediaItems(config, path: path, useCache: useCache);
+    final allItems = await getAllMediaItems(
+      config,
+      path: path,
+      useCache: useCache,
+      onProgress: onProgress,
+    );
 
     final total = allItems.length;
     final end = (offset + limit > total) ? total : offset + limit;
@@ -513,6 +601,11 @@ class SmbService {
   /// 避免为了显示网格而下载整张原图。
   static const int _thumbnailProbeBytes = 256 * 1024;
 
+  /// EXIF 拍摄时间探测的读取上限。DateTimeOriginal 位于 APP1 的 IFD 结构中，
+  /// 紧邻文件头部，64KB 足以覆盖；比缩略图探测的缓冲区小得多，
+  /// 在大相册逐文件扫描时可显著降低网络开销。
+  static const int _exifDateProbeBytes = 64 * 1024;
+
   /// 进程内缩略图内存缓存：避免列表重建时反复走「内存→磁盘→网络」全流程。
   static final Map<String, Uint8List> _thumbnailMemoryCache = {};
   static const int _thumbnailMemoryCacheLimit = 400;
@@ -577,19 +670,7 @@ class SmbService {
     while (retries-- > 0) {
       try {
         final connect = await _getConnection(config);
-        final fullPath = remotePath.startsWith('/')
-            ? _buildSMBPath(config, remotePath.substring(1))
-            : _buildSMBPath(config, remotePath);
-        final file = await connect.file(fullPath);
-        final size = file.size;
-        final end = (size > 0 && size < maxBytes) ? size : maxBytes;
-        final stream = await connect.openRead(file, 0, end);
-        final bytes = <int>[];
-        await for (final chunk in stream) {
-          bytes.addAll(chunk);
-          if (bytes.length >= end) break;
-        }
-        return Uint8List.fromList(bytes);
+        return await _readHeaderVia(connect, config, remotePath, maxBytes);
       } on SmbException catch (e) {
         final msg = e.toString().toLowerCase();
         final isConnectionError = msg.contains('network name') ||
@@ -607,6 +688,29 @@ class SmbService {
       }
     }
     return Uint8List(0);
+  }
+
+  /// 用指定连接读取文件开头 [maxBytes] 字节。不负责重试与连接失效处理，
+  /// 便于扫描阶段用各自的独立连接直接调用。
+  Future<Uint8List> _readHeaderVia(
+    SmbConnect connect,
+    SmbConfig config,
+    String remotePath,
+    int maxBytes,
+  ) async {
+    final fullPath = remotePath.startsWith('/')
+        ? _buildSMBPath(config, remotePath.substring(1))
+        : _buildSMBPath(config, remotePath);
+    final file = await connect.file(fullPath);
+    final size = file.size;
+    final end = (size > 0 && size < maxBytes) ? size : maxBytes;
+    final stream = await connect.openRead(file, 0, end);
+    final bytes = <int>[];
+    await for (final chunk in stream) {
+      bytes.addAll(chunk);
+      if (bytes.length >= end) break;
+    }
+    return Uint8List.fromList(bytes);
   }
 
   /// 从 JPEG 头部字节中提取 EXIF 内嵌缩略图。

@@ -17,6 +17,10 @@ class CacheService {
   static const _thumbnailSize = 200;
   static const _cacheLimitKey = 'cache_limit_bytes';
 
+  /// 相册媒体列表缓存版本：排序依据切换为 EXIF 拍摄时间时递增，
+  /// 使旧的 mtime 缓存失效并触发一次重新探测。
+  static const _albumMediaCacheVersion = 'v3';
+
   /// 默认缓存上限：500 MB。
   static const int defaultCacheLimitBytes = 500 * 1024 * 1024;
 
@@ -108,8 +112,7 @@ class CacheService {
 
   Future<void> cacheAlbumMediaItems(String serverId, String albumPath, List<MediaItem> items) async {
     await ensureInitialized();
-    // v3：排序依据改为 EXIF 拍摄时间，旧的 mtime 缓存需失效以重新探测。
-    final key = '$_albumCachePrefix${serverId}_${albumPath}_v3';
+    final key = '$_albumCachePrefix${serverId}_${albumPath}_$_albumMediaCacheVersion';
     final data = {
       'timestamp': DateTime.now().millisecondsSinceEpoch,
       'items': items.map((e) => e.toJson()).toList(),
@@ -119,7 +122,7 @@ class CacheService {
 
   Future<List<MediaItem>?> getCachedAlbumMediaItems(String serverId, String albumPath) async {
     await ensureInitialized();
-    final key = '$_albumCachePrefix${serverId}_${albumPath}_v2';
+    final key = '$_albumCachePrefix${serverId}_${albumPath}_$_albumMediaCacheVersion';
     final data = _prefs!.getString(key);
     if (data == null) return null;
 
@@ -135,6 +138,43 @@ class CacheService {
     } catch (_) {
       return null;
     }
+  }
+
+  /// EXIF 拍摄时间缓存：记录「文件路径 → 拍摄时间(毫秒)」。
+  ///
+  /// 大相册全量探测 EXIF 耗时较久，扫描过程中分批增量写入，
+  /// 若中途退出，下次进入可跳过已探测的文件继续，避免重复劳动。
+  /// 键前缀复用 `album_cache_`，可被既有的过期清理逻辑一并回收。
+  String _exifDatesKey(String serverId, String albumPath) =>
+      '${_albumCachePrefix}exif_${serverId}_$albumPath';
+
+  Future<Map<String, int>> getCachedExifDates(String serverId, String albumPath) async {
+    await ensureInitialized();
+    final key = _exifDatesKey(serverId, albumPath);
+    final data = _prefs!.getString(key);
+    if (data == null) return <String, int>{};
+    try {
+      final json = jsonDecode(data) as Map<String, dynamic>;
+      final timestamp = json['timestamp'] as int;
+      if (DateTime.now().millisecondsSinceEpoch - timestamp > _defaultCacheDuration.inMilliseconds) {
+        await _prefs!.remove(key);
+        return <String, int>{};
+      }
+      final dates = json['dates'] as Map<String, dynamic>;
+      return dates.map((k, v) => MapEntry(k, v as int));
+    } catch (_) {
+      return <String, int>{};
+    }
+  }
+
+  Future<void> cacheExifDates(String serverId, String albumPath, Map<String, int> dates) async {
+    await ensureInitialized();
+    final key = _exifDatesKey(serverId, albumPath);
+    final data = {
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'dates': dates,
+    };
+    await _prefs!.setString(key, jsonEncode(data));
   }
 
   Future<void> cacheAlbums(String serverId, List<Album> albums) async {
