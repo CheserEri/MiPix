@@ -535,7 +535,9 @@ class _BottomActionBar extends ConsumerWidget {
           [photo.path],
         );
     final String message;
-    if (result.successCount == 0 && result.failedCount == 0) {
+    if (result.allAlreadyBackedUp) {
+      message = '该照片已在服务器上，无需重复备份';
+    } else if (result.successCount == 0 && result.failedCount == 0) {
       message = '该照片正在上传中';
     } else if (result.allSucceeded) {
       message = '已加入备份队列';

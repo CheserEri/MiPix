@@ -7,6 +7,7 @@ import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
 import '../widgets/animations.dart';
 import '../widgets/local_media_thumb.dart';
+import '../widgets/smb_server_switcher.dart';
 import '../utils/mipix_theme.dart';
 
 class TransfersScreen extends ConsumerStatefulWidget {
@@ -39,9 +40,16 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
   Widget build(BuildContext context) {
     super.build(context); // AutomaticKeepAliveClientMixin 要求先调用
     final transfersAsync = ref.watch(transfersProvider);
-    final photos = ref.watch(localPhotosProvider).valueOrNull ?? [];
-    final synced = ref.watch(syncedPhotosProvider);
-    final unsynced = photos.where((p) => !synced.contains(p.path)).toList();
+    final unsynced = ref.watch(unsyncedPhotosProvider);
+
+    // 正在排队/上传的本地文件 → 任务，用于在对应缩略图底部叠加进度条。
+    final uploadsByPath = <String, TransferTask>{};
+    for (final t in transfersAsync.valueOrNull ?? const <TransferTask>[]) {
+      if (t.status == TransferStatus.running ||
+          t.status == TransferStatus.pending) {
+        uploadsByPath[t.localPath] = t;
+      }
+    }
 
     final palette = MiPixPalette.of(context);
     return Scaffold(
@@ -53,6 +61,7 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
             child: _sectionHeader(
               '未同步',
               subtitle: '共 ${unsynced.length} 张',
+              switcher: true,
               action: unsynced.isEmpty
                   ? null
                   : TextButton.icon(
@@ -86,7 +95,11 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
                     final photo = unsynced[index];
                     return BounceTap(
                       onTap: () => _backupOne(photo),
-                      child: LocalMediaThumb(item: photo),
+                      child: _thumbWithProgress(
+                        photo,
+                        uploadsByPath[photo.path],
+                        palette,
+                      ),
                     );
                   },
                   childCount: unsynced.length,
@@ -156,7 +169,53 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     );
   }
 
-  Widget _sectionHeader(String title, {String? subtitle, Widget? action}) {
+  /// 缩略图底部叠加上传进度条：直观显示这张照片的备份进度。
+  ///
+  /// [task] 为 null 表示该照片当前不在传输中，直接显示原缩略图。
+  Widget _thumbWithProgress(
+    MediaItem photo,
+    TransferTask? task,
+    MiPixPalette palette,
+  ) {
+    final thumb = LocalMediaThumb(item: photo);
+    if (task == null) return thumb;
+
+    // 排队阶段进度未知，显示不确定态（来回滚动）的进度条。
+    final value = task.status == TransferStatus.pending ? null : task.progress;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        thumb,
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(3, 6, 3, 3),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Colors.transparent, Colors.black54],
+              ),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                value: value,
+                minHeight: 3,
+                backgroundColor: Colors.white24,
+                valueColor: AlwaysStoppedAnimation<Color>(palette.accent),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sectionHeader(String title,
+      {String? subtitle, Widget? action, bool switcher = false}) {
     final palette = MiPixPalette.of(context);
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 16, 12, 10),
@@ -181,6 +240,11 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
             ),
           ],
           const Spacer(),
+          if (switcher) ...[
+            // 备份目标是「当前服务器」，在此提供快速切换入口。
+            const SmbServerSwitcher(),
+            const SizedBox(width: 4),
+          ],
           if (action != null) action,
         ],
       ),
@@ -288,16 +352,21 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
           paths,
         );
     if (!mounted) return;
+    final String message;
+    if (result.allAlreadyBackedUp) {
+      message = '所选照片均已在服务器上，无需重复备份（${result.skippedCount} 项）';
+    } else if (result.allSucceeded) {
+      message = result.skippedCount > 0
+          ? '已加入备份队列 ${result.successCount} 项，${result.skippedCount} 项已备份跳过'
+          : '已加入备份队列 ${result.successCount} 项';
+    } else if (result.allFailed) {
+      message = '备份失败，请检查 SMB 配置';
+    } else {
+      message = '部分备份成功：成功 ${result.successCount}，失败 ${result.failedCount}'
+          '${result.skippedCount > 0 ? '，跳过 ${result.skippedCount}' : ''}';
+    }
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          result.allSucceeded
-              ? '已加入备份队列 ${result.successCount} 项'
-              : result.allFailed
-                  ? '备份失败，请检查 SMB 配置'
-                  : '部分备份成功：成功 ${result.successCount}，失败 ${result.failedCount}',
-        ),
-      ),
+      SnackBar(content: Text(message)),
     );
   }
 

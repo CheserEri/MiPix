@@ -312,7 +312,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                     }).toList(),
                   ),
                   const SizedBox(height: 16),
-                  Text('将按照片在手机上的相册目录结构备份到服务器',
+                  Text('将按手机相册名称在服务器上创建同名文件夹',
                       style: TextStyle(
                           fontSize: 13, color: palette.textSecondary)),
                   const SizedBox(height: 16),
@@ -330,22 +330,28 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                                     selectedServer!,
                                     paths,
                                   );
-                              ref.read(defaultServerProvider.notifier).state =
-                                  selectedServer;
+                              ref.read(defaultServerProvider.notifier).select(selectedServer!);
                               if (!context.mounted) return;
                               Navigator.pop(context);
                               toggleMultiSelect(ref);
                               final String message;
-                              if (result.successCount == 0 &&
+                              if (result.allAlreadyBackedUp) {
+                                message =
+                                    '所选照片均已在服务器上，无需重复备份（${result.skippedCount} 项）';
+                              } else if (result.successCount == 0 &&
                                   result.failedCount == 0) {
                                 message = '所选照片均在上传中，已跳过';
                               } else if (result.allSucceeded) {
-                                message = '已加入备份队列 ${result.successCount} 项';
+                                message = result.skippedCount > 0
+                                    ? '已加入备份队列 ${result.successCount} 项，'
+                                        '${result.skippedCount} 项已备份跳过'
+                                    : '已加入备份队列 ${result.successCount} 项';
                               } else if (result.allFailed) {
                                 message = '备份失败，请检查 SMB 配置或后端连接';
                               } else {
                                 message =
-                                    '部分备份已加入队列：成功 ${result.successCount}，失败 ${result.failedCount}';
+                                    '部分备份已加入队列：成功 ${result.successCount}，失败 ${result.failedCount}'
+                                    '${result.skippedCount > 0 ? '，跳过 ${result.skippedCount}' : ''}';
                               }
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(content: Text(message)),
