@@ -404,12 +404,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
               var attempts = 3;
               while (true) {
                 try {
-                  final bytes = await File(item.localPath).readAsBytes();
                   await _smbService.uploadFileVia(
                     connections[index],
                     server,
                     item.remotePath,
-                    bytes,
+                    item.localPath,
                     onProgress: (progress) => _updateTaskProgress(
                       item.taskId,
                       (progress * item.size).round(),

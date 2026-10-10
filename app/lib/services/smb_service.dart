@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -200,7 +201,7 @@ class SmbService {
 
         final items = <MediaItem>[];
         for (final file in files) {
-          if (!file.isDirectory() && _isImage(file.name)) {
+          if (!file.isDirectory() && _isMedia(file.name)) {
             items.add(MediaItem(
               id: file.path,
               name: file.name,
@@ -493,11 +494,11 @@ class SmbService {
     return [];
   }
 
-  /// 递归收集 [basePath] 下所有「直接包含图片」的目录作为相册。
+  /// 递归收集 [basePath] 下所有「直接包含媒体文件」的目录作为相册。
   ///
   /// 之前只扫描一层，导致 `DCIM/Camera`、`Pictures/Weixin` 这类
   /// 二级目录永远不会出现在相册列表里。现在按深度递归，任一目录只要
-  /// 直接含有图片就算作相册；不含图片但含子目录的目录继续向下查找。
+  /// 直接含有图片或视频就算作相册；只含子目录的目录继续向下查找。
   Future<void> _collectAlbums(
     SmbConnect connect,
     SmbConfig config, {
@@ -512,11 +513,13 @@ class SmbService {
     final folder = await connect.file(_buildSMBPath(config, currentPath));
     final files = await connect.listFiles(folder);
 
-    final imageFiles =
-        files.where((f) => !f.isDirectory() && _isImage(f.name)).toList();
+    final mediaFiles =
+        files.where((f) => !f.isDirectory() && _isMedia(f.name)).toList();
+    // 相册封面只能是图片：视频无法直接解码成缩略图。
+    final coverCandidates = mediaFiles.where((f) => _isImage(f.name)).toList();
 
     // basePath 自身是当前浏览位置，不作为它自己的子相册。
-    if (imageFiles.isNotEmpty && relative.isNotEmpty) {
+    if (mediaFiles.isNotEmpty && relative.isNotEmpty) {
       try {
         out.add(Album(
           id: currentPath,
@@ -526,9 +529,9 @@ class SmbService {
             connect,
             config,
             currentPath,
-            imageFiles,
+            coverCandidates,
           ),
-          count: imageFiles.length,
+          count: mediaFiles.length,
           parentPath: _parentOfRemotePath(currentPath),
         ));
       } catch (_) {
@@ -1161,76 +1164,76 @@ class SmbService {
     }
   }
 
-  /// 用指定连接上传一个文件。
+  /// 上传时先写入的临时后缀。
+  ///
+  /// 整份文件写完后才改名为正式文件名。上传中途被打断时只会留下 `.mipixtmp`，
+  /// 不会在正式文件名上留半截文件——那种半截文件在服务端会变成打不开、也删不掉的
+  /// “锁死”文件，导致该文件此后永远报 “Access is denied.” 传不上去。
+  static const String uploadTempSuffix = '.mipixtmp';
+
+  /// 上传分块大小。
+  static const int _uploadChunkSize = 64 * 1024;
+
+  /// 用指定连接上传一个本地文件。
   ///
   /// 供并行备份的 worker 复用其独占连接；连接的创建/重连/关闭由调用方管理。
+  /// 逐块从磁盘读取，不会把整个文件（视频可达 GB 级）读进内存。
   Future<void> uploadFileVia(
     SmbConnect connect,
     SmbConfig config,
     String remotePath,
-    Uint8List data, {
+    String localPath, {
     Function(double)? onProgress,
   }) async {
-    final fullPath = remotePath.startsWith('/')
-        ? _buildSMBPath(config, remotePath.substring(1))
-        : _buildSMBPath(config, remotePath);
-    final file = await _openFileForWrite(connect, fullPath);
-    final writer = await connect.openWrite(file);
+    final tempFull = _buildSMBPath(config, '$remotePath$uploadTempSuffix');
 
-    const chunkSize = 64 * 1024;
-    int offset = 0;
-    while (offset < data.length) {
-      final end = (offset + chunkSize > data.length) ? data.length : offset + chunkSize;
-      writer.add(data.sublist(offset, end));
-      await writer.flush();
-      offset = end;
-      if (onProgress != null) {
-        onProgress(offset / data.length);
-      }
-    }
-    await writer.close();
-  }
+    // 清掉上次中断可能残留的临时文件，保证本次从零写入（否则写短了会留旧内容的尾巴）。
+    await _deleteRemoteIfExists(connect, tempFull);
 
-  /// 打开（必要时创建）待写入的远端文件。
-  ///
-  /// `createFile` 以「独占（shareAccess=0）」方式打开已存在的文件，若远端残留
-  /// 了上次中断留下的同名文件（或被索引器占用），会直接报 “Access is denied.”
-  /// 导致该文件永远备份不上去。此处在此类失败时先删除旧文件再重建，作为兜底。
-  Future<SmbFile> _openFileForWrite(SmbConnect connect, String fullPath) async {
+    final tempFile = await connect.createFile(tempFull);
+    final writer = await connect.openWrite(tempFile);
+    final source = File(localPath);
+    final total = await source.length();
+    final reader = await source.open();
+
     try {
-      return await connect.createFile(fullPath);
-    } catch (e) {
-      final msg = e.toString().toLowerCase();
-      final isConflict = msg.contains('access is denied') ||
-          msg.contains('access denied') ||
-          msg.contains('sharing violation') ||
-          msg.contains('being used by another process');
-      if (!isConflict) rethrow;
-      try {
-        final existing = await connect.file(fullPath);
-        await connect.delete(existing);
-      } catch (_) {
-        // 旧文件删不掉时（仍被占用）继续尝试创建，失败会上抛给调用方。
+      var written = 0;
+      while (true) {
+        final chunk = await reader.read(_uploadChunkSize);
+        if (chunk.isEmpty) break;
+        writer.add(chunk);
+        await writer.flush();
+        written += chunk.length;
+        if (onProgress != null && total > 0) onProgress(written / total);
       }
-      return await connect.createFile(fullPath);
+      await writer.close();
+    } finally {
+      await reader.close();
+    }
+
+    // 整份写完才改名到正式文件名，同名旧文件由 replace 覆盖。
+    try {
+      await connect.rename(
+        tempFile,
+        _buildSMBPath(config, remotePath),
+        replace: true,
+      );
+    } catch (e) {
+      // 改名失败（例如目的地已被服务端句柄锁死）时清掉临时文件，
+      // 否则会在远端堆积一份与正式文件等大的残片。
+      await _deleteRemoteIfExists(connect, tempFull);
+      rethrow;
     }
   }
 
-  Future<void> uploadFile(SmbConfig config, String remotePath, Uint8List data, {Function(double)? onProgress}) async {
-    int retries = 3;
-    while (retries-- > 0) {
-      try {
-        final connect = await _getConnection(config);
-        await uploadFileVia(connect, config, remotePath, data, onProgress: onProgress);
-        return;
-      } on SmbException catch (e) {
-        if (!isConnectionError(e)) rethrow;
-        if (retries == 0) rethrow;
-        _invalidateConnection(config.host, config.username);
-      } on Exception {
-        if (retries == 0) rethrow;
-        _invalidateConnection(config.host, config.username);
-      }
+  /// 删除远端文件；不存在或无权限时静默忽略。
+  Future<void> _deleteRemoteIfExists(SmbConnect connect, String fullPath) async {
+    try {
+      final existing = await connect.file(fullPath);
+      if (!existing.isExists) return;
+      await connect.delete(existing);
+    } catch (_) {
+      // 不存在或被占用都无需在此处理：真正的问题会在后续 createFile 时暴露。
     }
   }
 
@@ -1274,13 +1277,31 @@ class SmbService {
     await prefs.remove(key);
   }
 
-  bool _isImage(String name) {
-    final ext = name.toLowerCase().split('.').last;
-    return ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'heif'].contains(ext);
-  }
+  static const Set<String> _imageExtensions = {
+    'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'heif',
+  };
+
+  static const Set<String> _videoExtensions = {
+    'mp4', 'mov', 'm4v', 'mkv', 'avi', '3gp', '3gpp', 'ts', 'webm', 'flv', 'wmv',
+  };
+
+  static String _extOf(String name) => name.toLowerCase().split('.').last;
+
+  /// 是否为图片扩展名（相册封面、SMB 图片展示用）。
+  bool _isImage(String name) => _imageExtensions.contains(_extOf(name));
+
+  /// 是否为可展示的媒体扩展名（图片或视频）。
+  bool _isMedia(String name) =>
+      _imageExtensions.contains(_extOf(name)) ||
+      _videoExtensions.contains(_extOf(name));
+
+  /// 文件名是否为视频。SMB 相册网格据此渲染播放占位图标，
+  /// 而不是去下载整段视频再当作图片解码。
+  static bool isVideoName(String name) =>
+      _videoExtensions.contains(_extOf(name));
 
   String _getMimeType(String name) {
-    final ext = name.toLowerCase().split('.').last;
+    final ext = _extOf(name);
     switch (ext) {
       case 'jpg':
       case 'jpeg':
@@ -1296,6 +1317,26 @@ class SmbService {
       case 'heic':
       case 'heif':
         return 'image/heic';
+      case 'mp4':
+      case 'm4v':
+        return 'video/mp4';
+      case 'mov':
+        return 'video/quicktime';
+      case 'mkv':
+        return 'video/x-matroska';
+      case 'avi':
+        return 'video/x-msvideo';
+      case '3gp':
+      case '3gpp':
+        return 'video/3gpp';
+      case 'ts':
+        return 'video/mp2t';
+      case 'webm':
+        return 'video/webm';
+      case 'flv':
+        return 'video/x-flv';
+      case 'wmv':
+        return 'video/x-ms-wmv';
       default:
         return 'application/octet-stream';
     }

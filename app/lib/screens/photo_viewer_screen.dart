@@ -760,9 +760,16 @@ class _RemotePhotoViewerState extends State<_RemotePhotoViewer> {
   Uint8List? _imageData;
   bool _loading = true;
 
+  /// 远程视频暂不支持播放：直接给占位提示，避免把整段视频读进内存再解码失败。
+  bool get _isVideo => SmbService.isVideoName(widget.remotePath);
+
   @override
   void initState() {
     super.initState();
+    if (_isVideo) {
+      _loading = false;
+      return;
+    }
     _load();
   }
 
@@ -783,6 +790,23 @@ class _RemotePhotoViewerState extends State<_RemotePhotoViewer> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isVideo) {
+      return Container(
+        color: Colors.black,
+        alignment: Alignment.center,
+        child: const Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.play_circle_outline, size: 64, color: Color(0x1FFFFFFF)),
+            SizedBox(height: 12),
+            Text(
+              '暂不支持播放在线视频',
+              style: TextStyle(fontSize: 14, color: Color(0x99FFFFFF)),
+            ),
+          ],
+        ),
+      );
+    }
     if (_loading) {
       return Container(
         color: Colors.black,

@@ -441,9 +441,16 @@ class _RemoteImageState extends State<_RemoteImage> {
   bool _loading = true;
   static final _loadingController = _ImageLoadingController();
 
+  /// 视频无法当作图片解码，直接用播放占位块渲染，跳过缩略图请求。
+  bool get _isVideo => SmbService.isVideoName(widget.remotePath);
+
   @override
   void initState() {
     super.initState();
+    if (_isVideo) {
+      _loading = false;
+      return;
+    }
     // 内存缓存命中时同步展示，避免列表滚动/重建时重复加载。
     final cached = SmbService.peekThumbnail(widget.serverId, widget.remotePath);
     if (cached != null && cached.isNotEmpty) {
@@ -473,6 +480,17 @@ class _RemoteImageState extends State<_RemoteImage> {
   @override
   Widget build(BuildContext context) {
     final palette = MiPixPalette.of(context);
+    if (_isVideo) {
+      return Container(
+        color: palette.fill,
+        alignment: Alignment.center,
+        child: Icon(
+          Icons.play_circle_outline,
+          size: 36,
+          color: palette.textSecondary.withValues(alpha: 0.7),
+        ),
+      );
+    }
     if (_loading) {
       return Container(
         color: palette.fill,

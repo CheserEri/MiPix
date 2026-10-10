@@ -23,7 +23,8 @@ class CacheService {
   /// v4：修复「上传备份后 SMB 相册不显示新照片」——此前上传成功后从不失效
   /// 缓存，旧的媒体列表会存活满 7 天 TTL。递增版本号可让升级后的首次
   /// 加载强制重新扫描一次（EXIF 时间缓存不带版本，因此不会被重复探测）。
-  static const _albumMediaCacheVersion = 'v4';
+  /// v5：媒体白名单纳入视频扩展名，旧缓存只含图片，需重新扫描才能显示视频。
+  static const _albumMediaCacheVersion = 'v5';
 
   /// 默认缓存上限：500 MB。
   static const int defaultCacheLimitBytes = 500 * 1024 * 1024;
