@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/models.dart';
 import '../providers/album_provider.dart';
 import '../providers/smb_provider.dart';
+import '../providers/transfer_provider.dart';
 import '../services/smb_service.dart';
 import '../services/local_storage_service.dart';
 import '../utils/mipix_theme.dart';
@@ -78,6 +79,7 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   Widget _buildLocalGrid() {
     final palette = MiPixPalette.of(context);
     final itemsAsync = ref.watch(albumItemsProvider(widget.albumId));
+    final uploading = ref.watch(uploadingPathsProvider);
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: MiPixTheme.overlayStyle(context),
@@ -149,13 +151,42 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
                           );
                         },
                   child: RepaintBoundary(
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        border: isSelected
-                            ? Border.all(color: palette.accent, width: 3)
-                            : null,
-                      ),
-                      child: LocalMediaThumb(item: item),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        DecoratedBox(
+                          decoration: BoxDecoration(
+                            border: isSelected
+                                ? Border.all(color: palette.accent, width: 3)
+                                : null,
+                          ),
+                          child: LocalMediaThumb(item: item),
+                        ),
+                        // 上传锁命中时显示「上传中」。
+                        if (uploading.contains(item.path))
+                          Positioned(
+                            right: 3,
+                            bottom: 3,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.45),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: const Text(
+                                '上传中',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  height: 1.1,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                   ),
                 );

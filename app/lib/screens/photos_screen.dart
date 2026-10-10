@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -15,72 +14,6 @@ import '../widgets/animations.dart';
 import '../widgets/local_media_thumb.dart';
 import '../utils/mipix_theme.dart';
 import 'photo_viewer_screen.dart';
-import '../services/smb_service.dart';
-import '../widgets/smb_image_widget.dart';
-
-/// 相册选择列表项（支持本地和远程封面）
-class _AlbumSelectorItem extends StatelessWidget {
-  final Album album;
-  final bool selected;
-  final VoidCallback onTap;
-
-  const _AlbumSelectorItem({
-    required this.album,
-    required this.selected,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = MiPixPalette.of(context);
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: album.coverPath != null
-          ? ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: album.source is SmbSource
-                  ? SmbRemoteImage(
-                      serverId: (album.source as SmbSource).serverId,
-                      remotePath: album.coverPath!,
-                      width: 48,
-                      height: 48,
-                      fit: BoxFit.cover,
-                    )
-                  : Image.file(
-                      File(album.coverPath!),
-                      width: 48,
-                      height: 48,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(
-                        width: 48,
-                        height: 48,
-                        color: palette.fill,
-                        child: Icon(Icons.folder,
-                            size: 24, color: palette.textSecondary),
-                      ),
-                    ),
-            )
-          : Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: palette.fill,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Icon(Icons.folder,
-                  size: 24, color: palette.textSecondary),
-            ),
-      title: Text(album.name,
-          style: TextStyle(color: palette.textPrimary)),
-      subtitle: Text('${album.count} 张照片',
-          style: TextStyle(color: palette.textSecondary)),
-      trailing: selected
-          ? Icon(Icons.check_circle, color: palette.accent)
-          : null,
-      onTap: onTap,
-    );
-  }
-}
 
 class PhotosScreen extends ConsumerStatefulWidget {
   const PhotosScreen({super.key});
@@ -122,6 +55,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     final isMultiSelect = ref.watch(isMultiSelectProvider);
     final selected = ref.watch(selectedPhotosProvider);
     final synced = ref.watch(syncedPhotosProvider);
+    final uploading = ref.watch(uploadingPathsProvider);
 
     return Scaffold(
       backgroundColor: palette.background,
@@ -219,6 +153,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                           isMultiSelect: isMultiSelect,
                           isSelected: isSelected,
                           isSynced: synced.contains(photo.path),
+                          isUploading: uploading.contains(photo.path),
                           onTap: () {
                             if (isMultiSelect) {
                               togglePhotoSelection(ref, photo.id);
@@ -320,9 +255,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     if (selectedServer == null || !servers.any((s) => s.id == selectedServer)) {
       selectedServer = servers.first.id;
     }
-    var remoteDir = ref.read(defaultBackupPathProvider);
-    var selectedAlbumId = <String>{}; // 多选相册，为空则使用 remoteDir
-    var isCreating = false; // 是否正在创建相册
+    var isBackingUp = false;
 
     showModalBottomSheet(
       context: context,
@@ -334,11 +267,6 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setState) {
-            // 获取选中服务器的相册
-            final selectedServerObj = servers.firstWhere((s) => s.id == selectedServer);
-            final albumsAsync = ref.watch(smbAlbumsProvider(selectedServer!));
-            final albums = albumsAsync.valueOrNull ?? [];
-
             return Padding(
               padding: EdgeInsets.only(
                 bottom: MediaQuery.of(ctx).viewInsets.bottom,
@@ -378,189 +306,15 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                         selectedColor: palette.accent,
                         backgroundColor: palette.fill,
                         onSelected: (_) {
-                          setState(() {
-                            selectedServer = s.id;
-                            selectedAlbumId.clear(); // 重置相册选择
-                            remoteDir = '';
-                          });
+                          setState(() => selectedServer = s.id);
                         },
                       );
                     }).toList(),
                   ),
-                  const SizedBox(height: 20),
-                  Text('选择相册（可选）',
+                  const SizedBox(height: 16),
+                  Text('将按照片在手机上的相册目录结构备份到服务器',
                       style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w500,
-                          color: palette.textSecondary)),
-                  const SizedBox(height: 10),
-                  ...albums.map((album) => _AlbumSelectorItem(
-                        album: album,
-                        selected: selectedAlbumId.contains(album.id),
-                        onTap: () {
-                          setState(() {
-                            if (selectedAlbumId.contains(album.id)) {
-                              selectedAlbumId.remove(album.id);
-                            } else {
-                              selectedAlbumId.add(album.id);
-                            }
-                            remoteDir = album.id;
-                          });
-                        },
-                      )),
-                  // 新建相册按钮
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        color: palette.fill,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: isCreating
-                          ? SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: palette.accent,
-                              ),
-                            )
-                          : Icon(Icons.create_new_folder,
-                              color: palette.textSecondary),
-                    ),
-                    title: Text('新建相册',
-                        style: TextStyle(color: palette.textPrimary)),
-                    trailing: isCreating
-                        ? null
-                        : Icon(Icons.add, color: palette.textSecondary),
-                    onTap: isCreating
-                        ? null
-                        : () async {
-                            final controller = TextEditingController();
-                            final result = await showDialog<String>(
-                              context: ctx,
-                              builder: (dialogCtx) => AlertDialog(
-                                title: const Text('新建相册'),
-                                content: TextField(
-                                  controller: controller,
-                                  autofocus: true,
-                                  decoration: const InputDecoration(
-                                    hintText: '输入相册文件夹名称',
-                                    border: OutlineInputBorder(),
-                                  ),
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () => Navigator.pop(dialogCtx),
-                                    child: const Text('取消'),
-                                  ),
-                                  TextButton(
-                                    onPressed: () {
-                                      final name = controller.text.trim();
-                                      if (name.isNotEmpty) Navigator.pop(dialogCtx, name);
-                                    },
-                                    child: const Text('创建'),
-                                  ),
-                                ],
-                              ),
-                            );
-
-                            if (result == null || result.isEmpty) return;
-
-                            final newAlbumName = result;
-                            final smbService = SmbService();
-                            try {
-                              setState(() => isCreating = true);
-                              final server = servers.firstWhere((s) => s.id == selectedServer);
-                              final serverRoot = server.rootPath;
-                              final newPath = serverRoot.isEmpty ? newAlbumName : '$serverRoot/$newAlbumName';
-                              await smbService.createDirectory(server, newPath);
-
-                              ref.invalidate(smbAlbumsProvider(selectedServer!));
-                              await Future.delayed(const Duration(milliseconds: 800));
-
-                              final newAlbums = await smbService.getAlbums(server);
-                              final newAlbum = newAlbums.firstWhere(
-                                (a) => a.name.toLowerCase() == newAlbumName.toLowerCase(),
-                                orElse: () => Album(
-                                  id: newAlbumName,
-                                  name: newAlbumName,
-                                  source: SmbSource(server.id),
-                                  coverPath: null,
-                                  count: 0,
-                                  parentPath: serverRoot,
-                                ),
-                              );
-
-                              if (!ctx.mounted) return;
-                              setState(() {
-                                selectedAlbumId.clear();
-                                selectedAlbumId.add(newAlbum.id);
-                                remoteDir = newAlbum.id;
-                                isCreating = false;
-                              });
-
-                              if (mounted) {
-                                ScaffoldMessenger.of(ctx).showSnackBar(
-                                  const SnackBar(
-                                    content: Text('相册创建成功'),
-                                    backgroundColor: Colors.green,
-                                  ),
-                                );
-                              }
-                            } catch (e) {
-                              if (!ctx.mounted) return;
-                              setState(() => isCreating = false);
-                              if (ctx.mounted) {
-                                ScaffoldMessenger.of(ctx).showSnackBar(
-                                  SnackBar(
-                                    content: Text('创建失败: ${e.toString()}'),
-                                    backgroundColor: Colors.red,
-                                  ),
-                                );
-                              }
-                            }
-                          },
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Checkbox(
-                        value: selectedAlbumId.isEmpty,
-                        onChanged: (v) {
-                          setState(() {
-                            if (v == true) selectedAlbumId.clear();
-                          });
-                        },
-                      ),
-                      Expanded(
-                        child: Text('或手动输入目录（不选择相册时使用）',
-                            style: TextStyle(color: palette.textSecondary)),
-                      ),
-                    ],
-                  ),
-                  TextField(
-                    controller: TextEditingController(text: remoteDir),
-                    onChanged: (v) {
-                      remoteDir = v;
-                      if (v.isNotEmpty) {
-                        setState(() => selectedAlbumId.clear());
-                      }
-                    },
-                    style: TextStyle(color: palette.textPrimary),
-                    decoration: InputDecoration(
-                      hintText: '/MiPixBackup 或选择的相册路径',
-                      hintStyle: TextStyle(color: palette.textSecondary),
-                      filled: true,
-                      fillColor: palette.fill,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        borderSide: BorderSide.none,
-                      ),
-                    ),
-                  ),
+                          fontSize: 13, color: palette.textSecondary)),
                   const SizedBox(height: 16),
                   Text('共 ${paths.length} 张照片',
                       style: TextStyle(color: palette.textSecondary)),
@@ -568,32 +322,45 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton(
-                      onPressed: () async {
-                        final result = await ref.read(transfersProvider.notifier).backupPhotos(
-                              selectedServer!,
-                              paths,
-                              remoteDir,
-                            );
-                        ref.read(defaultServerProvider.notifier).state =
-                            selectedServer;
-                        ref.read(defaultBackupPathProvider.notifier).state =
-                            remoteDir;
-                        if (!context.mounted) return;
-                        Navigator.pop(context);
-                        toggleMultiSelect(ref);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text(
-                              result.allSucceeded
-                                  ? '已加入备份队列 ${result.successCount} 项'
-                                  : result.allFailed
-                                      ? '备份失败，请检查 SMB 配置或后端连接'
-                                      : '部分备份已加入队列：成功 ${result.successCount}，失败 ${result.failedCount}',
-                            ),
-                          ),
-                        );
-                      },
-                      child: const Text('开始备份'),
+                      onPressed: isBackingUp
+                          ? null
+                          : () async {
+                              setState(() => isBackingUp = true);
+                              final result = await ref.read(transfersProvider.notifier).backupPhotos(
+                                    selectedServer!,
+                                    paths,
+                                  );
+                              ref.read(defaultServerProvider.notifier).state =
+                                  selectedServer;
+                              if (!context.mounted) return;
+                              Navigator.pop(context);
+                              toggleMultiSelect(ref);
+                              final String message;
+                              if (result.successCount == 0 &&
+                                  result.failedCount == 0) {
+                                message = '所选照片均在上传中，已跳过';
+                              } else if (result.allSucceeded) {
+                                message = '已加入备份队列 ${result.successCount} 项';
+                              } else if (result.allFailed) {
+                                message = '备份失败，请检查 SMB 配置或后端连接';
+                              } else {
+                                message =
+                                    '部分备份已加入队列：成功 ${result.successCount}，失败 ${result.failedCount}';
+                              }
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text(message)),
+                              );
+                            },
+                      child: isBackingUp
+                          ? const SizedBox(
+                              height: 18,
+                              width: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Text('开始备份'),
                     ),
                   ),
                   const SizedBox(height: 24),
@@ -613,6 +380,7 @@ class _PhotoTile extends StatelessWidget {
   final bool isMultiSelect;
   final bool isSelected;
   final bool isSynced;
+  final bool isUploading;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
@@ -621,6 +389,7 @@ class _PhotoTile extends StatelessWidget {
     required this.isMultiSelect,
     required this.isSelected,
     this.isSynced = false,
+    this.isUploading = false,
     required this.onTap,
     required this.onLongPress,
   });
@@ -640,21 +409,33 @@ class _PhotoTile extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             LocalMediaThumb(item: photo),
-            // 同步状态角标：已备份到 SMB 为蓝色云勾，未同步为白色云叉。
+            // 上传中优先显示「上传中」；否则显示同步角标（已备份蓝色云勾 / 未同步白色云叉）。
             Positioned(
               right: 3,
               bottom: 3,
               child: Container(
-                padding: const EdgeInsets.all(2),
+                padding: EdgeInsets.symmetric(
+                  horizontal: isUploading ? 4 : 2,
+                  vertical: 2,
+                ),
                 decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.35),
+                  color: Colors.black.withValues(alpha: 0.45),
                   borderRadius: BorderRadius.circular(6),
                 ),
-                child: Icon(
-                  isSynced ? Icons.cloud_done : Icons.cloud_off,
-                  size: 13,
-                  color: isSynced ? palette.accent : Colors.white,
-                ),
+                child: isUploading
+                    ? const Text(
+                        '上传中',
+                        style: TextStyle(
+                          fontSize: 10,
+                          height: 1.1,
+                          color: Colors.white,
+                        ),
+                      )
+                    : Icon(
+                        isSynced ? Icons.cloud_done : Icons.cloud_off,
+                        size: 13,
+                        color: isSynced ? palette.accent : Colors.white,
+                      ),
               ),
             ),
             if (isMultiSelect)
