@@ -393,6 +393,25 @@ class SmbService {
     }
   }
 
+  /// 递归创建远端目录（已存在时忽略），供备份时复刻手机相册目录结构。
+  ///
+  /// 逐级创建 `DCIM`、`DCIM/Camera`，保证 [uploadFile] 的目标父目录已存在。
+  /// 单级创建失败（多半是目录已存在）不抛出，真正的写入失败会在上传阶段暴露。
+  Future<void> ensureRemoteDirectory(SmbConfig config, String path) async {
+    final normalized = path.replaceAll(RegExp(r'^/+|/+$'), '');
+    if (normalized.isEmpty) return;
+    final parts = normalized.split('/');
+    var current = '';
+    for (final part in parts) {
+      current = current.isEmpty ? part : '$current/$part';
+      try {
+        await createDirectory(config, current);
+      } catch (_) {
+        // 目录已存在等情况忽略；若确实无权限，上传时会失败并计入任务错误。
+      }
+    }
+  }
+
   Future<List<Album>> getAlbums(SmbConfig config, {String currentPath = '', bool useCache = true}) async {
     await _ensureCacheInitialized();
     if (useCache) {

@@ -490,6 +490,8 @@ class _BottomActionBar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final servers = ref.watch(smbServersProvider).valueOrNull ?? [];
+    // 上传锁：该照片已在传输中时，按钮显示「上传中」并禁止重复提交。
+    final isUploading = ref.watch(uploadingPathsProvider).contains(photo.path);
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
@@ -503,9 +505,13 @@ class _BottomActionBar extends ConsumerWidget {
           ),
           if (!isRemote && servers.isNotEmpty)
             _ActionButton(
-              icon: Icons.cloud_upload,
-              label: '备份',
-              onTap: () => _backup(context, ref, servers.first.id),
+              icon: isUploading ? Icons.cloud_sync : Icons.cloud_upload,
+              label: isUploading ? '上传中' : '备份',
+              onTap: isUploading
+                  ? () => ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('该照片正在上传中')),
+                      )
+                  : () => _backup(context, ref, servers.first.id),
             ),
           if (isRemote)
             _ActionButton(
@@ -527,19 +533,20 @@ class _BottomActionBar extends ConsumerWidget {
     final result = await ref.read(transfersProvider.notifier).backupPhotos(
           serverId,
           [photo.path],
-          '/MiPixBackup',
         );
+    final String message;
+    if (result.successCount == 0 && result.failedCount == 0) {
+      message = '该照片正在上传中';
+    } else if (result.allSucceeded) {
+      message = '已加入备份队列';
+    } else if (result.allFailed) {
+      message = '备份失败，请检查 SMB 配置';
+    } else {
+      message = '部分备份成功：成功 ${result.successCount}，失败 ${result.failedCount}';
+    }
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          result.allSucceeded
-              ? '已加入备份队列'
-              : result.allFailed
-                  ? '备份失败，请检查 SMB 配置'
-                  : '部分备份成功：成功 ${result.successCount}，失败 ${result.failedCount}',
-        ),
-      ),
+      SnackBar(content: Text(message)),
     );
   }
 

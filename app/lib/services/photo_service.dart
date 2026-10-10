@@ -491,6 +491,27 @@ class PhotoService {
   /// Android 主存储根目录，用于把相册相对路径拼成绝对路径。
   static const String _primaryStorageRoot = '/storage/emulated/0';
 
+  /// 由本地文件绝对路径推导其所属相册目录（相对存储根，如 `DCIM/Camera`）。
+  ///
+  /// 用于 SMB 备份时在远端复刻手机上的相册目录结构，保证远端文件夹与手机相册同名。
+  /// 识别不出存储根时返回空串（调用方回退到备份根目录）。
+  static String albumDirOf(String absolutePath) {
+    final normalized = absolutePath.replaceAll('\\', '/');
+    String? relative;
+    if (normalized.startsWith('$_primaryStorageRoot/')) {
+      relative = normalized.substring(_primaryStorageRoot.length + 1);
+    } else {
+      // 外置存储（SD 卡）形如 /storage/<VOLUME_ID>/...
+      final match = RegExp(r'^/storage/([^/]+)/').firstMatch(normalized);
+      if (match != null && match.group(1) != 'emulated') {
+        relative = normalized.substring(match.end);
+      }
+    }
+    if (relative == null) return '';
+    final slash = relative.lastIndexOf('/');
+    return slash <= 0 ? '' : relative.substring(0, slash);
+  }
+
   /// 解析资源在磁盘上的绝对路径。
   ///
   /// 优先用 `relativePath` + `title` 直接拼出路径：photo_manager 的

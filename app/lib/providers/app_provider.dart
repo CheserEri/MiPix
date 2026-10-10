@@ -31,4 +31,3 @@ class ThemeNotifier extends StateNotifier<ThemeMode> {
 }
 
 final defaultServerProvider = StateProvider<String?>((ref) => null);
-final defaultBackupPathProvider = StateProvider<String>((ref) => '/MiPixBackup');

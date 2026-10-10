@@ -282,12 +282,10 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     if (serverId == null || !servers.any((s) => s.id == serverId)) {
       serverId = servers.first.id;
     }
-    final remoteDir = ref.read(defaultBackupPathProvider);
 
     final result = await ref.read(transfersProvider.notifier).backupPhotos(
           serverId,
           paths,
-          remoteDir,
         );
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
