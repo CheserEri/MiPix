@@ -5,6 +5,7 @@ import '../providers/album_provider.dart';
 import '../models/models.dart';import '../providers/smb_provider.dart';
 import '../widgets/glass_container.dart';
 import '../widgets/animations.dart';
+import '../widgets/smb_server_switcher.dart';
 import 'photo_grid_screen.dart';
 import '../services/photo_service.dart';
 import '../utils/mipix_theme.dart';
@@ -151,9 +152,16 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen>
                       color: palette.textSecondary,
                     ),
                   ),
+                  const SizedBox(width: 10),
+                  const SmbServerSwitcher(),
                   const Spacer(),
                   TextButton.icon(
-                    onPressed: () { ref.invalidate(allSmbAlbumsProvider); },
+                    onPressed: () async {
+                      final servers =
+                          ref.read(smbServersProvider).value ?? const [];
+                      await rescanSmbAlbums(servers);
+                      ref.invalidate(allSmbAlbumsProvider);
+                    },
                     icon: Icon(Icons.refresh, size: 18, color: palette.textSecondary),
                     label: Text('刷新', style: TextStyle(color: palette.textSecondary)),
                   ),

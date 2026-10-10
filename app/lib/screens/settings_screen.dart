@@ -69,6 +69,8 @@ class SettingsScreen extends ConsumerWidget {
             ),
           ),
           const SliverToBoxAdapter(child: SizedBox(height: 16)),
+          const SliverToBoxAdapter(child: _TransferSection()),
+          const SliverToBoxAdapter(child: SizedBox(height: 16)),
           const SliverToBoxAdapter(child: _CacheSection()),
           const SliverToBoxAdapter(child: SizedBox(height: 16)),
           SliverToBoxAdapter(
@@ -307,6 +309,91 @@ class _SettingsTile extends StatelessWidget {
           ),
       ],
     );
+  }
+}
+
+/// 传输设置：备份并发数（默认 4，最高 8）。
+class _TransferSection extends ConsumerWidget {
+  const _TransferSection();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final concurrency = ref.watch(uploadConcurrencyProvider);
+    return _SectionCard(
+      title: '传输',
+      children: [
+        _SettingsTile(
+          icon: Icons.swap_vert,
+          iconColor: const Color(0xFF38BDF8),
+          title: '备份并发数',
+          subtitle: '同时上传 $concurrency 个文件',
+          onTap: () => _pickConcurrency(context, ref, concurrency),
+          showDivider: false,
+        ),
+      ],
+    );
+  }
+
+  Future<void> _pickConcurrency(
+      BuildContext context, WidgetRef ref, int current) async {
+    final palette = MiPixPalette.of(context);
+    final chosen = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        decoration: BoxDecoration(
+          color: palette.surface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: palette.textSecondary.withValues(alpha: 0.3),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              '备份并发数',
+              style: TextStyle(
+                color: palette.textPrimary,
+                fontSize: 18,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '同时上传的文件数，过高可能被服务器限流（1 - $maxUploadConcurrency）',
+              style: TextStyle(color: palette.textSecondary, fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            ...List.generate(maxUploadConcurrency, (i) => i + 1).map(
+              (value) => ListTile(
+                title: Text(
+                  '$value 个',
+                  style: TextStyle(
+                    color: value == current
+                        ? palette.accent
+                        : palette.textPrimary,
+                  ),
+                ),
+                trailing: value == current
+                    ? Icon(Icons.check, color: palette.accent, size: 20)
+                    : null,
+                onTap: () => Navigator.pop(ctx, value),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (chosen == null) return;
+    await ref.read(uploadConcurrencyProvider.notifier).setConcurrency(chosen);
   }
 }
 

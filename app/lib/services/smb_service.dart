@@ -157,6 +157,25 @@ class SmbService {
     return [];
   }
 
+  /// 列出远端目录下所有文件的「文件名 → 大小」，供上传前跨设备去重。
+  ///
+  /// 目录不存在 / 无权限 / 网络异常时返回空表，调用方据此视为「远端还没有」，
+  /// 不会因去重探测失败而阻断备份。
+  Future<Map<String, int>> listFilesWithSize(SmbConfig config, String path) async {
+    try {
+      final connect = await _getConnection(config);
+      final smbPath = _buildSMBPath(config, path);
+      final folder = await connect.file(smbPath);
+      final files = await connect.listFiles(folder);
+      return {
+        for (final f in files)
+          if (!f.isDirectory()) f.name: f.size,
+      };
+    } catch (_) {
+      return <String, int>{};
+    }
+  }
+
   Future<List<MediaItem>> getAllMediaItems(
     SmbConfig config, {
     String path = '',
@@ -412,10 +431,27 @@ class SmbService {
     }
   }
 
-  Future<List<Album>> getAlbums(SmbConfig config, {String currentPath = '', bool useCache = true}) async {
+  /// 递归扫描相册目录的最大深度。
+  ///
+  /// 现在备份是扁平的（直接用手机相册名在根目录下建文件夹），新相册都在
+  /// 第 1 层。但根目录里可能残留旧版按手机绝对路径复刻的深层结构
+  /// （如 `Pictures/Gallery/owner/生活`），保留一个递归上限既能扫到这些
+  /// 历史目录，又可避免误入更深的归档目录导致扫描爆炸。
+  static const int _maxAlbumDepth = 8;
+
+  /// 读取 [currentPath] 下的相册列表。
+  ///
+  /// [refresh] 为 true 时跳过缓存读取、强制重新扫描（仍会回写缓存），
+  /// 供界面的「刷新」按钮使用——否则刷新只会重新命中同一份磁盘缓存。
+  Future<List<Album>> getAlbums(
+    SmbConfig config, {
+    String currentPath = '',
+    bool useCache = true,
+    bool refresh = false,
+  }) async {
     await _ensureCacheInitialized();
-    if (useCache) {
-      final cached = await _cacheService.getCachedAlbums(config.id);
+    if (useCache && !refresh) {
+      final cached = await _cacheService.getCachedAlbums(config.id, currentPath);
       if (cached != null) {
         return cached;
       }
@@ -425,72 +461,18 @@ class SmbService {
     while (retries-- > 0) {
       try {
         final connect = await _getConnection(config);
-        final smbPath = _buildSMBPath(config, currentPath);
-        final folder = await connect.file(smbPath);
-        final files = await connect.listFiles(folder);
-
         final albums = <Album>[];
-        for (final file in files) {
-          if (!file.isDirectory()) continue;
-
-          final albumFolderName = file.name;
-          final albumFullPath = currentPath.isEmpty
-              ? albumFolderName
-              : '$currentPath/$albumFolderName';
-
-          try {
-            final subFolder = await connect.file(_buildSMBPath(config, albumFullPath));
-            final subFiles = await connect.listFiles(subFolder);
-
-            final imageFiles = subFiles.where((f) => !f.isDirectory() && _isImage(f.name)).toList();
-
-            if (imageFiles.isEmpty) {
-              continue;
-            }
-
-            String? coverPath;
-            final prefs = await _getPrefs();
-            final customCoverKey = 'custom_cover_${config.id}_$albumFullPath';
-            final customCover = prefs.getString(customCoverKey);
-
-            if (customCover != null) {
-              try {
-                final coverFile = await connect.file(_buildSMBPath(config, customCover));
-                coverPath = customCover;
-              } catch (_) {
-                coverPath = null;
-                prefs.remove(customCoverKey);
-              }
-            }
-
-            if (coverPath == null) {
-              SmbFile? latestImage;
-              for (final img in imageFiles) {
-                if (latestImage == null ||
-                    (img.lastModified != null && img.lastModified > (latestImage.lastModified ?? 0))) {
-                  latestImage = img;
-                }
-              }
-              coverPath = latestImage != null
-                  ? '$albumFullPath/${latestImage!.name}'
-                  : null;
-            }
-
-            albums.add(Album(
-              id: albumFullPath,
-              name: albumFolderName,
-              source: SmbSource(config.id),
-              coverPath: coverPath,
-              count: imageFiles.length,
-              parentPath: currentPath,
-            ));
-          } catch (e) {
-            continue;
-          }
-        }
+        await _collectAlbums(
+          connect,
+          config,
+          basePath: currentPath,
+          relative: '',
+          depth: 0,
+          out: albums,
+        );
 
         albums.sort((a, b) => a.name.compareTo(b.name));
-        await _cacheService.cacheAlbums(config.id, albums);
+        await _cacheService.cacheAlbums(config.id, currentPath, albums);
         return albums;
       } on SmbException catch (e) {
         final msg = e.toString().toLowerCase();
@@ -509,6 +491,155 @@ class SmbService {
       }
     }
     return [];
+  }
+
+  /// 递归收集 [basePath] 下所有「直接包含图片」的目录作为相册。
+  ///
+  /// 之前只扫描一层，导致 `DCIM/Camera`、`Pictures/Weixin` 这类
+  /// 二级目录永远不会出现在相册列表里。现在按深度递归，任一目录只要
+  /// 直接含有图片就算作相册；不含图片但含子目录的目录继续向下查找。
+  Future<void> _collectAlbums(
+    SmbConnect connect,
+    SmbConfig config, {
+    required String basePath,
+    required String relative,
+    required int depth,
+    required List<Album> out,
+  }) async {
+    if (depth > _maxAlbumDepth) return;
+
+    final currentPath = _joinRemotePath(basePath, relative);
+    final folder = await connect.file(_buildSMBPath(config, currentPath));
+    final files = await connect.listFiles(folder);
+
+    final imageFiles =
+        files.where((f) => !f.isDirectory() && _isImage(f.name)).toList();
+
+    // basePath 自身是当前浏览位置，不作为它自己的子相册。
+    if (imageFiles.isNotEmpty && relative.isNotEmpty) {
+      try {
+        out.add(Album(
+          id: currentPath,
+          name: relative.split('/').last,
+          source: SmbSource(config.id),
+          coverPath: await _resolveAlbumCover(
+            connect,
+            config,
+            currentPath,
+            imageFiles,
+          ),
+          count: imageFiles.length,
+          parentPath: _parentOfRemotePath(currentPath),
+        ));
+      } catch (_) {
+        // 单张封面读取失败不影响该相册入列。
+      }
+    }
+
+    if (depth == _maxAlbumDepth) return;
+    for (final dir in files.where((f) => f.isDirectory())) {
+      if (_isIgnoredDirectory(dir.name)) continue;
+      final childRelative = relative.isEmpty ? dir.name : '$relative/${dir.name}';
+      try {
+        await _collectAlbums(
+          connect,
+          config,
+          basePath: basePath,
+          relative: childRelative,
+          depth: depth + 1,
+          out: out,
+        );
+      } catch (_) {
+        // 单个子目录读取失败（无权限等）不阻断其余目录的扫描。
+      }
+    }
+  }
+
+  /// 相册封面：优先使用用户自定义封面，否则取目录内最后修改时间最新的图片。
+  Future<String?> _resolveAlbumCover(
+    SmbConnect connect,
+    SmbConfig config,
+    String albumPath,
+    List<SmbFile> imageFiles,
+  ) async {
+    final prefs = await _getPrefs();
+    final customCoverKey = 'custom_cover_${config.id}_$albumPath';
+    final customCover = prefs.getString(customCoverKey);
+
+    if (customCover != null) {
+      try {
+        await connect.file(_buildSMBPath(config, customCover));
+        return customCover;
+      } catch (_) {
+        await prefs.remove(customCoverKey);
+      }
+    }
+
+    SmbFile? latest;
+    for (final image in imageFiles) {
+      if (latest == null ||
+          (image.lastModified != null &&
+              image.lastModified > (latest.lastModified ?? 0))) {
+        latest = image;
+      }
+    }
+    return latest == null ? null : '$albumPath/${latest.name}';
+  }
+
+  /// 拼接远端相对路径，任一段为空时自动省略分隔符。
+  String _joinRemotePath(String base, String child) {
+    if (base.isEmpty) return child;
+    if (child.isEmpty) return base;
+    return '$base/$child';
+  }
+
+  /// 取相对路径的父目录，位于顶层时返回空串。
+  String _parentOfRemotePath(String path) {
+    final slash = path.lastIndexOf('/');
+    return slash <= 0 ? '' : path.substring(0, slash);
+  }
+
+  /// 扫描时跳过的系统目录（Windows 回收站、卷信息、macOS 元数据等）。
+  bool _isIgnoredDirectory(String name) {
+    if (name.startsWith('.')) return true;
+    final lower = name.toLowerCase();
+    return lower == '\$recycle.bin' ||
+        lower == 'system volume information' ||
+        lower == 'lost+found' ||
+        lower == 'node_modules';
+  }
+
+  /// 上传成功后批量失效相关缓存。
+  ///
+  /// 上传会新建目录（新相册）、改变相册计数与封面、并可能同名覆盖已有文件。
+  /// 此前这些操作完全不触碰缓存，导致新相册要等满 7 天 TTL 才出现——
+  /// 这正是「上传备份后 SMB 相册不显示更新内容」的根因。
+  Future<void> invalidateAfterUploads(
+    SmbConfig config,
+    Iterable<String> uploadedRemotePaths,
+  ) async {
+    await _ensureCacheInitialized();
+
+    final dirs = <String>{};
+    for (final remotePath in uploadedRemotePaths) {
+      dirs.add(_parentOfRemotePath(remotePath));
+      // 进程内缩略图内存缓存同样会残留旧图。
+      _thumbnailMemoryCache.remove('${config.id}|$remotePath');
+      await _cacheService.invalidateImage(config.id, remotePath);
+    }
+
+    // 目录结构可能新增层级，整台服务器的相册列表一律作废。
+    await _cacheService.invalidateAlbums(config.id);
+
+    for (final dir in dirs) {
+      // 该目录自身的媒体列表与 EXIF 时间已过期。
+      var current = dir;
+      while (true) {
+        await _cacheService.invalidateAlbumMediaItems(config.id, current);
+        if (current.isEmpty) break;
+        current = _parentOfRemotePath(current);
+      }
+    }
   }
 
   /// 单文件分块并行下载的连接数，以及启用该策略的文件大小阈值。
@@ -989,44 +1120,111 @@ class SmbService {
     }
   }
 
+  /// 判断异常是否为可重试的连接类错误。
+  ///
+  /// 备份并发上传时，某个 worker 的连接可能中途失效；据此决定是否需重连重试。
+  static bool isConnectionError(Object error) {
+    final msg = error.toString().toLowerCase();
+    return msg.contains('network name') ||
+        msg.contains('nt_status') ||
+        msg.contains('not available') ||
+        msg.contains('disconnected') ||
+        msg.contains('connection reset') ||
+        msg.contains('reset by peer');
+  }
+
+  /// 建立一条独立的 SMB 连接（不进入连接缓存池），由调用方负责关闭。
+  ///
+  /// 同一条连接上的读写无法真正并行，因此并行上传必须为每个 worker
+  /// 单独建连接，否则只是逻辑并发、实际仍在串行。
+  Future<SmbConnect> createConnection(SmbConfig config) {
+    return SmbConnect.connectAuth(
+      host: config.host,
+      domain: config.domain,
+      username: config.username,
+      password: config.password ?? '',
+    );
+  }
+
+  /// 用指定连接创建单级远端目录（已存在时忽略）。
+  Future<void> createDirectoryVia(
+    SmbConnect connect,
+    SmbConfig config,
+    String path,
+  ) async {
+    final normalized = path.replaceAll(RegExp(r'^/+|/+$'), '');
+    if (normalized.isEmpty) return;
+    try {
+      await connect.createFolder(_buildSMBPath(config, normalized));
+    } catch (_) {
+      // 目录已存在等情况忽略；真正的写入失败会在上传阶段暴露。
+    }
+  }
+
+  /// 用指定连接上传一个文件。
+  ///
+  /// 供并行备份的 worker 复用其独占连接；连接的创建/重连/关闭由调用方管理。
+  Future<void> uploadFileVia(
+    SmbConnect connect,
+    SmbConfig config,
+    String remotePath,
+    Uint8List data, {
+    Function(double)? onProgress,
+  }) async {
+    final fullPath = remotePath.startsWith('/')
+        ? _buildSMBPath(config, remotePath.substring(1))
+        : _buildSMBPath(config, remotePath);
+    final file = await _openFileForWrite(connect, fullPath);
+    final writer = await connect.openWrite(file);
+
+    const chunkSize = 64 * 1024;
+    int offset = 0;
+    while (offset < data.length) {
+      final end = (offset + chunkSize > data.length) ? data.length : offset + chunkSize;
+      writer.add(data.sublist(offset, end));
+      await writer.flush();
+      offset = end;
+      if (onProgress != null) {
+        onProgress(offset / data.length);
+      }
+    }
+    await writer.close();
+  }
+
+  /// 打开（必要时创建）待写入的远端文件。
+  ///
+  /// `createFile` 以「独占（shareAccess=0）」方式打开已存在的文件，若远端残留
+  /// 了上次中断留下的同名文件（或被索引器占用），会直接报 “Access is denied.”
+  /// 导致该文件永远备份不上去。此处在此类失败时先删除旧文件再重建，作为兜底。
+  Future<SmbFile> _openFileForWrite(SmbConnect connect, String fullPath) async {
+    try {
+      return await connect.createFile(fullPath);
+    } catch (e) {
+      final msg = e.toString().toLowerCase();
+      final isConflict = msg.contains('access is denied') ||
+          msg.contains('access denied') ||
+          msg.contains('sharing violation') ||
+          msg.contains('being used by another process');
+      if (!isConflict) rethrow;
+      try {
+        final existing = await connect.file(fullPath);
+        await connect.delete(existing);
+      } catch (_) {
+        // 旧文件删不掉时（仍被占用）继续尝试创建，失败会上抛给调用方。
+      }
+      return await connect.createFile(fullPath);
+    }
+  }
+
   Future<void> uploadFile(SmbConfig config, String remotePath, Uint8List data, {Function(double)? onProgress}) async {
     int retries = 3;
     while (retries-- > 0) {
       try {
         final connect = await _getConnection(config);
-        String fullPath;
-        if (remotePath.startsWith('/')) {
-          fullPath = _buildSMBPath(config, remotePath.substring(1));
-        } else {
-          fullPath = _buildSMBPath(config, remotePath);
-        }
-        final file = await connect.createFile(fullPath);
-        final writer = await connect.openWrite(file);
-
-        const chunkSize = 64 * 1024;
-        int offset = 0;
-        while (offset < data.length) {
-          final end = (offset + chunkSize > data.length) ? data.length : offset + chunkSize;
-          final chunk = data.sublist(offset, end);
-          writer.add(chunk);
-          await writer.flush();
-          offset = end;
-
-          if (onProgress != null) {
-            onProgress(offset / data.length);
-          }
-        }
-        await writer.close();
+        await uploadFileVia(connect, config, remotePath, data, onProgress: onProgress);
         return;
       } on SmbException catch (e) {
-        final msg = e.toString().toLowerCase();
-        final isConnectionError = msg.contains('network name') ||
-                                   msg.contains('nt_status') ||
-                                   msg.contains('not available') ||
-                                   msg.contains('disconnected') ||
-                                   msg.contains('connection reset') ||
-                                   msg.contains('reset by peer');
-        if (!isConnectionError) rethrow;
+        if (!isConnectionError(e)) rethrow;
         if (retries == 0) rethrow;
         _invalidateConnection(config.host, config.username);
       } on Exception {

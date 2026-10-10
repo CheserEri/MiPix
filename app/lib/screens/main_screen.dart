@@ -54,7 +54,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   @override
   Widget build(BuildContext context) {
-    final activeCount = ref.watch(activeTransferCountProvider);
+    // 「传输」标签展示待备份数量（本地尚未备份的照片数），而非瞬时在传任务数。
+    final pendingCount = ref.watch(unsyncedCountProvider);
     // 与小米相册一致：所有主页面统一使用色板配色，随主题明暗切换。
     final palette = MiPixPalette.of(context);
     final background = palette.background;
@@ -63,7 +64,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
     final labels = <String>[
       '照片',
       '相册',
-      activeCount > 0 ? '传输 $activeCount' : '传输',
+      pendingCount > 0 ? '传输 $pendingCount' : '传输',
     ];
 
     return AnnotatedRegion<SystemUiOverlayStyle>(

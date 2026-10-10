@@ -19,7 +19,11 @@ class CacheService {
 
   /// 相册媒体列表缓存版本：排序依据切换为 EXIF 拍摄时间时递增，
   /// 使旧的 mtime 缓存失效并触发一次重新探测。
-  static const _albumMediaCacheVersion = 'v3';
+  ///
+  /// v4：修复「上传备份后 SMB 相册不显示新照片」——此前上传成功后从不失效
+  /// 缓存，旧的媒体列表会存活满 7 天 TTL。递增版本号可让升级后的首次
+  /// 加载强制重新扫描一次（EXIF 时间缓存不带版本，因此不会被重复探测）。
+  static const _albumMediaCacheVersion = 'v4';
 
   /// 默认缓存上限：500 MB。
   static const int defaultCacheLimitBytes = 500 * 1024 * 1024;
@@ -177,9 +181,16 @@ class CacheService {
     await _prefs!.setString(key, jsonEncode(data));
   }
 
-  Future<void> cacheAlbums(String serverId, List<Album> albums) async {
+  /// 相册列表缓存键。
+  ///
+  /// 必须把 [albumPath] 纳入键：`getAlbums` 支持浏览子目录，只用 serverId
+  /// 做键会让子目录错误地命中根目录的缓存列表。
+  String _albumsKey(String serverId, String albumPath) =>
+      '${_albumCachePrefix}list_${serverId}_${albumPath.isEmpty ? '__root__' : albumPath}';
+
+  Future<void> cacheAlbums(String serverId, String albumPath, List<Album> albums) async {
     await ensureInitialized();
-    final key = '${_albumCachePrefix}list_$serverId';
+    final key = _albumsKey(serverId, albumPath);
     final data = {
       'timestamp': DateTime.now().millisecondsSinceEpoch,
       'albums': albums.map((e) => e.toJson()).toList(),
@@ -187,9 +198,9 @@ class CacheService {
     await _prefs!.setString(key, jsonEncode(data));
   }
 
-  Future<List<Album>?> getCachedAlbums(String serverId) async {
+  Future<List<Album>?> getCachedAlbums(String serverId, String albumPath) async {
     await ensureInitialized();
-    final key = '${_albumCachePrefix}list_$serverId';
+    final key = _albumsKey(serverId, albumPath);
     final data = _prefs!.getString(key);
     if (data == null) return null;
 
@@ -204,6 +215,51 @@ class CacheService {
       return albumsJson.map((e) => Album.fromJson(e as Map<String, dynamic>)).toList();
     } catch (_) {
       return null;
+    }
+  }
+
+  /// 失效某台服务器的相册列表缓存（含其所有子目录层级）。
+  ///
+  /// 上传备份会新建目录、改变相册计数与封面，缓存必须整体作废，
+  /// 否则新相册要等满 7 天 TTL 才会出现。
+  Future<void> invalidateAlbums(String serverId) async {
+    await ensureInitialized();
+    final prefix = '${_albumCachePrefix}list_$serverId';
+    final keys = _prefs!
+        .getKeys()
+        .where((k) => k == prefix || k.startsWith('${prefix}_'))
+        .toList();
+    for (final key in keys) {
+      await _prefs!.remove(key);
+    }
+  }
+
+  /// 失效某个相册目录的媒体列表缓存与 EXIF 拍摄时间缓存。
+  ///
+  /// 上传后该目录多出新文件、或已有文件被同名覆盖，两者都不能再复用。
+  Future<void> invalidateAlbumMediaItems(String serverId, String albumPath) async {
+    await ensureInitialized();
+    await _prefs!.remove(
+      '$_albumCachePrefix${serverId}_${albumPath}_$_albumMediaCacheVersion',
+    );
+    await _prefs!.remove(_exifDatesKey(serverId, albumPath));
+  }
+
+  /// 失效单张图片的原图与缩略图缓存。
+  ///
+  /// 备份同名覆盖上传时，路径不变但内容已变，若不清理会一直显示旧图。
+  Future<void> invalidateImage(String serverId, String imagePath) async {
+    await ensureInitialized();
+    final safeName = _sanitizePath(imagePath);
+    for (final prefix in [_imageCachePrefix, _thumbnailCachePrefix]) {
+      final file = File(path.join(_cacheDir.path, '$prefix${serverId}_$safeName'));
+      if (file.existsSync()) {
+        try {
+          await file.delete();
+        } catch (_) {
+          // 单个缓存文件删除失败不影响整体失效流程。
+        }
+      }
     }
   }
 

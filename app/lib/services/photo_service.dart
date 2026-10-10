@@ -491,9 +491,22 @@ class PhotoService {
   /// Android 主存储根目录，用于把相册相对路径拼成绝对路径。
   static const String _primaryStorageRoot = '/storage/emulated/0';
 
+  /// 由本地文件绝对路径推导其所属相册的显示名称（如 `相机`、`生活`、`微信`）。
+  ///
+  /// 备份到 SMB 时用相册名在远端直接创建同名文件夹（扁平结构），
+  /// 与手机相册列表里看到的名称一致；不再复刻 `DCIM/Camera`、
+  /// `Pictures/Gallery/owner/生活` 这类深层绝对路径。
+  ///
+  /// 识别不出目录时返回空串（调用方回退到备份根目录）。
+  static String albumNameOf(String absolutePath) {
+    final dir = albumDirOf(absolutePath);
+    if (dir.isEmpty) return '';
+    // 相册名取路径最后一段，再套用与相册列表一致的本地化规则（Camera→相机 等）。
+    return _displayName(dir.split('/').last);
+  }
+
   /// 由本地文件绝对路径推导其所属相册目录（相对存储根，如 `DCIM/Camera`）。
   ///
-  /// 用于 SMB 备份时在远端复刻手机上的相册目录结构，保证远端文件夹与手机相册同名。
   /// 识别不出存储根时返回空串（调用方回退到备份根目录）。
   static String albumDirOf(String absolutePath) {
     final normalized = absolutePath.replaceAll('\\', '/');
