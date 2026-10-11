@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/album_provider.dart';
+import '../providers/app_provider.dart';
 import '../models/models.dart';import '../providers/smb_provider.dart';
 import '../widgets/glass_container.dart';
 import '../widgets/animations.dart';
@@ -38,6 +39,15 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen>
     super.build(context); // AutomaticKeepAliveClientMixin 要求先调用
     final palette = MiPixPalette.of(context);
     final localLibrary = ref.watch(localLibraryProvider);
+    // 当前生效的服务器：默认服务器已被删除/未设置时回退到第一台。
+    final activeId = ref.watch(defaultServerProvider);
+    final smbServers =
+        ref.watch(smbServersProvider).valueOrNull ?? const <SmbConfig>[];
+    final activeServerId = smbServers.isEmpty
+        ? ''
+        : (smbServers.any((s) => s.id == activeId)
+            ? activeId!
+            : smbServers.first.id);
 
     return Scaffold(
       backgroundColor: palette.background,
@@ -169,7 +179,7 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen>
               ),
             ),
           ),
-          ref.watch(allSmbAlbumsProvider).when(
+          ref.watch(allSmbAlbumsProvider(activeServerId)).when(
             loading: () => SliverToBoxAdapter(
               child: SizedBox(
                 height: 200,

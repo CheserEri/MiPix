@@ -2,7 +2,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/models.dart';
 import '../services/smb_service.dart';
 import '../services/local_storage_service.dart';
-import 'app_provider.dart';
 
 final smbServersProvider =
     StateNotifierProvider<SmbServersNotifier, AsyncValue<List<SmbConfig>>>(
@@ -179,23 +178,24 @@ final smbItemsPagedProvider = StateNotifierProvider.family<SmbItemsPagedNotifier
   },
 );
 
-/// 获取 SMB 相册（当前服务器的根目录直接子文件夹）。
+/// 指定服务器的 SMB 相册（根目录递归子文件夹）。
 ///
-/// 室内/室外两台服务器指向同一份存储，若同时聚合所有服务器，同一批相册会
-/// 重复出现，而且其中一台不可达时整块加载都会失败。因此只扫描「当前服务器」，
-/// 由界面上的服务器切换器决定用哪一台。
-final allSmbAlbumsProvider = FutureProvider<List<Album>>((ref) async {
-  final serversAsync = ref.watch(smbServersProvider);
-  final servers = serversAsync.value ?? [];
-  if (servers.isEmpty) return const [];
-
-  final activeId = ref.watch(defaultServerProvider);
-  final server = servers.firstWhere(
-    (s) => s.id == activeId,
-    orElse: () => servers.first,
-  );
-  return SmbService().getAlbums(server, currentPath: '');
-});
+/// 按 serverId 拆成 family：切换服务器时界面 watch 的是另一个 provider 实例，
+/// 会立即进入 loading 并加载新服务器的相册，而不是沿用上一台服务器的数据。
+/// 旧实现是单个 provider，切换后重跑时 `AsyncValue.when` 默认
+/// `skipLoadingOnRefresh` 会继续展示旧相册，大目录重新扫描期间看起来
+/// 「切换服务器没反应」。
+final allSmbAlbumsProvider = FutureProvider.family<List<Album>, String>(
+  (ref, serverId) async {
+    final servers = ref.watch(smbServersProvider).value ?? const <SmbConfig>[];
+    if (servers.isEmpty) return const [];
+    final server = servers.firstWhere(
+      (s) => s.id == serverId,
+      orElse: () => servers.first,
+    );
+    return SmbService().getAlbums(server, currentPath: '');
+  },
+);
 
 /// 强制跳过缓存重新扫描各服务器的相册列表，供「刷新」按钮使用。
 ///

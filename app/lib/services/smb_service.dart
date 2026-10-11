@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
@@ -1126,7 +1127,10 @@ class SmbService {
   /// 判断异常是否为可重试的连接类错误。
   ///
   /// 备份并发上传时，某个 worker 的连接可能中途失效；据此决定是否需重连重试。
+  /// 超时（见 [_stallTimeout]）同样视为连接异常：它意味着这条连接已经写不动了，
+  /// 只能弃用重连，而不是把文件标记为永久失败。
   static bool isConnectionError(Object error) {
+    if (error is TimeoutException) return true;
     final msg = error.toString().toLowerCase();
     return msg.contains('network name') ||
         msg.contains('nt_status') ||
@@ -1172,7 +1176,23 @@ class SmbService {
   static const String uploadTempSuffix = '.mipixtmp';
 
   /// 上传分块大小。
-  static const int _uploadChunkSize = 64 * 1024;
+  ///
+  /// 取 smb_connect 单次 SMB2 写请求能承载的最大数据量（`SmbStreamConsumer.blockSize`
+  /// = 64936）。分块与之对齐后，每个分块恰好对应一次写请求；若用 64KiB 这类非对齐值，
+  /// 每个分块都会被拆成「64936 + 尾巴」两次请求——由于该库的写路径严格串行
+  /// （一次请求一次往返），请求数翻倍就等于吞吐减半。
+  static const int _uploadChunkSize = 64936;
+
+  /// 单次 SMB 写入调用的「卡死」上限。
+  ///
+  /// 底层 Socket.flush() 自身没有任何超时：WiFi 静默断开（对端不再回 ACK、
+  /// 也不发 RST）时，内核只会不断重传，这个 await 能被挂住十几分钟——界面一直
+  /// 停在「传输中」不动，用户看到的就是「传输卡死 / 慢得离谱」。这里统一给每次
+  /// 写入加上限，超时按连接类错误上抛，交由调用方的重连重试逻辑处理。
+  static const Duration _stallTimeout = Duration(seconds: 30);
+
+  /// 给单次 SMB 调用加卡死上限。
+  static Future<T> _guard<T>(Future<T> future) => future.timeout(_stallTimeout);
 
   /// 用指定连接上传一个本地文件。
   ///
@@ -1188,10 +1208,10 @@ class SmbService {
     final tempFull = _buildSMBPath(config, '$remotePath$uploadTempSuffix');
 
     // 清掉上次中断可能残留的临时文件，保证本次从零写入（否则写短了会留旧内容的尾巴）。
-    await _deleteRemoteIfExists(connect, tempFull);
+    await _guard(_deleteRemoteIfExists(connect, tempFull));
 
-    final tempFile = await connect.createFile(tempFull);
-    final writer = await connect.openWrite(tempFile);
+    final tempFile = await _guard(connect.createFile(tempFull));
+    final writer = await _guard(connect.openWrite(tempFile));
     final source = File(localPath);
     final total = await source.length();
     final reader = await source.open();
@@ -1202,26 +1222,26 @@ class SmbService {
         final chunk = await reader.read(_uploadChunkSize);
         if (chunk.isEmpty) break;
         writer.add(chunk);
-        await writer.flush();
+        await _guard(writer.flush());
         written += chunk.length;
         if (onProgress != null && total > 0) onProgress(written / total);
       }
-      await writer.close();
+      await _guard(writer.close());
     } finally {
       await reader.close();
     }
 
     // 整份写完才改名到正式文件名，同名旧文件由 replace 覆盖。
     try {
-      await connect.rename(
+      await _guard(connect.rename(
         tempFile,
         _buildSMBPath(config, remotePath),
         replace: true,
-      );
+      ));
     } catch (e) {
       // 改名失败（例如目的地已被服务端句柄锁死）时清掉临时文件，
       // 否则会在远端堆积一份与正式文件等大的残片。
-      await _deleteRemoteIfExists(connect, tempFull);
+      await _guard(_deleteRemoteIfExists(connect, tempFull));
       rethrow;
     }
   }

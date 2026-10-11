@@ -73,21 +73,76 @@ final uploadingPathsProvider = Provider<Set<String>>((ref) {
       .toSet();
 });
 
+/// 「已同步」标记的唯一权威来源。
+///
+/// 内存中的 [state] 是权威集合，磁盘只作持久化镜像：
+/// - [load] 采用并集合并而非整体覆盖，避免异步载入在用户已开始备份、
+///   markSynced 已写入新路径之后才返回，把刚标记的路径抹掉——那样界面会在
+///   备份完成后仍把已同步的照片显示成「未同步」，正是「未同步栏不刷新」的根因；
+/// - [markSynced] 立即更新内存状态（界面即时收缩），落盘则去抖后整表覆盖写，
+///   杜绝并发读-改-写互相覆盖导致丢标记。
 class SyncedPhotosNotifier extends StateNotifier<Set<String>> {
   final _storage = LocalStorageService();
+
+  Timer? _flushTimer;
+  bool _writing = false;
+  bool _flushAgain = false;
 
   SyncedPhotosNotifier() : super(<String>{}) {
     load();
   }
 
   Future<void> load() async {
-    state = await _storage.getSyncedPhotos();
+    try {
+      final stored = await _storage.getSyncedPhotos();
+      // 并集合并：绝不删除内存中已有的标记。
+      state = {...state, ...stored};
+    } catch (_) {
+      // 读取失败时保留当前内存状态，避免把已标记的清空。
+    }
   }
 
-  Future<void> markSynced(List<String> localPaths) async {
-    if (localPaths.isEmpty) return;
-    await _storage.markSynced(localPaths);
-    state = {...state, ...localPaths};
+  /// 标记若干本地路径为「已同步」。立即反映到界面，落盘合并去抖。
+  void markSynced(Iterable<String> localPaths) {
+    final incoming = localPaths.where((p) => p.isNotEmpty);
+    if (incoming.isEmpty) return;
+    final next = {...state, ...incoming};
+    if (next.length == state.length) return; // 无新增，无需刷新与落盘
+    state = next;
+    _scheduleFlush();
+  }
+
+  void _scheduleFlush() {
+    _flushTimer?.cancel();
+    _flushTimer = Timer(const Duration(milliseconds: 300), _flush);
+  }
+
+  /// 立即把当前集合写入磁盘（备份批次结束时调用，确保进程被杀也不丢）。
+  Future<void> flushNow() => _flush();
+
+  Future<void> _flush() async {
+    if (_writing) {
+      _flushAgain = true;
+      return;
+    }
+    _writing = true;
+    try {
+      await _storage.saveSyncedPhotos(state);
+    } catch (_) {
+      // 落盘失败忽略：后续标记或下次启动载入会再尝试。
+    } finally {
+      _writing = false;
+    }
+    if (_flushAgain) {
+      _flushAgain = false;
+      await _flush();
+    }
+  }
+
+  @override
+  void dispose() {
+    _flushTimer?.cancel();
+    super.dispose();
   }
 }
 
@@ -96,6 +151,17 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
   final _storage = LocalStorageService();
   final _smbService = SmbService();
   final Map<String, StreamController<double>> _progressControllers = {};
+
+  /// 进度落盘的最小间隔，避免高频进度回调把整表反复写入磁盘。
+  static const Duration _progressPersistInterval = Duration(milliseconds: 500);
+  DateTime _lastProgressPersist = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 进度界面刷新的最小间隔（按任务）。
+  ///
+  /// 进度回调每 64KB 一次，若每次都重建整个传输列表，这些重建会与 SMB 网络
+  /// I/O 争抢同一个 UI isolate 的时间片，反过来拖慢上传本身。
+  static const Duration _progressUiInterval = Duration(milliseconds: 150);
+  final Map<String, DateTime> _lastProgressUiAt = {};
 
   TransfersNotifier(this._ref) : super(const AsyncValue.loading()) {
     _init();
@@ -150,7 +216,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         final synced = await _storage.getSyncedPhotos();
         final missing = donePaths.where((p) => !synced.contains(p)).toList();
         if (missing.isNotEmpty) {
-          await _ref.read(syncedPhotosProvider.notifier).markSynced(missing);
+          _ref.read(syncedPhotosProvider.notifier).markSynced(missing);
         }
       }
     } catch (e, st) {
@@ -260,9 +326,58 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     await load();
   }
 
+  /// 手动续传：把「上传失败」的照片重新排队备份。
+  ///
+  /// 断网/服务器不可达会让该批次内相关文件标记为失败并留在传输队列里。
+  /// 用户在网络恢复后点「重试失败」即可一次性续传，无需重新挑选照片。
+  /// 按服务器分组，各自续传到原本的目标服务器。
+  Future<BackupResult> retryFailedUploads() async {
+    final tasks = state.valueOrNull ?? const <TransferTask>[];
+    final failed = tasks
+        .where((t) =>
+            t.status == TransferStatus.failed &&
+            t.transferType == TransferType.upload &&
+            t.localPath.isNotEmpty)
+        .toList();
+    if (failed.isEmpty) {
+      return const BackupResult(successCount: 0, failedCount: 0);
+    }
+
+    // 先移除这些失败记录，避免续传时与新建的同名任务重复。
+    final failedIds = failed.map((t) => t.id).toSet();
+    final remaining = tasks.where((t) => !failedIds.contains(t.id)).toList();
+    await _storage.saveTransfers(remaining);
+    state = AsyncValue.data(remaining);
+
+    final byServer = <String, List<String>>{};
+    for (final t in failed) {
+      // 本地文件可能已被删除，跳过不存在的项。
+      if (!await File(t.localPath).exists()) continue;
+      byServer.putIfAbsent(t.serverId, () => []).add(t.localPath);
+    }
+
+    var success = 0;
+    var fail = 0;
+    var skipped = 0;
+    final servers = await _storage.getSmbServers();
+    for (final entry in byServer.entries) {
+      if (!servers.any((s) => s.id == entry.key)) continue; // 服务器已被删除
+      final result = await backupPhotos(entry.key, entry.value);
+      success += result.successCount;
+      fail += result.failedCount;
+      skipped += result.skippedCount;
+    }
+    return BackupResult(
+      successCount: success,
+      failedCount: fail,
+      skippedCount: skipped,
+    );
+  }
+
   Future<BackupResult> backupPhotos(String serverId, List<String> localPaths) async {
     final servers = await _storage.getSmbServers();
     final server = servers.firstWhere((s) => s.id == serverId);
+    final syncedPhotosNotifier = _ref.read(syncedPhotosProvider.notifier);
     var successCount = 0;
     var failedCount = 0;
     var skippedCount = 0;
@@ -312,6 +427,8 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       if (fileSize > 0 && remoteSize != null && remoteSize == fileSize) {
         skippedCount += 1;
         syncedPaths.add(path);
+        // 即时标记：远端已有即视为已备份，界面立刻从未同步栏移除，无需等整批结束。
+        syncedPhotosNotifier.markSynced([path]);
         continue;
       }
 
@@ -367,7 +484,9 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       final connections = <SmbConnect>[];
       for (var i = 0; i < workerCount; i++) {
         try {
-          connections.add(await _smbService.createConnection(server));
+          connections.add(await _smbService
+              .createConnection(server)
+              .timeout(_connectTimeout));
         } catch (_) {
           break;
         }
@@ -423,14 +542,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                 } catch (e) {
                   if (attempts-- > 0 && SmbService.isConnectionError(e)) {
                     // 连接可能已失效：重建本 worker 的连接后重试当前文件。
+                    await _closeQuietly(connections[index]);
                     try {
-                      await connections[index].close();
-                    } catch (_) {
-                      // 旧连接已不可用，忽略关闭异常。
-                    }
-                    try {
-                      connections[index] =
-                          await _smbService.createConnection(server);
+                      connections[index] = await _smbService
+                          .createConnection(server)
+                          .timeout(_connectTimeout);
                       continue;
                     } catch (_) {
                       // 重连失败，落回失败处理。
@@ -450,21 +566,23 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
           ]);
         } finally {
           for (final conn in connections) {
-            try {
-              await conn.close();
-            } catch (_) {
-              // 关闭失败无需处理，连接已随备份结束废弃。
-            }
+            await _closeQuietly(conn);
           }
         }
       }
     }
 
+    // 兜底落盘：完成类记录在 _updateTaskComplete 里是按时间节流的，
+    // 批次结束时必须整表写一次，否则 load() 会把内存中刚变成 done 的记录读回旧值。
+    await _storage.saveTransfers(state.valueOrNull ?? const <TransferTask>[]);
     await load();
-    // 标记「成功上传」与「远端已存在而跳过」两类为已同步。
+    // 兜底：把「成功上传」与「远端已存在而跳过」两类一并标记为已同步。
+    // 单个文件成功/跳过时已即时标记（见 _updateTaskComplete 与跳过分支），
+    // 这里再做一次并集兜底并强制落盘，保证进程被杀也不丢。
     if (syncedPaths.isNotEmpty) {
-      await _ref.read(syncedPhotosProvider.notifier).markSynced(syncedPaths);
+      syncedPhotosNotifier.markSynced(syncedPaths);
     }
+    await syncedPhotosNotifier.flushNow();
 
     // 上传改变了远端目录结构与文件内容，必须失效 SMB 侧缓存并让界面重新拉取，
     // 否则新建的相册要等满 7 天缓存 TTL 才会出现在「SMB 相册」里。
@@ -483,6 +601,20 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       failedCount: failedCount,
       skippedCount: skippedCount,
     );
+  }
+
+  /// 建立一条 SMB 连接的上限：网络断开时底层同样可能一直等，
+  /// 不设上限会让 worker 卡在重连上，队列整体停摆。
+  static const Duration _connectTimeout = Duration(seconds: 20);
+
+  /// 关闭一条 SMB 连接；底层 `Socket.close()` 会等待未发完的数据，
+  /// 断链时可能永久挂住，因此加上限：连接本就已废弃，关不掉就直接放弃。
+  static Future<void> _closeQuietly(SmbConnect connect) async {
+    try {
+      await connect.close().timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // 连接已失效或被挂住，无需处理。
+    }
   }
 
   /// 更新任务状态（并发上传的 worker 领取任务时把 pending 置为 running）。
@@ -511,6 +643,13 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
   }
 
   void _updateTaskProgress(String taskId, int writtenBytes, double progress) {
+    // 按任务节流界面刷新：进度条 6~7Hz 已足够顺滑，而每次刷新都要重建整个
+    // 任务列表，过密只会挤占上传循环的时间片。
+    final now = DateTime.now();
+    final last = _lastProgressUiAt[taskId];
+    if (last != null && now.difference(last) < _progressUiInterval) return;
+    _lastProgressUiAt[taskId] = now;
+
     state.whenData((tasks) {
       final updated = tasks.map((t) {
         if (t.id == taskId && t.status == TransferStatus.running) {
@@ -532,14 +671,22 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         return t;
       }).toList();
       state = AsyncValue.data(updated);
-      _storage.saveTransfers(updated);
+      // 进度回调节奏很高（每 64KB 一次），整表落盘过密会拖慢上传并卡顿 UI。
+      // 内存状态按上面的节流更新（界面流畅），磁盘持久化再按时间节流；
+      // 任务完成时会由 _updateTaskComplete 落一次最终状态，不会丢进度。
+      if (now.difference(_lastProgressPersist) >= _progressPersistInterval) {
+        _lastProgressPersist = now;
+        _storage.saveTransfers(updated);
+      }
     });
   }
 
   void _updateTaskComplete(String taskId, TransferStatus status, {String? errorMessage}) {
     state.whenData((tasks) {
+      String? donePath;
       final updated = tasks.map((t) {
         if (t.id == taskId) {
+          if (status == TransferStatus.done) donePath = t.localPath;
           return TransferTask(
             id: t.id,
             serverId: t.serverId,
@@ -558,7 +705,21 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         return t;
       }).toList();
       state = AsyncValue.data(updated);
-      _storage.saveTransfers(updated);
+      _lastProgressUiAt.remove(taskId);
+      // 「完成」记录随批量上传逐条产生，每次都整表 JSON 落盘会退化成 O(n²)
+      // 的序列化开销（长队列时单次可达数百毫秒），直接卡住同 isolate 的上传循环。
+      // 完成项改为按时间节流落盘、批量结束再统一兜底（见 backupPhotos）；
+      // 失败项必须立即落盘，否则进程被杀会丢掉「重试失败」的入口。
+      final now = DateTime.now();
+      if (status != TransferStatus.done ||
+          now.difference(_lastProgressPersist) >= _progressPersistInterval) {
+        _lastProgressPersist = now;
+        _storage.saveTransfers(updated);
+      }
+      // 单张上传成功即标记已同步：界面「未同步」栏实时收缩，无需等整批结束或手动刷新。
+      if (donePath != null && donePath!.isNotEmpty) {
+        _ref.read(syncedPhotosProvider.notifier).markSynced([donePath!]);
+      }
     });
   }
 }

@@ -26,6 +26,16 @@ class LocalStorageService {
     await prefs.setStringList(_syncedPhotosKey, synced.toList());
   }
 
+  /// 用给定集合整体覆盖「已同步」记录。
+  ///
+  /// 调用方持有权威的内存集合，直接整表覆盖而非读-改-写，可避免并发调用
+  /// 各自读旧值再写回、互相覆盖导致部分标记丢失（丢标记会让已备份的照片
+  /// 重新显示为未同步，并可能在换 IP 连同一文件夹时重复上传）。
+  Future<void> saveSyncedPhotos(Iterable<String> localPaths) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_syncedPhotosKey, localPaths.toList());
+  }
+
   Future<void> clearSynced() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_syncedPhotosKey);
