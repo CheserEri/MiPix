@@ -129,6 +129,11 @@ class SmbServerSwitcher extends ConsumerWidget {
     );
     if (chosen == null || chosen == activeId) return;
     await ref.read(defaultServerProvider.notifier).select(chosen);
-    ref.invalidate(allSmbAlbumsProvider);
+    // 浏览中的服务器与当前路径一并切到新服务器：路径回到根目录，
+    // 避免界面仍停留在上一台服务器的相册路径上。
+    ref.read(selectedSmbServerProvider.notifier).state = chosen;
+    ref.read(smbCurrentPathProvider.notifier).state = '';
+    // 目标服务器的相册若已缓存，强制重取一次，保证切换后立刻刷新。
+    ref.invalidate(allSmbAlbumsProvider(chosen));
   }
 }

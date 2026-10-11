@@ -52,6 +52,12 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     }
 
     final palette = MiPixPalette.of(context);
+    // 失败的上传项数量：>0 时在队列标题处提供「重试失败」续传入口。
+    final failedUploadCount = (transfersAsync.valueOrNull ?? const <TransferTask>[])
+        .where((t) =>
+            t.status == TransferStatus.failed &&
+            t.transferType == TransferType.upload)
+        .length;
     return Scaffold(
       backgroundColor: palette.background,
       body: CustomScrollView(
@@ -113,12 +119,26 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
           SliverToBoxAdapter(
             child: _sectionHeader(
               '传输队列',
-              action: TextButton.icon(
-                onPressed: () => ref.read(transfersProvider.notifier).clearCompleted(),
-                icon: Icon(Icons.clear_all,
-                    size: 18, color: palette.textSecondary),
-                label: Text('清除已完成',
-                    style: TextStyle(color: palette.textSecondary)),
+              action: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (failedUploadCount > 0)
+                    TextButton.icon(
+                      onPressed: _retryFailed,
+                      icon: Icon(Icons.refresh,
+                          size: 18, color: palette.accent),
+                      label: Text('重试失败 $failedUploadCount',
+                          style: TextStyle(color: palette.accent)),
+                    ),
+                  TextButton.icon(
+                    onPressed: () =>
+                        ref.read(transfersProvider.notifier).clearCompleted(),
+                    icon: Icon(Icons.clear_all,
+                        size: 18, color: palette.textSecondary),
+                    label: Text('清除已完成',
+                        style: TextStyle(color: palette.textSecondary)),
+                  ),
+                ],
               ),
             ),
           ),
@@ -332,6 +352,23 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
 
   Future<void> _backupOne(MediaItem photo) async {
     await _backup([photo.path]);
+  }
+
+  /// 续传：把队列里失败的上传项重新排队备份（断网恢复后使用）。
+  Future<void> _retryFailed() async {
+    final result =
+        await ref.read(transfersProvider.notifier).retryFailedUploads();
+    if (!mounted) return;
+    final String message;
+    if (result.successCount == 0 && result.failedCount == 0) {
+      message = '没有可重试的失败项（本地文件可能已删除）';
+    } else if (result.failedCount == 0) {
+      message = '续传完成，成功 ${result.successCount} 项';
+    } else {
+      message = '续传：成功 ${result.successCount}，仍失败 ${result.failedCount}';
+    }
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _backup(List<String> paths) async {
