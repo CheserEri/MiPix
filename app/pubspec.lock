@@ -560,10 +560,9 @@ packages:
   smb_connect:
     dependency: "direct main"
     description:
-      name: smb_connect
-      sha256: "8d82b701f8ff8a736070f6eb5393fe983da1a0f4747a56c3a04bda68765b5e66"
-      url: "https://pub.dev"
-    source: hosted
+      path: "packages/smb_connect"
+      relative: true
+    source: path
     version: "0.0.9"
   source_span:
     dependency: transitive

@@ -1129,6 +1129,10 @@ class SmbService {
   /// 备份并发上传时，某个 worker 的连接可能中途失效；据此决定是否需重连重试。
   /// 超时（见 [_stallTimeout]）同样视为连接异常：它意味着这条连接已经写不动了，
   /// 只能弃用重连，而不是把文件标记为永久失败。
+  ///
+  /// `connection abort` 与 `cant send request` 是服务端重置连接后的两种典型报文：
+  /// 前者来自 Socket 写失败，后者是 smb_connect 在 5 次无响应重试后的兜底异常。
+  /// 二者都意味着这条连接已死，必须重连而不是把文件判为失败。
   static bool isConnectionError(Object error) {
     if (error is TimeoutException) return true;
     final msg = error.toString().toLowerCase();
@@ -1137,7 +1141,9 @@ class SmbService {
         msg.contains('not available') ||
         msg.contains('disconnected') ||
         msg.contains('connection reset') ||
-        msg.contains('reset by peer');
+        msg.contains('reset by peer') ||
+        msg.contains('connection abort') ||
+        msg.contains('cant send request');
   }
 
   /// 建立一条独立的 SMB 连接（不进入连接缓存池），由调用方负责关闭。
@@ -1178,10 +1184,24 @@ class SmbService {
   /// 上传分块大小。
   ///
   /// 取 smb_connect 单次 SMB2 写请求能承载的最大数据量（`SmbStreamConsumer.blockSize`
-  /// = 64936）。分块与之对齐后，每个分块恰好对应一次写请求；若用 64KiB 这类非对齐值，
-  /// 每个分块都会被拆成「64936 + 尾巴」两次请求——由于该库的写路径严格串行
-  /// （一次请求一次往返），请求数翻倍就等于吞吐减半。
+  /// = 64936）。**注意：实测服务端（Samba 4.19）单次写入硬性上限为 64KiB——
+  /// 65536 能写、65537 即被服务端以 STATUS_INVALID_PARAMETER 拒绝**，库协商出来的
+  /// maxWriteSize（按客户端缓冲区算出的 1MiB）是虚高的、不可信。因此分块不能超过
+  /// 64KiB，必须与 blockSize 对齐，否则每个分块都会被拆/被拒，大视频直接备份失败。
   static const int _uploadChunkSize = 64936;
+
+  /// 单文件分片并行上传的连接数。
+  ///
+  /// 一条 SMB 连接上的写请求在库内部严格串行（`SmbTransport.sendrecv` 全程持有
+  /// 互斥锁），所以单个文件无论多大都只能跑出一条约 5~6MB/s 的串行流，大视频
+  /// 因此慢得难以接受。这里把文件按字节区间切给多条独立连接并行写入同一个
+  /// 临时文件，写完再统一改名，用并发突破单连接的吞吐上限。
+  static const int _uploadChunkParallelism = 4;
+
+  /// 启用 [uploadFileParallel] 的文件大小阈值。
+  ///
+  /// 小文件不启用分片：连接建立 + 认证的固定开销会超过省下的时间，反而更慢。
+  static const int uploadParallelThresholdBytes = 8 * 1024 * 1024;
 
   /// 单次 SMB 写入调用的「卡死」上限。
   ///
@@ -1243,6 +1263,176 @@ class SmbService {
       // 否则会在远端堆积一份与正式文件等大的残片。
       await _guard(_deleteRemoteIfExists(connect, tempFull));
       rethrow;
+    }
+  }
+
+  /// 上传单个本地文件；大文件自动改用多连接分片并行，突破单连接吞吐上限。
+  ///
+  /// 与 [uploadFileVia] 保持同一套原子性语义：内容一律先写 `.mipixtmp` 临时文件，
+  /// 全部写完才改名为正式文件名，中途失败只会留下临时文件（并在此处清掉），
+  /// 不会在正式文件名上留半截「锁死」文件。
+  ///
+  /// 低于 [uploadParallelThresholdBytes] 或 [parallelism] < 2 时直接回落到单连接
+  /// [uploadFileVia]，避免小文件被连接建立/认证开销拖累。
+  Future<void> uploadFileParallel(
+    SmbConfig config,
+    String remotePath,
+    String localPath, {
+    int parallelism = _uploadChunkParallelism,
+    Function(double)? onProgress,
+  }) async {
+    final total = await File(localPath).length();
+    if (total < uploadParallelThresholdBytes || parallelism < 2) {
+      final connect = await createConnection(config);
+      try {
+        await uploadFileVia(connect, config, remotePath, localPath,
+            onProgress: onProgress);
+      } finally {
+        await _closeQuietly(connect);
+      }
+      return;
+    }
+
+    final tempFull = _buildSMBPath(config, '$remotePath$uploadTempSuffix');
+
+    // 用一条独立连接做「准备 + 收尾」：先清掉上次中断残留的临时文件，再建出一个
+    // 空文件。分片写入要以 FileMode.write 打开已存在的文件（该库的 open 只发
+    // FILE_OPEN，不会创建），且各连接共用同一个文件——默认共享模式允许这样做。
+    final setup = await createConnection(config);
+
+    try {
+      try {
+        await _guard(_deleteRemoteIfExists(setup, tempFull));
+        await _guard(setup.createFile(tempFull));
+      } catch (e) {
+        await _closeQuietly(setup);
+        rethrow;
+      }
+
+      // 按字节区间均分，最后一个分片吃掉余数。
+      final chunkSize = (total + parallelism - 1) ~/ parallelism;
+      final ranges = <List<int>>[];
+      for (int i = 0; i < parallelism; i++) {
+        final start = i * chunkSize;
+        if (start >= total) break;
+        final end = (start + chunkSize > total) ? total : start + chunkSize;
+        ranges.add([start, end]);
+      }
+
+      var written = 0;
+      void report(int n) {
+        written += n;
+        if (onProgress != null && total > 0) onProgress(written / total);
+      }
+
+      // 每条分片各用一条全新连接（同一条连接上的写请求严格串行，共用连接等于串行）。
+      final connections = <SmbConnect>[];
+      try {
+        await Future.wait(
+          ranges.map((r) => _writeRange(
+                config: config,
+                tempFull: tempFull,
+                localPath: localPath,
+                start: r[0],
+                end: r[1],
+                connections: connections,
+                report: report,
+              )),
+        );
+      } catch (e) {
+        // 任一分片失败：先关掉所有连接与远端句柄，再清掉临时文件，
+        // 否则会在远端堆积一份与正式文件等大的残片。
+        for (final connect in connections) {
+          await _closeQuietly(connect);
+        }
+        try {
+          await _guard(_deleteRemoteIfExists(setup, tempFull));
+        } catch (_) {
+          // 清理失败无需上抛：原始错误更有诊断价值。
+        }
+        rethrow;
+      }
+
+      // 全部写完、且远端句柄全部关闭后才改名：句柄未关时改名会被服务端拒绝。
+      for (final connect in connections) {
+        await _closeQuietly(connect);
+      }
+
+      try {
+        final tempFile = await _guard(setup.file(tempFull));
+        await _guard(setup.rename(
+          tempFile,
+          _buildSMBPath(config, remotePath),
+          replace: true,
+        ));
+      } catch (e) {
+        try {
+          await _guard(_deleteRemoteIfExists(setup, tempFull));
+        } catch (_) {
+          // 同上传失败路径：忽略清理错误，保留原始异常。
+        }
+        rethrow;
+      }
+    } finally {
+      await _closeQuietly(setup);
+    }
+  }
+
+  /// 把本地文件 [start, end) 字节区间写入远端 [tempFull] 的对应偏移。
+  ///
+  /// 自己新建一条连接并登记到 [connections]，由调用方在全部结束后统一关闭；
+  /// 逐块读写，不会把整个文件读进内存。
+  Future<void> _writeRange({
+    required SmbConfig config,
+    required String tempFull,
+    required String localPath,
+    required int start,
+    required int end,
+    required List<SmbConnect> connections,
+    required void Function(int) report,
+  }) async {
+    final connect = await _guard(createConnection(config));
+    connections.add(connect);
+    final reader = await File(localPath).open();
+    try {
+      final file = await _guard(connect.file(tempFull));
+      final remote = await _guard(connect.open(file, mode: FileMode.write));
+      try {
+        // 本地读取必须定位到本分片起点：RandomAccessFile 从当前位置顺序读，
+        // 不定位的话每个分片都会从文件头开始读，把前段数据写到自己的偏移上，
+        // 结果就是整份文件内容错位。
+        await reader.setPosition(start);
+        var offset = start;
+        while (offset < end) {
+          final remaining = end - offset;
+          final want = remaining < _uploadChunkSize ? remaining : _uploadChunkSize;
+          final chunk = await reader.read(want);
+          if (chunk.isEmpty) break;
+          // 该库的 writeFrom 不会自行推进位置，每次写入前都要显式定位。
+          await remote.setPosition(offset);
+          await _guard(remote.writeFrom(chunk));
+          offset += chunk.length;
+          report(chunk.length);
+        }
+      } finally {
+        // 连接可能已被服务端重置：不加超时的话，这条 tree disconnect 会在
+        // 库内部按「3 秒响应超时 × 5 次重试」空转 15 秒，把整批传输拖停。
+        await _guard(remote.close());
+      }
+    } finally {
+      await reader.close();
+    }
+  }
+
+  /// 关闭一条独立连接；失败静默忽略（连接可能已因出错而断开）。
+  ///
+  /// 必须加超时：连接断开后 `close()` 内部仍会发 tree disconnect 并等响应，
+  /// 无上限时每条死连接都要空转十几秒，几条例连接就能让一批备份「卡住不动」。
+  Future<void> _closeQuietly(SmbConnect connect) async {
+    try {
+      await connect.close().timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // 关闭失败或超时均无需处理：连接本就要废弃。
     }
   }
 

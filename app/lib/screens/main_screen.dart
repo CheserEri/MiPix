@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/album_provider.dart';
+import '../providers/app_provider.dart';
 import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
@@ -33,12 +34,29 @@ class _MainScreenState extends ConsumerState<MainScreen>
     TransfersScreen(),
   ];
 
+  /// 已核对（或已发起核对）的服务器，避免「启动」与「切换」两条路径重复触发。
+  String? _reconciledServerId;
+
+  /// 用当前服务器的远端实际内容核对「已备份」记录（启动 / 切服务器时调用）。
+  void _reconcileCurrent() {
+    final serverId = ref.read(defaultServerProvider);
+    if (serverId == null || serverId == _reconciledServerId) return;
+    _reconciledServerId = serverId;
+    // 不 await：后台核对，失败由方法内部静默处理，不阻塞界面。
+    ref.read(transfersProvider.notifier).reconcileWithServer(serverId);
+  }
+
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: _tabCount, vsync: this);
     // 滑动切换时同步顶栏配色与状态栏图标明暗。
     _tabController.addListener(_onTabChanged);
+    // 打开软件即核对一次。当前服务器是异步从磁盘载入的，可能晚于首帧：
+    // 这里先试一次（已载入则命中），未载入时由 build 中的 listen 兜底。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _reconcileCurrent();
+    });
   }
 
   void _onTabChanged() {
@@ -54,6 +72,10 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   @override
   Widget build(BuildContext context) {
+    // 切换服务器时立即对新服务器核对一次备份状态。
+    ref.listen(defaultServerProvider, (prev, next) {
+      if (next != null && next != prev) _reconcileCurrent();
+    });
     // 「传输」标签展示待备份数量（本地尚未备份的照片数），而非瞬时在传任务数。
     final pendingCount = ref.watch(unsyncedCountProvider);
     // 与小米相册一致：所有主页面统一使用色板配色，随主题明暗切换。

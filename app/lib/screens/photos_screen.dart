@@ -54,7 +54,7 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     final access = ref.watch(localAccessProvider).valueOrNull;
     final isMultiSelect = ref.watch(isMultiSelectProvider);
     final selected = ref.watch(selectedPhotosProvider);
-    final synced = ref.watch(syncedPhotosProvider);
+    final synced = ref.watch(syncedForCurrentServerProvider);
     final uploading = ref.watch(uploadingPathsProvider);
 
     return Scaffold(
