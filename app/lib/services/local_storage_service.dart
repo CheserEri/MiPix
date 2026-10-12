@@ -5,35 +5,31 @@ import '../models/models.dart';
 class LocalStorageService {
   static const _smbServersKey = 'smb_servers';
   static const _transfersKey = 'transfers';
-  static const _syncedPhotosKey = 'synced_photos';
+  // v2：按服务器分别记录（serverId → 已备份的本地路径集合），切换服务器时
+  // 「已备份」状态以对应服务器为准。旧的全局 key 直接废弃，不做迁移。
+  static const _syncedPhotosKey = 'synced_photos_v2';
 
-  /// 已成功备份到 SMB 的本地图片路径集合（用于区分已同步 / 未同步）。
-  Future<Set<String>> getSyncedPhotos() async {
+  /// 全部服务器的「已备份」记录。
+  Future<Map<String, Set<String>>> getAllSynced() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getStringList(_syncedPhotosKey)?.toSet() ?? <String>{};
+    final data = prefs.getString(_syncedPhotosKey);
+    if (data == null) return <String, Set<String>>{};
+    final map = jsonDecode(data) as Map<String, dynamic>;
+    return map.map<String, Set<String>>(
+        (k, v) => MapEntry(k, (v as List).cast<String>().toSet()));
   }
 
-  Future<bool> isSynced(String localPath) async {
-    final synced = await getSyncedPhotos();
-    return synced.contains(localPath);
+  /// 某台服务器的「已备份」本地路径集合。
+  Future<Set<String>> getSyncedPhotos(String serverId) async {
+    return (await getAllSynced())[serverId] ?? <String>{};
   }
 
-  Future<void> markSynced(List<String> localPaths) async {
-    if (localPaths.isEmpty) return;
+  /// 整表覆盖持久化（调用方持有权威内存集合，避免并发读-改-写互相覆盖）。
+  Future<void> saveAllSynced(Map<String, Set<String>> all) async {
     final prefs = await SharedPreferences.getInstance();
-    final synced = prefs.getStringList(_syncedPhotosKey)?.toSet() ?? <String>{};
-    synced.addAll(localPaths);
-    await prefs.setStringList(_syncedPhotosKey, synced.toList());
-  }
-
-  /// 用给定集合整体覆盖「已同步」记录。
-  ///
-  /// 调用方持有权威的内存集合，直接整表覆盖而非读-改-写，可避免并发调用
-  /// 各自读旧值再写回、互相覆盖导致部分标记丢失（丢标记会让已备份的照片
-  /// 重新显示为未同步，并可能在换 IP 连同一文件夹时重复上传）。
-  Future<void> saveSyncedPhotos(Iterable<String> localPaths) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(_syncedPhotosKey, localPaths.toList());
+    final enc = all.map<String, List<String>>(
+        (k, v) => MapEntry(k, v.toList()));
+    await prefs.setString(_syncedPhotosKey, jsonEncode(enc));
   }
 
   Future<void> clearSynced() async {
