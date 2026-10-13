@@ -1,12 +1,26 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:smb_connect/smb_connect.dart';
 import 'package:smb_connect/src/exceptions.dart' show SmbException;
 import '../models/models.dart';
 import 'cache_service.dart';
+
+/// 收集流式哈希的最终摘要（`startChunkedConversion` 需要 `Sink<Digest>`）。
+/// 每次哈希都新建一个实例，避免复用上次的部分结果。
+class _DigestSink implements Sink<Digest> {
+  Digest? value;
+
+  @override
+  void add(Digest data) => value = data;
+
+  @override
+  void close() {}
+}
 
 class _ConnectionWrapper {
   final SmbConnect connect;
@@ -159,23 +173,105 @@ class SmbService {
     return [];
   }
 
-  /// 列出远端目录下所有文件的「文件名 → 大小」，供上传前跨设备去重。
+  /// 列出远端目录下所有文件的「文件名 → 大小」，供上传前跨设备去重与对账。
   ///
-  /// 目录不存在 / 无权限 / 网络异常时返回空表，调用方据此视为「远端还没有」，
-  /// 不会因去重探测失败而阻断备份。
-  Future<Map<String, int>> listFilesWithSize(SmbConfig config, String path) async {
-    try {
-      final connect = await _getConnection(config);
-      final smbPath = _buildSMBPath(config, path);
-      final folder = await connect.file(smbPath);
-      final files = await connect.listFiles(folder);
-      return {
-        for (final f in files)
-          if (!f.isDirectory()) f.name: f.size,
-      };
-    } catch (_) {
-      return <String, int>{};
+  /// 返回值语义（区分「远端为空」与「读取失败」，两者后果完全不同）：
+  /// - 非空 map / 空 map：读取成功。目录不存在或为空时返回空表，表示远端确实没有；
+  /// - `null`：读取失败（连接异常、重试耗尽）。调用方**不得**把它当作「远端为空」——
+  ///   对账会据此放弃本轮，避免一次抖动把所有「已备份」记录误清成 0。
+  ///
+  /// 该调用复用共享缓存连接（[_getConnection]）。历史上它对连接异常零重试、
+  /// 并把异常吞成空表，导致「瞬时读取失败」被伪装成「远端没有」。这里与
+  /// 其它方法保持一致：失败即废弃连接并重建，重试耗尽才判定为读取失败。
+  Future<Map<String, int>?> listFilesWithSize(SmbConfig config, String path) async {
+    final smbPath = _buildSMBPath(config, path);
+    var retries = 3;
+    Object? lastError;
+    while (retries-- > 0) {
+      try {
+        final connect = await _getConnection(config);
+        final folder = await connect.file(smbPath);
+        // 目录不存在属于正常语义（该相册尚未备份过），不是读取失败。
+        if (!folder.isExists) {
+          debugPrint('[diag-smb] listFilesWithSize ABSENT path="$path" '
+              'smbPath="$smbPath"');
+          return <String, int>{};
+        }
+        final files = await connect.listFiles(folder);
+        final result = {
+          for (final f in files)
+            if (!f.isDirectory()) f.name: f.size,
+        };
+        debugPrint('[diag-smb] listFilesWithSize path="$path" smbPath="$smbPath" '
+            'files=${files.length} entries=${result.length}');
+        return result;
+      } catch (e) {
+        lastError = e;
+        if (retries == 0) break;
+        _invalidateConnection(config.host, config.username);
+      }
     }
+    debugPrint('[diag-smb] listFilesWithSize FAIL path="$path" smbPath="$smbPath" '
+        'share="${config.share}" root="${config.rootPath}" host="${config.host}" '
+        'err=$lastError');
+    return null;
+  }
+
+  /// 流式读取远端文件并计算 SHA-256。返回 `null` 表示**未能确认内容**，
+  /// 调用方不得当作「相同」。
+  ///
+  /// 实现要点：
+  /// - 对远端文件只调用一次 [SmbConnect.openRead]（默认读整份文件），逐个消费
+  ///   stream chunk 并喂给 SHA-256 的 chunked sink；**不要**每 256KiB 再调用一次
+  ///   `openRead(start, end)`——每次调用都会重新打开远端文件并增加 SMB 往返/句柄开销。
+  /// - 哈希前后核对远端大小，且累计读取字节数必须等于预期大小；若文件在清单扫描后
+  ///   被并发改写、删除或读取不完整，返回 `null`，绝不把部分摘要用于决策。
+  /// - 每次重试都新建摘要状态，丢弃上次部分结果；不以反复 `openRead` 分窗来控制内存。
+  /// - 连接类异常按既有范式重试并失效重建；非连接类错误立即返回 `null`。
+  ///
+  /// 不复用 [readFile]：它整文件入内存 + 4 连接并行分块 + 图片缓存，都不适用。
+  Future<String?> hashRemoteFile(SmbConfig config, String remotePath) async {
+    final smbPath = _buildSMBPath(config, remotePath);
+    var retries = 3;
+    Object? lastError;
+    while (retries-- > 0) {
+      try {
+        final connect = await _getConnection(config);
+        final file = await connect.file(smbPath);
+        if (!file.isExists || file.isDirectory()) {
+          debugPrint('[backup][hash] FAIL remote="$remotePath" reason=absent');
+          return null;
+        }
+        final expected = file.size;
+        final digestSink = _DigestSink();
+        final hasher = sha256.startChunkedConversion(digestSink);
+        var read = 0;
+        final stream = await connect.openRead(file);
+        await for (final chunk in stream) {
+          hasher.add(chunk);
+          read += chunk.length;
+        }
+        hasher.close();
+        final digest = digestSink.value;
+        if (digest == null || read != expected) {
+          debugPrint('[backup][hash] FAIL remote="$remotePath" '
+              'expected=$expected read=$read');
+          return null;
+        }
+        debugPrint('[backup][hash] remote="$remotePath" bytes=$read hash=$digest');
+        return digest.toString();
+      } catch (e) {
+        lastError = e;
+        if (!isConnectionError(e)) {
+          debugPrint('[backup][hash] FAIL remote="$remotePath" err=$e');
+          return null;
+        }
+        if (retries == 0) break;
+        _invalidateConnection(config.host, config.username);
+      }
+    }
+    debugPrint('[backup][hash] FAIL remote="$remotePath" err=$lastError');
+    return null;
   }
 
   Future<List<MediaItem>> getAllMediaItems(
@@ -1133,8 +1229,14 @@ class SmbService {
   /// `connection abort` 与 `cant send request` 是服务端重置连接后的两种典型报文：
   /// 前者来自 Socket 写失败，后者是 smb_connect 在 5 次无响应重试后的兜底异常。
   /// 二者都意味着这条连接已死，必须重连而不是把文件判为失败。
+  ///
+  /// 「本地 socket 已被关闭」是息屏断连场景下实际观测到的异常（`Bad state:
+  /// StreamSink is closed`），它同样说明这条连接已经废了。这里只匹配**明确的
+  /// socket 关闭报文**，不匹配宽泛的 `bad state`——否则任何程序性 StateError
+  /// 都会被误判成网络问题而白等一轮重连。
   static bool isConnectionError(Object error) {
     if (error is TimeoutException) return true;
+    if (error is SocketException) return true;
     final msg = error.toString().toLowerCase();
     return msg.contains('network name') ||
         msg.contains('nt_status') ||
@@ -1143,19 +1245,35 @@ class SmbService {
         msg.contains('connection reset') ||
         msg.contains('reset by peer') ||
         msg.contains('connection abort') ||
-        msg.contains('cant send request');
+        msg.contains('cant send request') ||
+        // 本地 socket/sink 已关闭（SocketWriter.write / SocketReader2）
+        msg.contains('streamsink is closed') ||
+        msg.contains('stream sink is closed') ||
+        msg.contains('socket is closed') ||
+        msg.contains('connection closed') ||
+        msg.contains('broken pipe') ||
+        (msg.contains("can't read") && msg.contains('from socket')) ||
+        (msg.contains('cant read') && msg.contains('from socket'));
   }
 
   /// 建立一条独立的 SMB 连接（不进入连接缓存池），由调用方负责关闭。
   ///
   /// 同一条连接上的读写无法真正并行，因此并行上传必须为每个 worker
   /// 单独建连接，否则只是逻辑并发、实际仍在串行。
-  Future<SmbConnect> createConnection(SmbConfig config) {
+  ///
+  /// [onDisconnect] 与缓存连接（见 [_getConnection]）保持一致：socket 一旦
+  /// 断开（对端断开、链路中断）立即回调，调用方据此把该连接标记为失效并在
+  /// 下一个文件前重建，而不是等到某次写入失败才发现。
+  Future<SmbConnect> createConnection(
+    SmbConfig config, {
+    Function(SmbConnect)? onDisconnect,
+  }) {
     return SmbConnect.connectAuth(
       host: config.host,
       domain: config.domain,
       username: config.username,
       password: config.password ?? '',
+      onDisconnect: onDisconnect,
     );
   }
 

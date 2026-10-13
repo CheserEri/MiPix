@@ -129,6 +129,14 @@ class SocketReader2 extends SocketReader {
   final bool debugPrint;
   late StreamSubscription _subscription;
 
+  /// 当前挂起的读取者：数据到达 / 连接关闭时由 [_wake] 唤醒。
+  ///
+  /// 取代原先「每 1ms 轮询一次缓冲区」的写法——轮询在主 isolate 繁忙时会被
+  /// 拉长到几十~上百毫秒，把每次 SMB 请求的往返都拖慢一个数量级。
+  Completer<void>? _waiter;
+  bool _closed = false;
+  Object? _error;
+
   SocketReader2(super._socket, Function update, {this.debugPrint = false}) {
     _subscription = _socket.listen(
       (event) {
@@ -138,33 +146,52 @@ class SocketReader2 extends SocketReader {
         }
         _chunks.add(event);
         _chunkBytes += event.length;
+        _wake();
         update();
+      },
+      onError: (Object e) {
+        _error = e;
+        _closed = true;
+        _wake();
       },
       onDone: () {
         if (debugPrint) {
           print("Smb Reader closed");
         }
+        _closed = true;
+        _wake();
         _socket.close();
       },
     );
   }
 
+  /// 数据到达或连接结束时唤醒挂起的读取者。
+  void _wake() {
+    final waiter = _waiter;
+    _waiter = null;
+    if (waiter != null && !waiter.isCompleted) waiter.complete();
+  }
+
   @override
   Future<int> _readChunkFor(int bytes) async {
     var readed = _readedBytes();
-    int n = 0;
     while (bytes > readed) {
-      await Future.delayed(Duration(milliseconds: 1));
-      readed = _readedBytes();
-      n++;
-      if (n >= 3000) {
-        throw "Can't read $bytes from Socket!";
+      if (_error != null) throw _error!;
+      if (_closed) throw "Can't read $bytes from Socket!";
+      final waiter = _waiter ??= Completer<void>();
+      try {
+        // 保留超时兜底：对端静默失联（不回 ACK 也不发 RST）时不会永久挂住。
+        await waiter.future.timeout(const Duration(seconds: 3));
+      } finally {
+        if (identical(_waiter, waiter)) _waiter = null;
       }
+      readed = _readedBytes();
     }
     return readed;
   }
 
   Future close() async {
+    _wake();
     await _subscription.cancel();
   }
 }

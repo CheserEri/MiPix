@@ -1,10 +1,23 @@
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import '../models/models.dart';
+
+/// 收集流式哈希的最终摘要（`startChunkedConversion` 需要 `Sink<Digest>`）。
+class _DigestSink implements Sink<Digest> {
+  Digest? value;
+
+  @override
+  void add(Digest data) => value = data;
+
+  @override
+  void close() {}
+}
 
 /// 本地媒体库的访问状态。
 enum LocalAccess {
@@ -490,6 +503,35 @@ class PhotoService {
 
   /// Android 主存储根目录，用于把相册相对路径拼成绝对路径。
   static const String _primaryStorageRoot = '/storage/emulated/0';
+
+  /// 流式计算本地文件的 SHA-256（在独立 isolate 内执行，避免大文件哈希阻塞 UI）。
+  ///
+  /// 返回 `null` 表示**未能确认内容**：文件读取失败，或哈希过程中文件被改动
+  /// 导致累计字节数与开始时记录的大小不一致。调用方不得把它当作「相同」。
+  /// 只消费一次 [File.openRead] 流并流式喂给摘要，不缓存整文件。
+  ///
+  /// 注：远端读必须留在主 isolate（socket 不可跨 isolate），只有本地哈希下放。
+  static Future<String?> hashFile(String path) {
+    return Isolate.run<String?>(() async {
+      try {
+        final file = File(path);
+        final expected = await file.length();
+        final digestSink = _DigestSink();
+        final hasher = sha256.startChunkedConversion(digestSink);
+        var read = 0;
+        await for (final chunk in file.openRead()) {
+          hasher.add(chunk);
+          read += chunk.length;
+        }
+        hasher.close();
+        final digest = digestSink.value;
+        if (digest == null || read != expected) return null;
+        return digest.toString();
+      } catch (_) {
+        return null;
+      }
+    });
+  }
 
   /// 由本地文件绝对路径推导其所属相册的显示名称（如 `相机`、`生活`、`微信`）。
   ///

@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/album_provider.dart';
-import '../providers/app_provider.dart';
 import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
@@ -39,7 +38,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   /// 用当前服务器的远端实际内容核对「已备份」记录（启动 / 切服务器时调用）。
   void _reconcileCurrent() {
-    final serverId = ref.read(defaultServerProvider);
+    final serverId = ref.read(effectiveServerIdProvider);
     if (serverId == null || serverId == _reconciledServerId) return;
     _reconciledServerId = serverId;
     // 不 await：后台核对，失败由方法内部静默处理，不阻塞界面。
@@ -73,7 +72,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
   @override
   Widget build(BuildContext context) {
     // 切换服务器时立即对新服务器核对一次备份状态。
-    ref.listen(defaultServerProvider, (prev, next) {
+    ref.listen(effectiveServerIdProvider, (prev, next) {
       if (next != null && next != prev) _reconcileCurrent();
     });
     // 「传输」标签展示待备份数量（本地尚未备份的照片数），而非瞬时在传任务数。
