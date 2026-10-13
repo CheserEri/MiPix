@@ -6,26 +6,29 @@ MiPix（米影相册）是一款**纯本地运行**的 Android 相册管理工�
 - 框架：Flutter + Riverpod
 - 目标平台：Android（targetSdk 36 / minSdk 24）
 
-> 技术问题、根因分析与解决方案的整合记录见 [技术问题与方案.md](./技术问题与方案.md)。
+> 技术问题、根因分析与解决方案的整合记录见 [技术问题与方案.md](./app/技术问题与方案.md)。
 
 ## 项目结构
 
 ```
 MiPix/
-└── app/                          # 前端 (Flutter Android)
+├── README.md                       # 本文件
+├── LICENSE
+└── app/                            # Flutter Android 工程
     ├── lib/
     │   ├── main.dart
-    │   ├── models/               # 数据模型（含 TransferStatus 等）
-    │   ├── providers/            # Riverpod 状态管理（app/photo/album/smb/transfer）
-    │   ├── screens/              # 页面
-    │   ├── services/             # 本地服务（SMB、照片、存储、缓存、保活）
-    │   ├── widgets/              # UI 组件（玻璃容器、动画等）
-    │   └── utils/                # 工具类
-    ├── android/                  # Android 配置（MethodChannel 保活、权限）
-    ├── packages/smb_connect/     # 本地补丁的 SMB 协议实现（纯 Dart）
-    ├── test/                     # 单元测试
-    ├── 技术问题与方案.md          # 本项目技术问题整合文档
-    └── README.md                 # 本文件
+    │   ├── models/                 # 数据模型（含 TransferStatus 等）
+    │   ├── providers/              # Riverpod 状态管理（app/photo/album/smb/transfer）
+    │   ├── screens/                # 页面
+    │   ├── services/               # 本地服务（SMB、照片、存储、缓存、保活）
+    │   ├── widgets/                # UI 组件（玻璃容器、动画等）
+    │   └── utils/                  # 工具类
+    ├── android/                    # Android 配置（MethodChannel 保活、权限）
+    ├── assets/                     # 应用资源
+    ├── packages/smb_connect/       # 本地补丁的 SMB 协议实现（纯 Dart）
+    ├── test/                       # 单元测试
+    ├── 技术问题与方案.md            # 本项目技术问题整合文档
+    └── pubspec.yaml
 ```
 
 ## 功能特性
