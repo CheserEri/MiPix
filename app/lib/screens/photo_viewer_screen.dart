@@ -537,6 +537,10 @@ class _BottomActionBar extends ConsumerWidget {
     final String message;
     if (result.allAlreadyBackedUp) {
       message = '该照片已在服务器上，无需重复备份';
+    } else if (result.successCount == 0 &&
+        result.failedCount == 0 &&
+        result.conflictSkippedCount > 0) {
+      message = '${result.conflictSkippedCount} 项同名冲突未备份（详见传输列表）';
     } else if (result.successCount == 0 && result.failedCount == 0) {
       message = '该照片正在上传中';
     } else if (result.allSucceeded) {

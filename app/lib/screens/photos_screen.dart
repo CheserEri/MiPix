@@ -339,19 +339,32 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                                 message =
                                     '所选照片均已在服务器上，无需重复备份（${result.skippedCount} 项）';
                               } else if (result.successCount == 0 &&
+                                  result.failedCount == 0 &&
+                                  result.conflictSkippedCount > 0) {
+                                message =
+                                    '${result.conflictSkippedCount} 项同名冲突未备份（详见传输列表）';
+                              } else if (result.successCount == 0 &&
                                   result.failedCount == 0) {
                                 message = '所选照片均在上传中，已跳过';
                               } else if (result.allSucceeded) {
-                                message = result.skippedCount > 0
-                                    ? '已加入备份队列 ${result.successCount} 项，'
-                                        '${result.skippedCount} 项已备份跳过'
-                                    : '已加入备份队列 ${result.successCount} 项';
+                                message = [
+                                  '已加入备份队列 ${result.successCount} 项',
+                                  if (result.skippedCount > 0)
+                                    '${result.skippedCount} 项已备份跳过',
+                                  if (result.conflictSkippedCount > 0)
+                                    '${result.conflictSkippedCount} 项冲突未备份',
+                                ].join('，');
                               } else if (result.allFailed) {
                                 message = '备份失败，请检查 SMB 配置或后端连接';
                               } else {
-                                message =
-                                    '部分备份已加入队列：成功 ${result.successCount}，失败 ${result.failedCount}'
-                                    '${result.skippedCount > 0 ? '，跳过 ${result.skippedCount}' : ''}';
+                                message = '部分备份已加入队列：${[
+                                  '成功 ${result.successCount}',
+                                  '失败 ${result.failedCount}',
+                                  if (result.skippedCount > 0)
+                                    '跳过 ${result.skippedCount}',
+                                  if (result.conflictSkippedCount > 0)
+                                    '冲突未备份 ${result.conflictSkippedCount}',
+                                ].join('，')}';
                               }
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(content: Text(message)),

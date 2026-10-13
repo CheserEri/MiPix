@@ -6,7 +6,6 @@ import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
 import '../widgets/animations.dart';
-import '../widgets/local_media_thumb.dart';
 import '../widgets/smb_server_switcher.dart';
 import '../utils/mipix_theme.dart';
 
@@ -42,15 +41,6 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     final transfersAsync = ref.watch(transfersProvider);
     final unsynced = ref.watch(unsyncedPhotosProvider);
 
-    // 正在排队/上传的本地文件 → 任务，用于在对应缩略图底部叠加进度条。
-    final uploadsByPath = <String, TransferTask>{};
-    for (final t in transfersAsync.valueOrNull ?? const <TransferTask>[]) {
-      if (t.status == TransferStatus.running ||
-          t.status == TransferStatus.pending) {
-        uploadsByPath[t.localPath] = t;
-      }
-    }
-
     final palette = MiPixPalette.of(context);
     // 失败的上传项数量：>0 时在队列标题处提供「重试失败」续传入口。
     final failedUploadCount = (transfersAsync.valueOrNull ?? const <TransferTask>[])
@@ -85,31 +75,6 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
                 padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
                 child: Text('本地照片都已同步到 SMB 服务器',
                     style: TextStyle(color: palette.textSecondary, fontSize: 13)),
-              ),
-            )
-          else
-            SliverPadding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              sliver: SliverGrid(
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 4,
-                  crossAxisSpacing: 3,
-                  mainAxisSpacing: 3,
-                ),
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) {
-                    final photo = unsynced[index];
-                    return BounceTap(
-                      onTap: () => _backupOne(photo),
-                      child: _thumbWithProgress(
-                        photo,
-                        uploadsByPath[photo.path],
-                        palette,
-                      ),
-                    );
-                  },
-                  childCount: unsynced.length,
-                ),
               ),
             ),
           const SliverToBoxAdapter(child: SizedBox(height: 12)),
@@ -186,51 +151,6 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
           const SliverPadding(padding: EdgeInsets.only(bottom: 120)),
         ],
       ),
-    );
-  }
-
-  /// 缩略图底部叠加上传进度条：直观显示这张照片的备份进度。
-  ///
-  /// [task] 为 null 表示该照片当前不在传输中，直接显示原缩略图。
-  Widget _thumbWithProgress(
-    MediaItem photo,
-    TransferTask? task,
-    MiPixPalette palette,
-  ) {
-    final thumb = LocalMediaThumb(item: photo);
-    if (task == null) return thumb;
-
-    // 排队阶段进度未知，显示不确定态（来回滚动）的进度条。
-    final value = task.status == TransferStatus.pending ? null : task.progress;
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        thumb,
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 0,
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(3, 6, 3, 3),
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Colors.transparent, Colors.black54],
-              ),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: LinearProgressIndicator(
-                value: value,
-                minHeight: 3,
-                backgroundColor: Colors.white24,
-                valueColor: AlwaysStoppedAnimation<Color>(palette.accent),
-              ),
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -341,6 +261,19 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
               fontSize: 11,
             ),
           ),
+          // 跳过/失败原因（此前从未渲染）：冲突跳过、清单/哈希不可知等都要让用户看到。
+          if (task.errorMessage != null && task.errorMessage!.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              task.errorMessage!,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: palette.textSecondary,
+                fontSize: 11,
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -350,17 +283,17 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     await _backup(photos.map((p) => p.path).toList());
   }
 
-  Future<void> _backupOne(MediaItem photo) async {
-    await _backup([photo.path]);
-  }
-
   /// 续传：把队列里失败的上传项重新排队备份（断网恢复后使用）。
   Future<void> _retryFailed() async {
     final result =
         await ref.read(transfersProvider.notifier).retryFailedUploads();
     if (!mounted) return;
     final String message;
-    if (result.successCount == 0 && result.failedCount == 0) {
+    if (result.successCount == 0 &&
+        result.failedCount == 0 &&
+        result.conflictSkippedCount > 0) {
+      message = '${result.conflictSkippedCount} 项同名冲突未备份（详见传输列表）';
+    } else if (result.successCount == 0 && result.failedCount == 0) {
       message = '没有可重试的失败项（本地文件可能已删除）';
     } else if (result.failedCount == 0) {
       message = '续传完成，成功 ${result.successCount} 项';
@@ -392,15 +325,30 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     final String message;
     if (result.allAlreadyBackedUp) {
       message = '所选照片均已在服务器上，无需重复备份（${result.skippedCount} 项）';
+    } else if (result.successCount == 0 &&
+        result.failedCount == 0 &&
+        result.conflictSkippedCount > 0) {
+      // 仅有冲突跳过时，不能误报「已加入备份队列 0 项」。
+      message = '${result.conflictSkippedCount} 项同名冲突未备份（详见传输列表）';
+    } else if (result.successCount == 0 && result.failedCount == 0) {
+      message = '所选照片均在上传中，已跳过';
     } else if (result.allSucceeded) {
-      message = result.skippedCount > 0
-          ? '已加入备份队列 ${result.successCount} 项，${result.skippedCount} 项已备份跳过'
-          : '已加入备份队列 ${result.successCount} 项';
+      message = [
+        '已加入备份队列 ${result.successCount} 项',
+        if (result.skippedCount > 0) '${result.skippedCount} 项已备份跳过',
+        if (result.conflictSkippedCount > 0)
+          '${result.conflictSkippedCount} 项冲突未备份',
+      ].join('，');
     } else if (result.allFailed) {
       message = '备份失败，请检查 SMB 配置';
     } else {
-      message = '部分备份成功：成功 ${result.successCount}，失败 ${result.failedCount}'
-          '${result.skippedCount > 0 ? '，跳过 ${result.skippedCount}' : ''}';
+      message = '部分备份成功：${[
+        '成功 ${result.successCount}',
+        '失败 ${result.failedCount}',
+        if (result.skippedCount > 0) '跳过 ${result.skippedCount}',
+        if (result.conflictSkippedCount > 0)
+          '冲突未备份 ${result.conflictSkippedCount}',
+      ].join('，')}';
     }
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
@@ -417,6 +365,8 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
         return const Color(0xFFEF4444);
       case TransferStatus.paused:
         return const Color(0xFF3B82F6);
+      case TransferStatus.skipped:
+        return const Color(0xFF9CA3AF);
       default:
         return const Color(0xFF9CA3AF);
     }
@@ -434,6 +384,8 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
         return '完成';
       case TransferStatus.failed:
         return '失败';
+      case TransferStatus.skipped:
+        return '已跳过';
     }
   }
 

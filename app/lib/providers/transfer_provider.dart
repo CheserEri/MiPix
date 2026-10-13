@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:smb_connect/smb_connect.dart';
 import '../models/models.dart';
 import '../services/local_storage_service.dart';
+import '../services/keep_alive_service.dart';
 import '../services/photo_service.dart';
 import '../services/smb_service.dart';
 import 'app_provider.dart';
@@ -35,18 +36,381 @@ class BackupResult {
   /// 远端已存在「同名同大小」文件而跳过上传的照片数（视为已备份）。
   final int skippedCount;
 
+  /// 因同名冲突而**未备份**的照片数（远端更大 / 同大同哈希不同 / 同批次落选）。
+  /// 与 [skippedCount] 语义不同：这些文件并未同步，需用户自行处理。
+  final int conflictSkippedCount;
+
   const BackupResult({
     required this.successCount,
     required this.failedCount,
     this.skippedCount = 0,
+    this.conflictSkippedCount = 0,
   });
 
   bool get allSucceeded => failedCount == 0;
   bool get allFailed => successCount == 0 && failedCount > 0;
 
-  /// 本次全部被判定为「远端已备份」而跳过（无上传、无失败）。
+  /// 本次全部被判定为「远端已备份」而跳过（无上传、无失败、无冲突未备份）。
   bool get allAlreadyBackedUp =>
-      successCount == 0 && failedCount == 0 && skippedCount > 0;
+      successCount == 0 &&
+      failedCount == 0 &&
+      skippedCount > 0 &&
+      conflictSkippedCount == 0;
+}
+
+/// 批量上传的失败收敛控制。
+///
+/// 断网/服务端持续不可用时，若让队列里每个文件各自空转 15~30 秒（库内
+/// 「3 秒响应超时 × 5 次重试」+ 写入卡死上限），进度条会冻结数小时，
+/// 用户看到的就是「速度归零、进度不动」。这里统计**连续**的连接类失败，
+/// 达到阈值即判定为「这条链路已经不可用」，让调度方尽快停止本批剩余项，
+/// 转为可恢复状态（保留「重试失败」入口），而不是继续空转。
+///
+/// 独立成类以便单测：不依赖 SMB、存储与 Flutter。
+class UploadFailureGuard {
+  /// 连续连接类失败达到该值即停止本批。
+  final int maxConsecutiveConnectionFailures;
+
+  int _consecutive = 0;
+  bool _stopped = false;
+
+  UploadFailureGuard({this.maxConsecutiveConnectionFailures = 5});
+
+  int get consecutiveFailures => _consecutive;
+
+  /// 是否已判定为「链路不可用」，调度方应立即停止领取新文件。
+  bool get shouldStop => _stopped;
+
+  /// 记录一次失败：连接类失败累加，其它失败（如权限/重名）清零。
+  void record(Object error) {
+    if (SmbService.isConnectionError(error)) {
+      _consecutive += 1;
+      if (_consecutive >= maxConsecutiveConnectionFailures) {
+        _stopped = true;
+      }
+    } else {
+      _consecutive = 0;
+    }
+  }
+
+  /// 记录一次成功：链路恢复可用，连续计数清零。
+  void recordSuccess() {
+    _consecutive = 0;
+  }
+}
+
+/// 上传一个文件，连接类错误时先废弃旧连接、再有限次重试同一文件。
+///
+/// 返回值：`null` 表示成功；否则返回导致最终失败的异常。
+///
+/// 失败时的处理顺序严格为「标记失效 → 关闭并重建连接 → 重试」，见
+/// [reconnect]：它由调用方提供，负责关掉已死的连接并新建一条。
+/// 重连本身失败时立即收敛为失败，避免在没有可用连接的情况下继续空转重试。
+///
+/// 抽出为顶层函数以便单测：只依赖传入的闭包，不触碰 SMB 与存储。
+Future<Object?> uploadWithRetry({
+  required Future<void> Function() upload,
+  required UploadFailureGuard guard,
+  Future<void> Function()? reconnect,
+  int maxRetries = 3,
+}) async {
+  var left = maxRetries;
+  while (true) {
+    try {
+      await upload();
+      guard.recordSuccess();
+      return null;
+    } catch (e) {
+      guard.record(e);
+      if (!SmbService.isConnectionError(e) || left <= 0 || guard.shouldStop) {
+        return e;
+      }
+      left -= 1;
+      if (reconnect != null) {
+        try {
+          await reconnect();
+        } catch (reconnectError) {
+          // 重建连接都失败了，说明链路确实不可用：立即收敛，不再重试。
+          guard.record(reconnectError);
+          return e;
+        }
+      }
+      // 大文件（分片并行）没有外部连接可重建：uploadFileParallel 每次调用
+      // 都会自行新建分片连接，直接重试即为「换一批新连接」。
+    }
+  }
+}
+
+/// 计算「与服务器核对后仍视为已备份」的本地路径集合。
+///
+/// 返回 `null` 表示**本轮清单不完整**：只要有任一相册的远端清单读取失败
+/// （[SmbService.listFilesWithSize] 返回 null），就不能判定这些照片「远端已删」，
+/// 必须放弃本轮、保留现有记录——否则一次抖动会把「已备份」误清成 0。
+///
+/// 独立成顶层纯函数以便单测：不依赖 SMB、存储与 Flutter。
+Set<String>? reconcileSynced({
+  required Iterable<String> candidates,
+  /// 本地路径 → 相册名（识别不出相册的为空串，不参与对账）。
+  required Map<String, String> albumOf,
+  /// 相册名 → 远端清单；`null` 表示该相册读取失败。
+  required Map<String, Map<String, int>?> remoteIndex,
+  /// 本地路径 → 文件大小；缺失表示文件已删除或不可读（丢弃记录）。
+  required Map<String, int> localSizes,
+}) {
+  // 清单完整性检查放最前：任一相册读取失败即放弃，绝不产出部分结果。
+  for (final album in albumOf.values) {
+    if (album.isEmpty) continue;
+    if (!remoteIndex.containsKey(album) || remoteIndex[album] == null) {
+      return null;
+    }
+  }
+
+  final stillSynced = <String>{};
+  for (final p in candidates) {
+    final album = albumOf[p] ?? '';
+    if (album.isEmpty) continue;
+    final size = localSizes[p];
+    if (size == null) continue; // 本地已删/不可读：丢弃记录。
+    final remoteSize = remoteIndex[album]?[p.split('/').last];
+    // 远端已有「同名同大小」才算已备份；同名不同大小不能误标。
+    if (size > 0 && remoteSize != null && remoteSize == size) {
+      stillSynced.add(p);
+    }
+  }
+  return stillSynced;
+}
+
+/// [clearCompleted] 之后仍保留在队列里的状态：未终结（pending/running/paused）
+/// 或可重试（failed）。done 与 skipped 都属于确定终态，一并清除。
+bool keepAfterClearCompleted(TransferStatus status) =>
+    status != TransferStatus.done &&
+    status != TransferStatus.skipped &&
+    status != TransferStatus.failed;
+
+// ---------------------------------------------------------------------------
+// 「同名文件冲突」判定（纯逻辑，可单测：不依赖 SMB、存储与 Flutter）
+// ---------------------------------------------------------------------------
+
+/// 冲突判定给出的处置动作。
+///
+/// - [upload]：正常上传（远端没有该文件 / 远端更小）；
+/// - [skipSynced]：同大同哈希相同 → 视为已备份，标记已同步；
+/// - [skipKeepRemote]：远端更大、或同大同哈希不同 → 保留远端，不覆盖；
+/// - [skipBatchCollision]：同批次内被更大的同名文件顶掉；
+/// - [skipAlreadyActive]：该文件正在上传中；
+/// - [failUnknown]：远端清单/哈希不可知（fail-closed，可重试）；
+/// - [failLocalUnreadable]：本地文件或本地哈希不可读（可重试）。
+enum PlanAction {
+  upload,
+  skipSynced,
+  skipKeepRemote,
+  skipBatchCollision,
+  skipAlreadyActive,
+  failUnknown,
+  failLocalUnreadable,
+}
+
+/// 用户可见的固定原因文案（同一条文案三处 UI 共用，便于测试与保持一致）。
+const String conflictMsgRemoteManifestFailed = '无法读取远端文件清单，未备份，请检查连接或权限后重试';
+const String conflictMsgRemoteHashFailed = '校验远端文件内容失败，未备份，请检查连接后重试';
+const String conflictMsgLocalReadFailed = '无法读取本地文件，未备份，请检查文件后重试';
+const String conflictMsgRemoteLarger = '远端已有更大的同名文件，本次未覆盖';
+const String conflictMsgSameSizeDifferent = '同名同大小但内容不同，远端文件已保留';
+const String conflictMsgAlreadyActive = '该文件正在上传，本次未重复加入';
+
+/// 同批次冲突落选文案：胜出者是「更大」还是「同大小按规则择一」要说清楚。
+String conflictMsgBatchCollision({required bool winnerLarger, required String winnerName}) {
+  return winnerLarger
+      ? '同批另有更大的同名文件（$winnerName）已选用，本文件未备份'
+      : '同批多个同名文件大小相同，已按固定规则选择 $winnerName，本文件未备份';
+}
+
+/// 参与冲突判定的一个本地候选文件。
+class ConflictCandidate {
+  final String localPath;
+  final String albumName;
+
+  /// 扁平结构下的远端相对路径：相册名为空时直接放在备份根目录下。
+  final String remotePath;
+  final int size;
+
+  const ConflictCandidate({
+    required this.localPath,
+    required this.albumName,
+    required this.remotePath,
+    required this.size,
+  });
+}
+
+/// 冲突判定对单个候选文件的结论。
+class ConflictDecision {
+  final ConflictCandidate candidate;
+  final PlanAction action;
+
+  /// 用户可见原因；[PlanAction.upload] / [PlanAction.skipSynced] 为 null。
+  final String? message;
+
+  /// 仅「同一远端路径 + 同大小」需要进一步哈希定案。
+  final bool needsHash;
+
+  const ConflictDecision({
+    required this.candidate,
+    required this.action,
+    this.message,
+    this.needsHash = false,
+  });
+}
+
+/// 阶段一产出：待上传、待哈希定案、以及已有确定结论的三类决定。
+class ConflictPlan {
+  /// 明确要上传的项（[ConflictDecision.needsHash] 的项不在其中）。
+  final List<ConflictDecision> uploads;
+
+  /// 需要哈希定案的项（同一远端路径先合并为一个）。
+  final List<ConflictDecision> probes;
+
+  /// 已确定结论的项（skipSynced / skipKeepRemote / skipBatchCollision / fail*）。
+  final List<ConflictDecision> settled;
+
+  const ConflictPlan({
+    required this.uploads,
+    required this.probes,
+    required this.settled,
+  });
+}
+
+/// 阶段一：按远端路径分组 → 组内取最大本地文件（并列用 localPath 字典序打破，
+/// 保证与输入顺序无关）→ 对照远端清单产出计划。
+///
+/// 清单不可知一律 fail-closed：相册值为 `null`（读取失败）、或根目录
+/// （`albumName == ''`）没有对应索引结果时，该相册的文件全部判 [PlanAction.failUnknown]，
+/// 绝不假设「远端不存在」而上传覆盖。
+ConflictPlan planConflicts({
+  required List<ConflictCandidate> candidates,
+  /// 相册名 → 远端清单（文件名 → 大小）。`null` 表示该相册清单读取失败；
+  /// 根目录用空串 key。
+  required Map<String, Map<String, int>?> remoteIndex,
+}) {
+  final uploads = <ConflictDecision>[];
+  final probes = <ConflictDecision>[];
+  final settled = <ConflictDecision>[];
+
+  // 按远端路径分组：同一批次内多个本地文件落到同一远端路径时只上传一次。
+  final groups = <String, List<ConflictCandidate>>{};
+  for (final c in candidates) {
+    groups.putIfAbsent(c.remotePath, () => []).add(c);
+  }
+
+  // 组按远端路径字典序处理，组内先按大小降序、并列按 localPath 升序，
+  // 使结果与输入顺序完全无关（反转输入得到同一结论）。
+  final remotePaths = groups.keys.toList()..sort();
+  for (final remotePath in remotePaths) {
+    final group = groups[remotePath]!;
+    group.sort((a, b) {
+      if (a.size != b.size) return b.size.compareTo(a.size);
+      return a.localPath.compareTo(b.localPath);
+    });
+    final winner = group.first;
+    final remoteMap = remoteIndex[winner.albumName];
+    if (remoteMap == null) {
+      // 远端状态未知时，不能把组内其他候选当作已处理的批次冲突；
+      // 整组都必须保留为可重试失败，待清单可用后重新择优。
+      for (final candidate in group) {
+        settled.add(ConflictDecision(
+          candidate: candidate,
+          action: PlanAction.failUnknown,
+          message: conflictMsgRemoteManifestFailed,
+        ));
+      }
+      continue;
+    }
+
+    // 文案里用本地文件名（用户选中的那个文件）；远端清单查找必须用**远端**文件名
+    // （remotePath 的最后一段），因为清单是按远端目录里的名字建的。
+    final winnerName = winner.localPath.split('/').last;
+    for (var i = 1; i < group.length; i++) {
+      final loser = group[i];
+      settled.add(ConflictDecision(
+        candidate: loser,
+        action: PlanAction.skipBatchCollision,
+        message: conflictMsgBatchCollision(
+          winnerLarger: winner.size > loser.size,
+          winnerName: winnerName,
+        ),
+      ));
+    }
+
+    final remoteSize = remoteMap[remotePath.split('/').last];
+    if (remoteSize == null) {
+      // 远端确实没有同名文件：正常上传。
+      uploads.add(ConflictDecision(candidate: winner, action: PlanAction.upload));
+    } else if (remoteSize == winner.size) {
+      // 同名同大小：必须双方 SHA-256 定案，不能仅凭大小就判「已备份」。
+      probes.add(ConflictDecision(
+        candidate: winner,
+        action: PlanAction.upload,
+        needsHash: true,
+      ));
+    } else if (winner.size > remoteSize) {
+      // 本地更大：上传替换远端旧文件。
+      uploads.add(ConflictDecision(candidate: winner, action: PlanAction.upload));
+    } else {
+      // 远端更大：拒绝上传并提示，绝不覆盖远端更大的文件。
+      settled.add(ConflictDecision(
+        candidate: winner,
+        action: PlanAction.skipKeepRemote,
+        message: conflictMsgRemoteLarger,
+      ));
+    }
+  }
+
+  return ConflictPlan(uploads: uploads, probes: probes, settled: settled);
+}
+
+/// 阶段二：回填哈希结果。任一哈希为 `null`（未能确认内容）→ 绝不当作「相同」：
+/// 远端哈希失败记 [PlanAction.failUnknown]，本地哈希失败记 [PlanAction.failLocalUnreadable]。
+List<ConflictDecision> resolveHashProbes({
+  required List<ConflictDecision> probes,
+  /// 远端路径 → 远端 SHA-256；`null`/缺失表示未能确认。
+  required Map<String, String?> remoteHashes,
+  /// 远端路径 → 本地 SHA-256；`null`/缺失表示未能确认。
+  required Map<String, String?> localHashes,
+}) {
+  final out = <ConflictDecision>[];
+  for (final probe in probes) {
+    final remotePath = probe.candidate.remotePath;
+    final remoteHash = remoteHashes[remotePath];
+    if (remoteHash == null) {
+      out.add(ConflictDecision(
+        candidate: probe.candidate,
+        action: PlanAction.failUnknown,
+        message: conflictMsgRemoteHashFailed,
+      ));
+      continue;
+    }
+    final localHash = localHashes[remotePath];
+    if (localHash == null) {
+      out.add(ConflictDecision(
+        candidate: probe.candidate,
+        action: PlanAction.failLocalUnreadable,
+        message: conflictMsgLocalReadFailed,
+      ));
+      continue;
+    }
+    if (remoteHash == localHash) {
+      out.add(ConflictDecision(
+        candidate: probe.candidate,
+        action: PlanAction.skipSynced,
+      ));
+    } else {
+      out.add(ConflictDecision(
+        candidate: probe.candidate,
+        action: PlanAction.skipKeepRemote,
+        message: conflictMsgSameSizeDifferent,
+      ));
+    }
+  }
+  return out;
 }
 
 final transfersProvider = StateNotifierProvider<TransfersNotifier, AsyncValue<List<TransferTask>>>(
@@ -59,9 +423,22 @@ final syncedPhotosProvider =
   (ref) => SyncedPhotosNotifier(),
 );
 
-/// 当前选中服务器的「已备份」路径集合，供界面判定单张照片是否已同步。
+/// 「有效当前服务器」：优先用用户显式选择的服务器；未选择（或所选已失效）时
+/// 回退到第一个已配置的服务器。
+///
+/// 备份流程本身就有这个回退（transfers_screen 里 `servers.first`），但显示端先前
+/// 没有，导致 `active_server_id` 为空时：显示端把「已备份」记录全部当作未备份
+/// （待备份数量恒为全部照片），且启动对账也永不触发。统一走这里以保证三处一致。
+final effectiveServerIdProvider = Provider<String?>((ref) {
+  final selected = ref.watch(defaultServerProvider);
+  final servers = ref.watch(smbServersProvider).valueOrNull ?? const <SmbConfig>[];
+  if (selected != null && servers.any((s) => s.id == selected)) return selected;
+  return servers.isEmpty ? null : servers.first.id;
+});
+
+/// 当前服务器的「已备份」路径集合，供界面判定单张照片是否已同步。
 final syncedForCurrentServerProvider = Provider<Set<String>>((ref) {
-  final current = ref.watch(defaultServerProvider);
+  final current = ref.watch(effectiveServerIdProvider);
   final all = ref.watch(syncedPhotosProvider);
   if (current == null) return const <String>{};
   return all[current] ?? const <String>{};
@@ -357,7 +734,9 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
 
   Future<void> clearCompleted() async {
     final tasks = state.valueOrNull ?? [];
-    final active = tasks.where((t) => t.status != TransferStatus.done && t.status != TransferStatus.failed).toList();
+    // done 与 skipped 都是「不再变化」的终态：一次性清掉，避免冲突跳过项
+    // 在队列里越积越多。failed 保留，作为「重试失败」的入口。
+    final active = tasks.where((t) => keepAfterClearCompleted(t.status)).toList();
     await _storage.saveTransfers(active);
     await load();
   }
@@ -395,6 +774,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     var success = 0;
     var fail = 0;
     var skipped = 0;
+    var conflictSkipped = 0;
     final servers = await _storage.getSmbServers();
     for (final entry in byServer.entries) {
       if (!servers.any((s) => s.id == entry.key)) continue; // 服务器已被删除
@@ -402,21 +782,39 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       success += result.successCount;
       fail += result.failedCount;
       skipped += result.skippedCount;
+      conflictSkipped += result.conflictSkippedCount;
     }
     return BackupResult(
       successCount: success,
       failedCount: fail,
       skippedCount: skipped,
+      conflictSkippedCount: conflictSkipped,
     );
   }
 
   Future<BackupResult> backupPhotos(String serverId, List<String> localPaths) async {
+    // 传输批次期间持有保活锁（PARTIAL_WAKE_LOCK + WifiLock），抑制息屏后
+    // WiFi 省电导致的 SMB 会话停顿/断开。无论正常完成、异常还是提前停止，
+    // 都必须释放，避免锁泄漏。
+    await KeepAliveService.acquire();
+    try {
+      return await _backupPhotosImpl(serverId, localPaths);
+    } finally {
+      await KeepAliveService.release();
+    }
+  }
+
+  Future<BackupResult> _backupPhotosImpl(
+    String serverId,
+    List<String> localPaths,
+  ) async {
     final servers = await _storage.getSmbServers();
     final server = servers.firstWhere((s) => s.id == serverId);
     final syncedPhotosNotifier = _ref.read(syncedPhotosProvider.notifier);
     var successCount = 0;
     var failedCount = 0;
     var skippedCount = 0;
+    var conflictSkippedCount = 0;
     final syncedPaths = <String>[];
     // 本次成功上传的远端路径，用于上传结束后一次性失效相关缓存。
     final uploadedRemotePaths = <String>[];
@@ -436,50 +834,159 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       albumNames[path] = PhotoService.albumNameOf(path);
     }
 
-    // 上传前按相册一次性拉取远端文件清单（文件名 → 大小），用于跨设备去重：
-    // 同一小米账号下的多台设备（小米云同步）会有相同照片，若远端已存在
-    // 「同名且同大小」的文件，说明这张已备份过，直接跳过并标记为已同步，
-    // 既不重复上传，也不会把已备份的照片显示成未备份。
-    final remoteIndex = <String, Map<String, int>>{};
+    // 上传前按相册一次性拉取远端文件清单（文件名 → 大小），用于冲突判定：
+    // 同名同大小 → 双方 SHA-256 定案；远端更大 → 拒绝覆盖；本地更大 → 替换上传；
+    // 远端确实没有 → 正常新增。
+    // 值为 null 表示该目录清单读取失败：fail-closed，受影响文件全部不写、提示可重试，
+    // 绝不假设「远端不存在」而上传覆盖。
+    // 注意：根目录（albumName == ""）也必须查询 share/rootPath 下的清单，
+    // 否则根目录同名文件会被误判为「远端不存在」。
+    final remoteIndex = <String, Map<String, int>?>{};
     for (final album in albumNames.values.toSet()) {
-      if (album.isEmpty) continue;
-      remoteIndex[album] = await _smbService.listFilesWithSize(server, album);
+      final entries = await _smbService.listFilesWithSize(server, album);
+      if (entries == null) {
+        debugPrint('[backup] 目录 "${album.isEmpty ? '<根目录>' : album}" 远端清单读取失败，'
+            '本次不写该目录下任何文件');
+      }
+      remoteIndex[album] = entries;
     }
 
-    // 组装本次真正需要上传的项（已排除远端已有、批次内重名）。
-    final pending = <_PendingUpload>[];
-    final batchRemotePaths = <String>{};
+    // 组装冲突候选：正在传输中的文件、本地不可读的文件先落成确定结论，
+    // 其余交给纯函数 planConflicts 做「同远端路径分组 + 远端清单」判定。
+    final candidates = <ConflictCandidate>[];
+    final preSettled = <ConflictDecision>[];
     for (final path in localPaths) {
-      // add 返回 false 表示该路径已在传输中或本次列表内重复。
-      if (path.isEmpty || !activePaths.add(path)) continue;
-
+      if (path.isEmpty) continue;
       final albumName = albumNames[path] ?? '';
       final fileName = path.split('/').last;
-      final fileSize = await File(path).length();
+      // 扁平结构：<相册名>/<文件名>；相册名为空时直接放在备份根目录下。
+      final remotePath = albumName.isEmpty ? fileName : '$albumName/$fileName';
 
-      // 远端已有同名文件：大小一致才判定为「同一张、已备份」并跳过；
-      // 同名但大小不同很可能是不同的照片，不能误标为已备份，需正常上传。
-      final remoteSize = remoteIndex[albumName]?[fileName];
-      if (fileSize > 0 && remoteSize != null && remoteSize == fileSize) {
-        skippedCount += 1;
-        syncedPaths.add(path);
-        // 即时标记：远端已有即视为已备份，界面立刻从未同步栏移除，无需等整批结束。
-        syncedPhotosNotifier.markSynced(serverId, [path]);
+      // add 返回 false 表示该路径已在传输中或本次列表内重复：不新建任务、不计数。
+      if (!activePaths.add(path)) {
+        preSettled.add(ConflictDecision(
+          candidate: ConflictCandidate(
+            localPath: path,
+            albumName: albumName,
+            remotePath: remotePath,
+            size: 0,
+          ),
+          action: PlanAction.skipAlreadyActive,
+          message: conflictMsgAlreadyActive,
+        ));
         continue;
       }
 
-      // 扁平结构：<相册名>/<文件名>；相册名为空时直接放在备份根目录下。
-      final remotePath = albumName.isEmpty ? fileName : '$albumName/$fileName';
-      // 同一批次内多个本地文件落到同一远端路径时只上传一次，避免自相覆盖。
-      if (!batchRemotePaths.add(remotePath)) continue;
+      int fileSize;
+      try {
+        fileSize = await File(path).length();
+      } catch (_) {
+        preSettled.add(ConflictDecision(
+          candidate: ConflictCandidate(
+            localPath: path,
+            albumName: albumName,
+            remotePath: remotePath,
+            size: 0,
+          ),
+          action: PlanAction.failLocalUnreadable,
+          message: conflictMsgLocalReadFailed,
+        ));
+        continue;
+      }
 
-      pending.add(_PendingUpload(
+      candidates.add(ConflictCandidate(
         localPath: path,
-        remotePath: remotePath,
         albumName: albumName,
+        remotePath: remotePath,
         size: fileSize,
       ));
     }
+
+    final plan = planConflicts(candidates: candidates, remoteIndex: remoteIndex);
+
+    // 同大同路径：串行哈希定案。先读远端（socket 只能留在主 isolate），远端读失败
+    // 就不必再算本地哈希——resolveHashProbes 会判 failUnknown，绝不视为「相同」。
+    final remoteHashes = <String, String?>{};
+    final localHashes = <String, String?>{};
+    for (final probe in plan.probes) {
+      final remotePath = probe.candidate.remotePath;
+      final remoteHash = await _smbService.hashRemoteFile(server, remotePath);
+      remoteHashes[remotePath] = remoteHash;
+      if (remoteHash == null) continue;
+      localHashes[remotePath] =
+          await PhotoService.hashFile(probe.candidate.localPath);
+    }
+    final probeResults = resolveHashProbes(
+      probes: plan.probes,
+      remoteHashes: remoteHashes,
+      localHashes: localHashes,
+    );
+
+    final allSettled = <ConflictDecision>[
+      ...preSettled,
+      ...plan.settled,
+      ...probeResults,
+    ];
+
+    // 已备份（同大同哈希相同）：计入成功跳过并即时标记已同步，从未同步栏移除。
+    for (final d in allSettled) {
+      if (d.action != PlanAction.skipSynced) continue;
+      skippedCount += 1;
+      syncedPaths.add(d.candidate.localPath);
+      syncedPhotosNotifier.markSynced(serverId, [d.candidate.localPath]);
+    }
+
+    // 冲突跳过 / 不可知失败：落一条终态任务记录（保留可读原因），但不计入
+    // 「已备份」集合——文件并未同步；skipAlreadyActive 不新建任务、不计数。
+    final settledAt = DateTime.now();
+    final settledRecords = <TransferTask>[];
+    var settledSeq = 0;
+    for (final d in allSettled) {
+      switch (d.action) {
+        case PlanAction.skipKeepRemote:
+        case PlanAction.skipBatchCollision:
+          conflictSkippedCount += 1;
+          settledRecords.add(_settledTask(
+            id: '${settledAt.millisecondsSinceEpoch}_x${settledSeq++}',
+            serverId: serverId,
+            decision: d,
+            status: TransferStatus.skipped,
+            at: settledAt,
+          ));
+          break;
+        case PlanAction.failUnknown:
+        case PlanAction.failLocalUnreadable:
+          failedCount += 1;
+          settledRecords.add(_settledTask(
+            id: '${settledAt.millisecondsSinceEpoch}_x${settledSeq++}',
+            serverId: serverId,
+            decision: d,
+            status: TransferStatus.failed,
+            at: settledAt,
+          ));
+          break;
+        case PlanAction.skipAlreadyActive:
+        case PlanAction.skipSynced:
+        case PlanAction.upload:
+          break;
+      }
+    }
+    if (settledRecords.isNotEmpty) {
+      final existing = state.valueOrNull ?? const <TransferTask>[];
+      await _storage.saveTransfers([...existing, ...settledRecords]);
+      await load();
+    }
+
+    // 待上传项（纯函数已按同远端路径去重，无需再自行去重）。
+    final pending = <_PendingUpload>[
+      for (final d in plan.uploads)
+        _PendingUpload(
+          localPath: d.candidate.localPath,
+          remotePath: d.candidate.remotePath,
+          albumName: d.candidate.albumName,
+          size: d.candidate.size,
+        ),
+    ];
 
     if (pending.isNotEmpty) {
       // 大文件（视频）走「多连接分片并行」，小文件（照片）继续用 worker 池并发。
@@ -538,15 +1045,65 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       // 建目录也需要一条连接，同时这条连接也充当「服务器是否可达」的探针。
       // 大文件的分片连接由 uploadFileParallel 自行建立，不占用这里的池。
       final poolSize = workerCount > 0 ? workerCount : 1;
+      // 每条 worker 连接的存活标记：socket 断开时 onDisconnect 立刻置为 false。
+      // worker 领取下一个文件前先把失效的连接关掉重建，避免继续往一条已经
+      // 死掉的 socket 上写——那正是「息屏后每个文件都在空转」的直接原因。
+      final connAlive = List<bool>.filled(poolSize, false);
+      Future<SmbConnect> openConnection(int slot) async {
+        final connect = await _smbService
+            .createConnection(server, onDisconnect: (_) => connAlive[slot] = false)
+            .timeout(_connectTimeout);
+        connAlive[slot] = true;
+        return connect;
+      }
+
       final connections = <SmbConnect>[];
       for (var i = 0; i < poolSize; i++) {
         try {
-          connections.add(await _smbService
-              .createConnection(server)
-              .timeout(_connectTimeout));
+          connections.add(await openConnection(i));
         } catch (_) {
           break;
         }
+      }
+
+      // 本批的失败收敛控制：连续连接类失败达到阈值即停止本批剩余项。
+      final guard = UploadFailureGuard();
+
+      /// 把本批仍处于 pending/running 的任务一次性转为失败（可恢复）态。
+      ///
+      /// 失败记录会立即落盘，从而保留「重试失败」入口；一次性整表更新避免了
+      /// 逐条调用 _updateTaskComplete 造成的 O(n²) 序列化开销。
+      Future<void> failRemaining(String message) async {
+        final batchIds = {for (final item in pending) item.taskId};
+        final tasks = state.valueOrNull ?? const <TransferTask>[];
+        var changed = 0;
+        final updated = tasks.map((t) {
+          if (!batchIds.contains(t.id)) return t;
+          if (t.status != TransferStatus.pending &&
+              t.status != TransferStatus.running) {
+            return t;
+          }
+          changed += 1;
+          _lastProgressUiAt.remove(t.id);
+          return TransferTask(
+            id: t.id,
+            serverId: t.serverId,
+            transferType: t.transferType,
+            remotePath: t.remotePath,
+            localPath: t.localPath,
+            totalBytes: t.totalBytes,
+            writtenBytes: t.writtenBytes,
+            progress: t.progress,
+            status: TransferStatus.failed,
+            errorMessage: message,
+            createdAt: t.createdAt,
+            updatedAt: DateTime.now(),
+          );
+        }).toList();
+        if (changed == 0) return;
+        failedCount += changed;
+        state = AsyncValue.data(updated);
+        await _storage.saveTransfers(updated);
       }
 
       if (connections.isEmpty) {
@@ -568,45 +1125,36 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
 
           /// 上传一个待传项并登记结果；[upload] 只负责把字节送达远端。
           ///
-          /// 连接类错误（含卡死超时）重试同一文件；[onRetry] 供调用方重建自己
-          /// 持有的连接，大文件分片上传的连接由 uploadFileParallel 自行管理，
-          /// 无需重建，因此可以不传。
+          /// 连接类错误（含卡死超时）先废弃并重建本 worker 的连接，再有限次重试
+          /// 同一文件；重试次数耗尽、重连失败或链路被判定为不可用即收敛为失败。
+          /// 无论成功失败都会写入终态，单文件异常不会逃逸成未处理异常。
           Future<void> runItem(
             _PendingUpload item,
             Future<void> Function() upload, {
-            Future<void> Function()? onRetry,
+            Future<void> Function()? reconnect,
           }) async {
-            var attempts = 3;
-            while (true) {
-              try {
-                await upload();
-                _updateTaskComplete(item.taskId, TransferStatus.done);
-                successCount += 1;
-                syncedPaths.add(item.localPath);
-                uploadedRemotePaths.add(item.remotePath);
-                return;
-              } catch (e) {
-                if (attempts-- > 0 && SmbService.isConnectionError(e)) {
-                  if (onRetry == null) continue;
-                  // 连接可能已失效：重建本 worker 的连接后重试当前文件。
-                  try {
-                    await onRetry();
-                    continue;
-                  } catch (_) {
-                    // 重连失败，落回失败处理。
-                  }
-                }
-                _updateTaskComplete(item.taskId, TransferStatus.failed,
-                    errorMessage: e.toString());
-                failedCount += 1;
-                return;
-              }
+            final error = await uploadWithRetry(
+              upload: upload,
+              guard: guard,
+              reconnect: reconnect,
+            );
+            if (error == null) {
+              _updateTaskComplete(item.taskId, TransferStatus.done);
+              successCount += 1;
+              syncedPaths.add(item.localPath);
+              uploadedRemotePaths.add(item.remotePath);
+            } else {
+              _updateTaskComplete(item.taskId, TransferStatus.failed,
+                  errorMessage: error.toString());
+              failedCount += 1;
             }
           }
 
           // 大文件串行处理：同一时刻只跑一个视频，让它独占 [largeParallelism] 条
           // 连接做分片并行。多个大文件同时跑只会互相抢带宽、把连接数顶到上限。
           for (final item in large) {
+            // 链路已被判定不可用：立即停止领取新文件，剩余项转入失败待续传。
+            if (guard.shouldStop) break;
             _updateTaskStatus(item.taskId, TransferStatus.running);
             await runItem(
               item,
@@ -628,12 +1176,29 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
           var next = 0;
           Future<void> worker(int index) async {
             while (true) {
+              if (guard.shouldStop) break;
               // 无 await 间隔，索引分配在事件循环中天然原子，无并发竞争。
               final local = next;
               if (local >= small.length) break;
               next = local + 1;
 
               final item = small[local];
+
+              // 这条连接在上一轮已断开（onDisconnect 已回调）：先关掉再重建，
+              // 不要拿一条死连接去写下一个文件。
+              if (!connAlive[index]) {
+                await _closeQuietly(connections[index]);
+                try {
+                  connections[index] = await openConnection(index);
+                } catch (e) {
+                  guard.record(e);
+                  _updateTaskComplete(item.taskId, TransferStatus.failed,
+                      errorMessage: '重连失败：$e');
+                  failedCount += 1;
+                  continue;
+                }
+              }
+
               _updateTaskStatus(item.taskId, TransferStatus.running);
 
               await runItem(
@@ -649,11 +1214,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                     progress,
                   ),
                 ),
-                onRetry: () async {
+                reconnect: () async {
+                  // 超时/写失败后旧连接上的请求可能仍有残留：先废弃关闭它，
+                  // 保证旧请求不会和重试请求并行写同一个 .mipixtmp。
                   await _closeQuietly(connections[index]);
-                  connections[index] = await _smbService
-                      .createConnection(server)
-                      .timeout(_connectTimeout);
+                  connections[index] = await openConnection(index);
                 },
               );
             }
@@ -662,10 +1227,21 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
           await Future.wait([
             for (var i = 0; i < connections.length; i++) worker(i),
           ]);
+        } catch (e) {
+          // 兜底：任何未预见的异常都不允许逃逸成未处理异常，否则整批会既没有
+          // 完成也没有失败提示。本批剩余项一并转入可恢复的失败态。
+          debugPrint('[backup] 批量上传异常，已停止本批：$e');
+          await failRemaining('本批已中断：$e');
         } finally {
           for (final conn in connections) {
             await _closeQuietly(conn);
           }
+        }
+
+        // 连续连接类失败达到阈值而提前停止：剩余未开始项转入失败，
+        // 保留「重试失败」入口，等网络恢复后由用户一键续传。
+        if (guard.shouldStop) {
+          await failRemaining('连接持续失败，已停止本批；网络恢复后可点「重试失败」续传');
         }
       }
     }
@@ -698,6 +1274,31 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       successCount: successCount,
       failedCount: failedCount,
       skippedCount: skippedCount,
+      conflictSkippedCount: conflictSkippedCount,
+    );
+  }
+
+  /// 把一条「已确定结论」的冲突记录落成终态任务（skipped / failed）。
+  TransferTask _settledTask({
+    required String id,
+    required String serverId,
+    required ConflictDecision decision,
+    required TransferStatus status,
+    required DateTime at,
+  }) {
+    return TransferTask(
+      id: id,
+      serverId: serverId,
+      transferType: TransferType.upload,
+      remotePath: decision.candidate.remotePath,
+      localPath: decision.candidate.localPath,
+      totalBytes: decision.candidate.size,
+      writtenBytes: 0,
+      progress: 0,
+      status: status,
+      errorMessage: decision.message,
+      createdAt: at,
+      updatedAt: at,
     );
   }
 
@@ -829,12 +1430,16 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     });
   }
 
-  /// 把某台服务器的「已备份」记录与远端实际内容核对一致。
+  /// 双向核对：让某台服务器的「已备份」记录与远端实际内容一致。
   ///
-  /// 用于：启动时、切换服务器时。对每条「已记录为已备份」的本地路径，按
-  /// 「<相册名>/<文件名>」去远端查同名同大小文件：远端缺失或大小不符 →
-  /// 从该服务器的已备份集合移除（界面重新显示为待备份）；本地文件已被删除
-  /// 的记录也一并清理。任何网络异常都直接放弃、不改记录，避免误清空。
+  /// 用于：启动时、切换服务器时。覆盖两个方向：
+  ///  - 本地存在、远端「同名同大小」也在 → 标记为已备份（从待备份移除）。
+  ///    这正是「重装 App / 切换到同文件夹的新 IP 后，仍能认出已备份」的关键——
+  ///    即便本地记录是空的，也能从远端反推恢复。
+  ///  - 已记录为已备份、但远端已不存在或大小不符 → 退回待备份。
+  ///
+  /// 服务器只增不减（手机删文件不影响服务器），所以远端是权威；任何网络异常
+  /// 都直接放弃、不改记录，避免一次抖动把「已备份」误清空。
   Future<void> reconcileWithServer(String serverId) async {
     final servers = await _storage.getSmbServers();
     SmbConfig? server;
@@ -844,48 +1449,78 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         break;
       }
     }
-    if (server == null) return;
+    if (server == null) {
+      return;
+    }
 
+    // 待核对的本地路径 = 本地照片列表 ∪ 已记录的已备份（覆盖 500 张之外的旧记录）。
+    // 直接从数据源取一次，避免启动竞态：重装后 recorded 为空，若 provider 还在
+    // 异步加载，reconcile 会拿到空列表直接 return，从而识别不出已备份。
     final notifier = _ref.read(syncedPhotosProvider.notifier);
-    final recorded = notifier.of(serverId).toList();
-    if (recorded.isEmpty) return;
+    final candidates = <String>{};
+    List<MediaItem> photos =
+        _ref.read(localPhotosProvider).valueOrNull ?? const <MediaItem>[];
+    if (photos.isEmpty) {
+      try {
+        photos = await PhotoService.getRecentPhotos();
+      } catch (_) {
+        photos = const [];
+      }
+    }
+    for (final p in photos) {
+      if (p.path.isNotEmpty) candidates.add(p.path);
+    }
+    candidates.addAll(notifier.of(serverId));
+    if (candidates.isEmpty) {
+      return;
+    }
 
-    // 先确认服务器可达。listFilesWithSize 在「连不上」与「目录为空」两种情况下
-    // 都返回空表，若不先探活，一次网络抖动会把所有记录误判为「远端已删」而清空。
+    // 先确认服务器可达。listFilesWithSize 用 `null` 区分「读取失败」与「目录为空」，
+    // 但这里仍保留一道探活：连接不可用时能更早退出，不必逐个相册重试到底。
     if (!await _smbService.testConnection(server)) {
       debugPrint('[reconcile] $serverId 不可达，跳过核对');
       return;
     }
 
-    // 相册名 → 远端文件清单（文件名 → 大小）。
+    // 相册名 → 远端文件清单（文件名 → 大小）。仅查非空相册，与备份时一致。
+    // `null` 表示该相册清单读取失败，本轮不可信。
     final albumOf = <String, String>{};
-    for (final p in recorded) {
+    for (final p in candidates) {
       albumOf[p] = PhotoService.albumNameOf(p);
     }
-    final remoteIndex = <String, Map<String, int>>{};
+    final remoteIndex = <String, Map<String, int>?>{};
     for (final album in albumOf.values.toSet()) {
+      if (album.isEmpty) continue;
       remoteIndex[album] = await _smbService.listFilesWithSize(server, album);
     }
 
-    final stillSynced = <String>{};
-    for (final p in recorded) {
-      if (!File(p).existsSync()) continue; // 本地已删，丢弃记录。
-      final album = albumOf[p] ?? '';
-      final fileName = p.split('/').last;
-      int size;
+    // 本地文件大小（对账需要与远端大小比对）。读取失败的项按「本地不可用」跳过。
+    final localSizes = <String, int>{};
+    for (final p in candidates) {
       try {
-        size = await File(p).length();
+        final f = File(p);
+        if (!f.existsSync()) continue;
+        localSizes[p] = f.lengthSync();
       } catch (_) {
-        continue;
-      }
-      final remoteSize = remoteIndex[album]?[fileName];
-      if (size > 0 && remoteSize != null && remoteSize == size) {
-        stillSynced.add(p);
+        // 读取失败按「本地不可用」处理，不参与对账。
       }
     }
-    debugPrint('[reconcile] $serverId 记录 ${recorded.length} 条 → 仍已备份 '
-        '${stillSynced.length} 条');
-    notifier.replaceSynced(serverId, stillSynced);
+
+    final result = reconcileSynced(
+      candidates: candidates,
+      albumOf: albumOf,
+      remoteIndex: remoteIndex,
+      localSizes: localSizes,
+    );
+    if (result == null) {
+      // 任一相册清单读取失败：清单不完整，放弃本轮并保留现有记录。
+      // 绝不能把「读不到」当成「远端已删」而清空「已备份」。
+      debugPrint('[reconcile] $serverId 清单不完整（存在读取失败的相册），放弃本轮，保留现有记录');
+      return;
+    }
+    debugPrint('[reconcile] $serverId 候选 ${candidates.length} → 已备份 '
+        '${result.length}');
+    notifier.replaceSynced(serverId, result);
     await notifier.flushNow();
   }
 }

@@ -248,7 +248,12 @@ class SmbConfig {
   }
 }
 
-enum TransferStatus { pending, running, paused, done, failed }
+/// 传输任务状态。
+///
+/// [skipped] 表示「确定性结论导致的未备份」：远端已有更大的同名文件、同名同大小
+/// 但内容不同、或同批次被更大的同名文件顶掉。它不是失败（可重试没有意义），
+/// 也不是「已备份」（文件并未同步），因此单独成态、不计入 [TransferStatus.failed]。
+enum TransferStatus { pending, running, paused, done, failed, skipped }
 
 enum TransferType { download, upload }
 

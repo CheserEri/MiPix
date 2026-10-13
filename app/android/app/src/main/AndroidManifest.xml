@@ -1,5 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- 备份传输期间保持 CPU 与 WiFi 不休眠（见 MainActivity 的保活锁） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <!-- Android 12 及以下：读取外部存储 -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
