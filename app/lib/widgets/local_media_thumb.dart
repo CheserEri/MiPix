@@ -1,10 +1,10 @@
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import '../models/models.dart';
+import 'thumb_image.dart';
 
 /// 本地媒体缩略图。
 ///
@@ -59,8 +59,8 @@ class _LocalMediaThumbState extends State<LocalMediaThumb> {
   @override
   Widget build(BuildContext context) {
     if (!widget.item.isVideo) {
-      return Image.file(
-        File(widget.item.path),
+      return ThumbImage(
+        path: widget.item.path,
         fit: widget.fit,
         cacheWidth: widget.cacheWidth,
         errorBuilder: (_, __, ___) => _fallback(),

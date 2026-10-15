@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/album_provider.dart';
@@ -11,6 +10,7 @@ import 'photo_grid_screen.dart';
 import '../services/photo_service.dart';
 import '../utils/mipix_theme.dart';
 import '../widgets/smb_image_widget.dart';
+import '../widgets/thumb_image.dart';
 
 class AlbumsScreen extends ConsumerStatefulWidget {
   const AlbumsScreen({super.key});
@@ -428,8 +428,8 @@ class _AlbumCard extends StatelessWidget {
                         remotePath: coverPath!,
                       )
                     else
-                      Image.file(
-                        File(coverPath!),
+                      ThumbImage(
+                        path: coverPath!,
                         fit: BoxFit.cover,
                         cacheWidth: 400,
                         errorBuilder: (_, __, ___) => _placeholder(context),
