@@ -18,6 +18,7 @@ class _PendingUpload {
   final String remotePath;
   final String albumName;
   final int size;
+  final DateTime? captureTime;
   /// 任务记录 id，在批量创建任务时才生成。
   String taskId = '';
 
@@ -26,6 +27,7 @@ class _PendingUpload {
     required this.remotePath,
     required this.albumName,
     required this.size,
+    required this.captureTime,
   });
 }
 
@@ -833,6 +835,14 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       if (path.isEmpty) continue;
       albumNames[path] = PhotoService.albumNameOf(path);
     }
+    Map<String, DateTime> captureTimes = const {};
+    try {
+      captureTimes = await PhotoService.captureTimesForPaths(localPaths);
+    } catch (e) {
+      debugPrint('[backup][time] 无法读取手机相册拍摄时间，将回退文件修改时间：$e');
+    }
+    DateTime? captureTimeFor(String path) =>
+        captureTimes[path.replaceAll('\\', '/').toLowerCase()];
 
     // 上传前按相册一次性拉取远端文件清单（文件名 → 大小），用于冲突判定：
     // 同名同大小 → 双方 SHA-256 定案；远端更大 → 拒绝覆盖；本地更大 → 替换上传；
@@ -985,6 +995,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
           remotePath: d.candidate.remotePath,
           albumName: d.candidate.albumName,
           size: d.candidate.size,
+          captureTime: captureTimeFor(d.candidate.localPath),
         ),
     ];
 
@@ -1162,6 +1173,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                 server,
                 item.remotePath,
                 item.localPath,
+                sourceTime: item.captureTime,
                 parallelism: largeParallelism,
                 onProgress: (progress) => _updateTaskProgress(
                   item.taskId,
@@ -1208,6 +1220,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                   server,
                   item.remotePath,
                   item.localPath,
+                  sourceTime: item.captureTime,
                   onProgress: (progress) => _updateTaskProgress(
                     item.taskId,
                     (progress * item.size).round(),

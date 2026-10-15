@@ -310,8 +310,10 @@ class SmbService {
               size: file.size ?? 0,
               width: 0,
               height: 0,
+              // 库的 SMBUtil.readTime 返回的已经是「自 1970 起的毫秒数」，
+              // 不要再乘 1000，否则日期会被放大 1000 倍（显示成公元数万年）。
               modifiedAt: file.lastModified != 0
-                  ? DateTime.fromMillisecondsSinceEpoch(file.lastModified * 1000)
+                  ? DateTime.fromMillisecondsSinceEpoch(file.lastModified)
                   : DateTime.now(),
             ));
           }
@@ -1332,6 +1334,73 @@ class SmbService {
   /// 给单次 SMB 调用加卡死上限。
   static Future<T> _guard<T>(Future<T> future) => future.timeout(_stallTimeout);
 
+  /// 计算本地文件的 SHA-256（小写十六进制）。
+  Future<String> _hashLocalFile(String path) async {
+    final sink = _DigestSink();
+    final hasher = sha256.startChunkedConversion(sink);
+    await for (final chunk in File(path).openRead()) {
+      hasher.add(chunk);
+    }
+    hasher.close();
+    final digest = sink.value;
+    if (digest == null) throw Exception('本地文件哈希计算失败：$path');
+    return digest.toString();
+  }
+
+  /// 通过指定连接读取远端文件并计算 SHA-256；不存在或读到的字节数不符时返回 null。
+  Future<String?> _hashRemoteVia(SmbConnect connect, String smbPath) async {
+    try {
+      final file = await connect.file(smbPath);
+      if (!file.isExists || file.isDirectory()) return null;
+      final expectedSize = file.size;
+      final sink = _DigestSink();
+      final hasher = sha256.startChunkedConversion(sink);
+      var read = 0;
+      final stream = await connect.openRead(file);
+      await for (final chunk in stream) {
+        hasher.add(chunk);
+        read += chunk.length;
+      }
+      hasher.close();
+      final digest = sink.value;
+      if (digest == null || read != expectedSize) {
+        debugPrint('[backup][verify] remote="$smbPath" '
+            'size=$expectedSize read=$read');
+        return null;
+      }
+      return digest.toString();
+    } catch (e) {
+      debugPrint('[backup][verify] remote read error: $e');
+      return null;
+    }
+  }
+
+  /// 上传后、改名前的回读校验。
+  ///
+  /// 「写入 API 返回成功」并不等于字节落盘正确——网络与服务端都可能静默截短或
+  /// 改写内容（本项目的 GPS 丢失事故正是这种长度不变的静默差异）。因此改名之前
+  /// 必须把远端临时文件读回来算一次 SHA-256，与本地源文件一致才允许改名；
+  /// 不一致时删掉临时文件并抛错，由上层按失败处理，正式文件名上始终保留旧文件。
+  Future<void> _verifyUploadedTemp(
+    SmbConnect connect,
+    String tempFull,
+    String localPath,
+  ) async {
+    final expected = await _hashLocalFile(localPath);
+    final actual = await _hashRemoteVia(connect, tempFull);
+    if (actual == null || actual != expected) {
+      debugPrint('[backup][verify] FAIL local="$localPath" '
+          'localHash=$expected remoteHash=${actual ?? "null"}');
+      try {
+        await _guard(_deleteRemoteIfExists(connect, tempFull));
+      } catch (_) {
+        // 清理失败不掩盖真正的校验失败原因。
+      }
+      throw Exception('上传后校验失败：NAS 端内容与手机端不一致（已丢弃临时文件）');
+    }
+    debugPrint('[backup][verify] OK local="$localPath" hash=$expected');
+  }
+
   /// 用指定连接上传一个本地文件。
   ///
   /// 供并行备份的 worker 复用其独占连接；连接的创建/重连/关闭由调用方管理。
@@ -1341,6 +1410,7 @@ class SmbService {
     SmbConfig config,
     String remotePath,
     String localPath, {
+    DateTime? sourceTime,
     Function(double)? onProgress,
   }) async {
     final tempFull = _buildSMBPath(config, '$remotePath$uploadTempSuffix');
@@ -1369,6 +1439,9 @@ class SmbService {
       await reader.close();
     }
 
+    // 回读校验通过后才允许改名（见 _verifyUploadedTemp）。
+    await _verifyUploadedTemp(connect, tempFull, localPath);
+
     // 整份写完才改名到正式文件名，同名旧文件由 replace 覆盖。
     try {
       await _guard(connect.rename(
@@ -1381,6 +1454,30 @@ class SmbService {
       // 否则会在远端堆积一份与正式文件等大的残片。
       await _guard(_deleteRemoteIfExists(connect, tempFull));
       rethrow;
+    }
+
+    await _applySourceTime(connect, config, remotePath, localPath, sourceTime);
+  }
+
+  /// 把远端正式文件的创建与修改时间回写为手机相册的拍摄时间。
+  ///
+  /// SMB 写入会让服务端把文件时间设成「写入时刻」，不显式回写的话，备份端
+  /// 时间戳就变成备份时间而不是照片的原始时间。回写失败只记录日志，
+  /// 不影响「上传已成功」的结论。
+  Future<void> _applySourceTime(SmbConnect connect, SmbConfig config,
+      String remotePath, String localPath, DateTime? sourceTime) async {
+    try {
+      final time = (sourceTime ?? await File(localPath).lastModified())
+          .millisecondsSinceEpoch;
+      final remoteFile =
+          await _guard(connect.file(_buildSMBPath(config, remotePath)));
+      await connect.setFileTime(
+        remoteFile,
+        lastWriteTime: time,
+        createTime: time,
+      );
+    } catch (e) {
+      print('[backup][time] FAIL remote="$remotePath" err=$e');
     }
   }
 
@@ -1396,6 +1493,7 @@ class SmbService {
     SmbConfig config,
     String remotePath,
     String localPath, {
+    DateTime? sourceTime,
     int parallelism = _uploadChunkParallelism,
     Function(double)? onProgress,
   }) async {
@@ -1404,6 +1502,7 @@ class SmbService {
       final connect = await createConnection(config);
       try {
         await uploadFileVia(connect, config, remotePath, localPath,
+            sourceTime: sourceTime,
             onProgress: onProgress);
       } finally {
         await _closeQuietly(connect);
@@ -1476,6 +1575,9 @@ class SmbService {
         await _closeQuietly(connect);
       }
 
+      // 回读校验通过后才允许改名（见 _verifyUploadedTemp）。
+      await _verifyUploadedTemp(setup, tempFull, localPath);
+
       try {
         final tempFile = await _guard(setup.file(tempFull));
         await _guard(setup.rename(
@@ -1491,6 +1593,8 @@ class SmbService {
         }
         rethrow;
       }
+
+      await _applySourceTime(setup, config, remotePath, localPath, sourceTime);
     } finally {
       await _closeQuietly(setup);
     }

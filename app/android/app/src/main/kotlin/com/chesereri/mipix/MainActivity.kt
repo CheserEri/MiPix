@@ -1,9 +1,12 @@
 package com.chesereri.mipix
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -24,9 +27,14 @@ import io.flutter.plugin.common.MethodChannel
  */
 class MainActivity : FlutterActivity() {
     private val channelName = "mipix/keepalive"
+    private val permissionChannelName = "mipix/permission"
+
+    /// 位置信息权限申请的回调标识（任意不冲突的值即可）。
+    private val mediaLocationRequestCode = 0x4D50
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var pendingMediaLocationResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -44,6 +52,53 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, permissionChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "ensureMediaLocation" -> ensureMediaLocation(result)
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 申请 `ACCESS_MEDIA_LOCATION` 并返回是否已持有。
+     *
+     * Android 10 起，应用缺少该权限时，MediaProvider 的 FUSE 层会在读取照片时
+     * 把 EXIF 中的位置信息（GPS）数值区间替换为 0——文件长度与其余字节完全不变，
+     * 因此「同名同大小」的去重和本地哈希校验都发现不了，备份端会静默丢 GPS。
+     * 要忠实备份位置信息，必须在读文件前就持有该权限。
+     */
+    private fun ensureMediaLocation(result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.ACCESS_MEDIA_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            result.success(true)
+            return
+        }
+        // 极端情况下前一次请求还没回调：先把旧的那次收敛为失败，避免结果悬空。
+        pendingMediaLocationResult?.success(false)
+        pendingMediaLocationResult = result
+        requestPermissions(
+            arrayOf(Manifest.permission.ACCESS_MEDIA_LOCATION), mediaLocationRequestCode
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        if (requestCode == mediaLocationRequestCode) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pendingMediaLocationResult?.success(granted)
+            pendingMediaLocationResult = null
+            return
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
     private fun acquireKeepAlive() {

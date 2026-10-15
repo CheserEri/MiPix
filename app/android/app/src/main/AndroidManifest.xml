@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
     <!-- Android 14+：仅选择部分照片时的授权 -->
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
+    <!-- Android 10+：读取照片 EXIF 中的位置信息（GPS）。
+         缺少该权限时，MediaProvider 的 FUSE 层会把照片里的 GPS 数值区间读取为 0，
+         文件大小与结构保持不变，因此备份端会静默丢失位置信息且去重察觉不到。 -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION"/>
     <!-- Android 10 及以下：写入相册（保存到 MediaStore） -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
