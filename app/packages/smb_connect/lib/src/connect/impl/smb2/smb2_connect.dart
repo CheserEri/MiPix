@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:smb_connect/src/connect/dcerpc.dart';
+import 'package:smb_connect/src/connect/fscc/file_basic_info.dart';
 import 'package:smb_connect/src/connect/fscc/file_rename_information2.dart';
 import 'package:smb_connect/src/connect/fscc/smb_basic_file_info.dart';
 import 'package:smb_connect/src/connect/impl/smb2/create/smb2_close_request.dart';
@@ -216,6 +217,40 @@ class Smb2Connect extends SmbConnect {
       throw SmbException.getMessageByCode(resp.status);
     }
     return await file(dstPath);
+  }
+
+  @override
+  Future<void> setFileTime(
+    SmbFile file, {
+    required int lastWriteTime,
+    int? createTime,
+    int? lastAccessTime,
+    int? changeTime,
+  }) async {
+    final info = FileBasicInfo(
+      createTime: createTime ?? lastWriteTime,
+      lastAccessTime: lastAccessTime ?? 0,
+      lastWriteTime: lastWriteTime,
+      changeTime: changeTime ?? 0,
+      // attributes 传 0：FILE_BASIC_INFORMATION 中属性为 0 表示不修改文件属性。
+      attributes: 0,
+    );
+    Smb2SetInfoRequest timeReq = Smb2SetInfoRequest(configuration, info, info);
+
+    var resp = await openCloseRequest(
+        path: file.path,
+        uncPath: file.uncPath,
+        share: file.share,
+        createDisposition: Smb2Constants.FILE_OPEN,
+        createOptions: 0,
+        fileAttributes: SmbConstants.ATTR_NORMAL,
+        desiredAccess: SmbConstants.FILE_WRITE_ATTRIBUTES,
+        shareAccess:
+            SmbConstants.FILE_SHARE_READ | SmbConstants.FILE_SHARE_WRITE,
+        cmd: timeReq);
+    if (resp.status != NtStatus.NT_STATUS_OK) {
+      throw SmbException.getMessageByCode(resp.status);
+    }
   }
 
   @override

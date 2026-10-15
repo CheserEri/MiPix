@@ -3,6 +3,8 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier, debugPrint;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:path_provider/path_provider.dart';
 import 'package:photo_manager/photo_manager.dart';
 
@@ -86,13 +88,54 @@ class PhotoService {
     orders: const [OrderOption(type: OrderOptionType.createDate, asc: false)],
   );
 
+  /// 位置信息权限的通道（原生侧实现见 MainActivity.ensureMediaLocation）。
+  static const MethodChannel _permissionChannel = MethodChannel('mipix/permission');
+
+  /// `ACCESS_MEDIA_LOCATION` 的授予状态（`null` = 尚未申请过；非 Android 恒为 true）。
+  ///
+  /// 未授予时 MediaProvider 会云隐照片 EXIF 里的 GPS（长度不变），备份端会静默丢失
+  /// 位置信息——这属于「备份不完整」，必须在界面上给出可见提示；只打印日志正是
+  /// 本问题最初被漏掉的原因。
+  static final ValueNotifier<bool?> mediaLocationGranted =
+      ValueNotifier<bool?>(null);
+
+  /// 申请 `ACCESS_MEDIA_LOCATION`（Android 10+）。
+  ///
+  /// 缺少该权限时，MediaProvider 的 FUSE 层会在应用读取照片时把 EXIF 中的位置
+  /// 信息数值区间替换为 0——文件长度与其余字节完全不变。于是应用会「忠实地」
+  /// 把被云隐过的字节上传到 NAS，导致备份端丢 GPS，而「同名同大小」去重与
+  /// 本地哈希校验都察觉不到。必须在读文件之前就持有该权限。
+  ///
+  /// 拿不到权限不应让备份整体失败，但结果会记入 [mediaLocationGranted]，
+  /// 由 UI 明确告知用户「本次备份可能不含位置信息」。
+  static Future<bool> ensureMediaLocationAccess() async {
+    if (!Platform.isAndroid) {
+      mediaLocationGranted.value = true;
+      return true;
+    }
+    try {
+      final granted =
+          await _permissionChannel.invokeMethod<bool>('ensureMediaLocation') ??
+              false;
+      mediaLocationGranted.value = granted;
+      return granted;
+    } catch (e) {
+      debugPrint('[permission] ACCESS_MEDIA_LOCATION 申请失败：$e');
+      mediaLocationGranted.value = false;
+      return false;
+    }
+  }
+
   /// 请求（必要时弹出系统授权对话框）并返回媒体访问状态。
   static Future<LocalAccess> ensurePermission() async {
     final PermissionState state = await PhotoManager.requestPermissionExtend();
     switch (state) {
       case PermissionState.authorized:
+        // 读文件前补申请位置信息权限，否则读到的 EXIF 会被系统云隐掉 GPS。
+        await ensureMediaLocationAccess();
         return LocalAccess.authorized;
       case PermissionState.limited:
+        await ensureMediaLocationAccess();
         return LocalAccess.limited;
       case PermissionState.restricted:
         return LocalAccess.restricted;
@@ -223,6 +266,42 @@ class PhotoService {
     if (count <= 0) return [];
     return _allMedia(RequestType.common, count: count);
   }
+
+  /// 返回指定本地文件在系统媒体库中的拍摄时间（MediaStore DATE_TAKEN）。
+  /// 未匹配到的文件不返回，由调用方回退到文件修改时间。
+  static Future<Map<String, DateTime>> captureTimesForPaths(
+      Iterable<String> filePaths) async {
+    final wanted = filePaths.map(_normalizeMediaPath).toSet();
+    if (wanted.isEmpty) return {};
+    final result = <String, DateTime>{};
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.common,
+      hasAll: true,
+      onlyAll: true,
+      filterOption: _descOrder,
+    );
+    if (paths.isEmpty) return result;
+    final album = paths.first;
+    final count = await album.assetCountAsync;
+    for (var start = 0; start < count && result.length < wanted.length; start += 200) {
+      final assets = await album.getAssetListRange(
+        start: start,
+        end: (start + 200).clamp(0, count).toInt(),
+      );
+      for (final asset in assets) {
+        final direct = _directPath(asset);
+        if (direct == null) continue;
+        final normalized = _normalizeMediaPath(direct);
+        if (wanted.contains(normalized)) {
+          result[normalized] = asset.createDateTime;
+        }
+      }
+    }
+    return result;
+  }
+
+  static String _normalizeMediaPath(String path) =>
+      path.replaceAll('\\', '/').toLowerCase();
 
   /// 把磁盘上的文件写入系统相册（写入 MediaStore），使 MIUI 相册也能看到。
   ///

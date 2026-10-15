@@ -168,6 +168,21 @@ abstract class SmbConnect {
   Future<SmbFile> rename(SmbFile srcFile, String dstPath,
       {bool replace = false});
 
+  /// 设置远端文件的创建/最后写入/最后访问时间（自 1970 起的毫秒数）。
+  ///
+  /// [createTime] 默认沿用 [lastWriteTime]；[lastAccessTime] 与 [changeTime]
+  /// 默认不修改。可选字段传 0 表示不修改，符合 FILE_BASIC_INFORMATION 语义。
+  /// 默认实现不支持该方法，SMB2 实现已覆盖。
+  Future<void> setFileTime(
+    SmbFile file, {
+    required int lastWriteTime,
+    int? createTime,
+    int? lastAccessTime,
+    int? changeTime,
+  }) {
+    throw UnsupportedError('setFileTime is not supported');
+  }
+
   Future<Stream<Uint8List>> openRead(SmbFile file, [int? start, int? end]);
 
   Future<IOSink> openWrite(SmbFile file, {bool append = false});

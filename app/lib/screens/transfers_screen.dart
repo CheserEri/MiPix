@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/models.dart';
+import '../providers/album_provider.dart';
 import '../providers/app_provider.dart';
 import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
+import '../services/photo_service.dart';
 import '../widgets/animations.dart';
 import '../widgets/smb_server_switcher.dart';
 import '../utils/mipix_theme.dart';
@@ -53,6 +55,10 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
       body: CustomScrollView(
         slivers: [
           const SliverToBoxAdapter(child: SizedBox(height: 8)),
+          // 未授予位置信息权限时，备份会丢掉照片的 GPS —— 属「备份不完整」，
+          // 必须显式提示（此前只打印日志，用户无从得知）。
+          if (ref.watch(mediaLocationGrantedProvider) == false)
+            SliverToBoxAdapter(child: _locationWarning(palette)),
           SliverToBoxAdapter(
             child: _sectionHeader(
               '未同步',
@@ -275,6 +281,43 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  /// 未授予「位置信息」权限时的提示条。
+  ///
+  /// 缺少该权限时系统会云隐照片 EXIF 里的 GPS，备份能跑完但内容不完整。
+  /// 这里明确告知并提供直达系统设置的入口，不阻断备份。
+  Widget _locationWarning(MiPixPalette palette) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
+        decoration: BoxDecoration(
+          color: const Color(0x1FF59E0B),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.location_off_outlined,
+                size: 18, color: Color(0xFFF59E0B)),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '未授予「位置信息」权限：备份不会包含照片的 GPS 位置。'
+                '请在系统设置中为 米影相册 开启该权限后重新备份。',
+                style: TextStyle(color: palette.textSecondary, fontSize: 12),
+              ),
+            ),
+            TextButton(
+              onPressed: () => PhotoService.openSettings(),
+              child: Text('去授权',
+                  style: TextStyle(color: palette.accent, fontSize: 12)),
+            ),
+          ],
+        ),
       ),
     );
   }

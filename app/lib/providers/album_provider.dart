@@ -9,17 +9,27 @@ import '../services/photo_service.dart';
 /// 避免同一次启动重复弹出系统授权对话框。
 final localAccessProvider =
     StateNotifierProvider<LocalAccessNotifier, AsyncValue<LocalAccess>>(
-  (ref) => LocalAccessNotifier(),
+  (ref) => LocalAccessNotifier(ref),
 );
 
+/// 位置信息（GPS）读取权限是否已授予（`null` = 尚未申请；非 Android 恒为 true）。
+///
+/// 未授予时系统会云隐照片 EXIF 里的位置信息，备份端会丢 GPS —— 这是「备份不完整」，
+/// 必须在界面上明确提示，不能静默通过。由 [LocalAccessNotifier.ensure] 同步。
+final mediaLocationGrantedProvider = StateProvider<bool?>((ref) => null);
+
 class LocalAccessNotifier extends StateNotifier<AsyncValue<LocalAccess>> {
-  LocalAccessNotifier() : super(const AsyncValue.loading());
+  LocalAccessNotifier(this._ref) : super(const AsyncValue.loading());
+
+  final Ref _ref;
 
   /// 请求（或读取当前）媒体权限，返回最新状态。
   Future<LocalAccess> ensure() async {
     try {
       final access = await PhotoService.ensurePermission();
       state = AsyncValue.data(access);
+      _ref.read(mediaLocationGrantedProvider.notifier).state =
+          PhotoService.mediaLocationGranted.value;
       return access;
     } catch (e, st) {
       state = AsyncValue.error(e, st);
