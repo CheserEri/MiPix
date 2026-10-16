@@ -549,4 +549,118 @@ void main() {
       expect(res.single.message, conflictMsgLocalReadFailed);
     });
   });
+
+  group('P1 队列可见性', () {
+    TransferTask task({
+      required String id,
+      String serverId = 's1',
+      String localPath = '/s/DCIM/Camera/a.jpg',
+      TransferType type = TransferType.upload,
+      TransferStatus status = TransferStatus.failed,
+      DateTime? createdAt,
+      DateTime? updatedAt,
+    }) {
+      final at = createdAt ?? DateTime.parse('2026-01-01T00:00:00.000');
+      return TransferTask(
+        id: id,
+        serverId: serverId,
+        transferType: type,
+        remotePath: '相机/a.jpg',
+        localPath: localPath,
+        totalBytes: 100,
+        writtenBytes: 0,
+        progress: 0,
+        status: status,
+        errorMessage: null,
+        createdAt: at,
+        updatedAt: updatedAt ?? at,
+      );
+    }
+
+    test('dropStaleFailedUploads 只移除「同服务器+同路径」的失败上传项', () {
+      final tasks = [
+        task(id: 'stale'), // 同服务器同路径失败 → 移除
+        task(id: 'otherPath', localPath: '/s/DCIM/Camera/b.jpg'), // 其他路径 → 保留
+        task(id: 'otherServer', serverId: 's2'), // 其他服务器 → 保留
+        task(id: 'notFailed', status: TransferStatus.done), // 非失败 → 保留
+        task(id: 'download', type: TransferType.download), // 非上传 → 保留
+      ];
+      final out = dropStaleFailedUploads(
+        tasks: tasks,
+        serverId: 's1',
+        localPaths: {'/s/DCIM/Camera/a.jpg'},
+      );
+      final ids = out.map((t) => t.id).toSet();
+      expect(ids.contains('stale'), isFalse);
+      expect(ids, containsAll(['otherPath', 'otherServer', 'notFailed', 'download']));
+    });
+
+    test('compareTransferTasks：运行中 > 等待中 > 终态', () {
+      final running = task(id: 'r', status: TransferStatus.running);
+      final pending = task(id: 'p', status: TransferStatus.pending);
+      final done = task(id: 'd', status: TransferStatus.done);
+      final list = [done, pending, running]..sort(compareTransferTasks);
+      expect(list.map((t) => t.id).toList(), ['r', 'p', 'd']);
+    });
+
+    test('compareTransferTasks：终态按最近更新优先，进行中按提交时间升序', () {
+      final olderDone = task(
+          id: 'oldDone',
+          status: TransferStatus.done,
+          updatedAt: DateTime.parse('2026-01-01T00:00:00.000'));
+      final newerDone = task(
+          id: 'newDone',
+          status: TransferStatus.done,
+          updatedAt: DateTime.parse('2026-01-02T00:00:00.000'));
+      final firstPending = task(
+          id: 'p1',
+          status: TransferStatus.pending,
+          createdAt: DateTime.parse('2026-01-01T00:00:00.000'));
+      final secondPending = task(
+          id: 'p2',
+          status: TransferStatus.pending,
+          createdAt: DateTime.parse('2026-01-02T00:00:00.000'));
+      final list = [
+        olderDone,
+        firstPending,
+        newerDone,
+        secondPending,
+      ]..sort(compareTransferTasks);
+      expect(list.map((t) => t.id).toList(),
+          ['p1', 'p2', 'newDone', 'oldDone']);
+    });
+
+    test('phase/phaseBytes 可 JSON round-trip，且旧记录缺字段时回退 preparing', () {
+      final withPhase = TransferTask(
+        id: '1',
+        serverId: 's',
+        transferType: TransferType.upload,
+        remotePath: '相机/a.jpg',
+        localPath: '/s/DCIM/Camera/a.jpg',
+        totalBytes: 100,
+        writtenBytes: 100,
+        progress: 0.8,
+        status: TransferStatus.running,
+        phase: TransferPhase.verifying,
+        phaseBytes: 42,
+        phaseStartedAt: DateTime.parse('2026-01-01T00:00:00.000'),
+        createdAt: DateTime.parse('2026-01-01T00:00:00.000'),
+        updatedAt: DateTime.parse('2026-01-01T00:00:00.000'),
+      );
+      final back = TransferTask.fromJson(withPhase.toJson());
+      expect(back.phase, TransferPhase.verifying);
+      expect(back.phaseBytes, 42);
+      expect(back.phaseStartedAt, isNotNull);
+
+      // 向后兼容：旧版 JSON 没有 phase 字段时回退到 preparing，不抛异常。
+      final legacy = withPhase.toJson()
+        ..remove('phase')
+        ..remove('phase_bytes')
+        ..remove('phase_started_at');
+      final legacyBack = TransferTask.fromJson(legacy);
+      expect(legacyBack.phase, TransferPhase.preparing);
+      expect(legacyBack.phaseBytes, 0);
+      expect(legacyBack.phaseStartedAt, isNull);
+    });
+  });
 }

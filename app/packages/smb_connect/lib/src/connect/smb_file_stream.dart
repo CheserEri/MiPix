@@ -17,12 +17,20 @@ import 'package:smb_connect/src/smb_constants.dart';
 
 int openReadNextNum = 0;
 
+/// 单次 SMB READ 请求可携带的最大负载。
+///
+/// 上游实现把读缓冲固定成 4095 字节，于是每个 4 KiB 都要一次完整往返，
+/// 实测吞吐只有约 0.7 MB/s（写路径用同量级的 64 KiB 块且有 19 MB/s）。
+/// 与服务端单次请求上限对齐后，读吞吐提升一个数量级。取值与写路径
+/// （[SmbStreamConsumer.blockSize]）一致：Samba 4.19 实测可接受的最大块。
+const int smbReadBlockSize = 64936;
+
 Stream<Uint8List> smbOpenRead(
     SmbFile file, SmbTree tree, Uint8List? fileId, int fid, int start,
     [int? length]) async* {
   // int openReadNum = openReadNextNum++;
   length = length ?? (file.size - start);
-  var buffSize = min(length, 0xFFF);
+  var buffSize = min(length, smbReadBlockSize);
   var position = 0;
   Uint8List buff = Uint8List(buffSize);
   do {
@@ -30,11 +38,11 @@ Stream<Uint8List> smbOpenRead(
     var readLen = min(buff.length, remain);
     var res = await smbReadFromFile(
         file, tree, fileId, fid, buff, position + start, 0, readLen);
-    if (readLen == buff.length) {
-      yield buff;
-    } else {
-      yield Uint8List.view(buff.buffer, 0, readLen);
-    }
+    // 服务端可能短读甚至返回 0：必须按真实读到的字节数上报。原来的实现只要
+    // 请求长度等于缓冲区长度就整块 yield，短读时会把缓冲区里遗留的旧字节
+    // 当作新数据（长度不变、内容错位），这在「上传后回读校验」里是致命的。
+    if (res <= 0) break;
+    yield res == buff.length ? buff : Uint8List.view(buff.buffer, 0, res);
     position += res;
   } while (position < length);
   await smbCloseFile(file, tree, fileId, fid);
@@ -43,8 +51,8 @@ Stream<Uint8List> smbOpenRead(
 void readAsync(SmbFile file, SmbTree tree, Uint8List? fileId, int fid,
     int start, int? length, StreamController<Uint8List> controller) async {
   length ??= (file.size - start);
-  var buffSize = min(length, 0xFFF);
-  // int index = 0;
+  var buffSize = min(length, smbReadBlockSize);
+  // var index = 0;
   var position = 0;
   Uint8List buff = Uint8List(buffSize);
   do {
@@ -52,10 +60,12 @@ void readAsync(SmbFile file, SmbTree tree, Uint8List? fileId, int fid,
     var readLen = min(buff.length, remain);
     var res = await smbReadFromFile(
         file, tree, fileId, fid, buff, start + position, 0, readLen);
-    if (readLen == buff.length) {
+    // 与 [smbOpenRead] 一致：短读按真实字节数上报，返回 0 时结束，避免死循环。
+    if (res <= 0) break;
+    if (res == buff.length) {
       controller.add(buff);
     } else {
-      var lastBuff = Uint8List.view(buff.buffer, 0, readLen);
+      var lastBuff = Uint8List.view(buff.buffer, 0, res);
       controller.add(lastBuff);
     }
     position += res;
