@@ -22,6 +22,15 @@ class _PendingUpload {
   /// 任务记录 id，在批量创建任务时才生成。
   String taskId = '';
 
+  /// P2：上传前启动、上传期间并行完成的本地摘要预取；null 表示未预取。
+  Future<String?>? prefetchedHash;
+
+  /// P2：启动摘要与上传前记录的来源稳定锚点（size + modified 毫秒）。
+  ///
+  /// 仅用于改名前的**稳定性检查**（发现变化即 fail-closed），不是强一致性证明。
+  int? sourceSize;
+  int? sourceModifiedMs;
+
   _PendingUpload({
     required this.localPath,
     required this.remotePath,
@@ -29,6 +38,17 @@ class _PendingUpload {
     required this.size,
     required this.captureTime,
   });
+}
+
+/// 单个任务当前阶段的追踪信息，仅用于阶段级耗时日志（不落盘）。
+class _PhaseTrace {
+  final TransferPhase phase;
+  final DateTime startedAt;
+
+  /// 该阶段最近一次上报的已处理字节数。
+  int bytes;
+
+  _PhaseTrace(this.phase, this.startedAt, this.bytes);
 }
 
 class BackupResult {
@@ -188,6 +208,56 @@ bool keepAfterClearCompleted(TransferStatus status) =>
     status != TransferStatus.done &&
     status != TransferStatus.skipped &&
     status != TransferStatus.failed;
+
+/// 从队列中移除「与本次将重新上传的目标身份相同」的历史失败上传记录。
+///
+/// 身份 = `serverId + localPath`。只移除「该服务器 + 该本地路径 + 上传类型 +
+/// failed」的记录：这样新批次的 pending 任务不会被上批遗留的失败项压在后面，
+/// 又不会误删其他服务器、其他路径的失败项（它们各自是「重试失败」的入口）。
+///
+/// 「全部备份」与「重试失败」共用本函数，保证两条入口的清理规则不分叉。
+/// 独立成顶层纯函数以便单测。
+List<TransferTask> dropStaleFailedUploads({
+  required List<TransferTask> tasks,
+  required String serverId,
+  required Set<String> localPaths,
+}) {
+  return tasks
+      .where((t) =>
+          !(t.transferType == TransferType.upload &&
+              t.status == TransferStatus.failed &&
+              t.serverId == serverId &&
+              localPaths.contains(t.localPath)))
+      .toList();
+}
+
+/// 队列显示顺序的排序权重：运行中(0) > 等待中(1) > 终态(2)。
+int transferSortRank(TransferStatus status) {
+  switch (status) {
+    case TransferStatus.running:
+      return 0;
+    case TransferStatus.pending:
+    case TransferStatus.paused:
+      return 1;
+    case TransferStatus.done:
+    case TransferStatus.failed:
+    case TransferStatus.skipped:
+      return 2;
+  }
+}
+
+/// 队列排序：运行中 > 等待中 > 近期终态 > 较早终态。
+///
+/// 保证当前批次一打开传输页就能看到正在跑的项，而不是被历史终态淹没。
+/// 进行中/等待中按提交时间升序（先提交先处理）；终态按最近更新降序（近期优先）。
+/// 独立成顶层纯函数以便单测。
+int compareTransferTasks(TransferTask a, TransferTask b) {
+  final ra = transferSortRank(a.status);
+  final rb = transferSortRank(b.status);
+  if (ra != rb) return ra.compareTo(rb);
+  if (ra < 2) return a.createdAt.compareTo(b.createdAt);
+  return b.updatedAt.compareTo(a.updatedAt);
+}
 
 // ---------------------------------------------------------------------------
 // 「同名文件冲突」判定（纯逻辑，可单测：不依赖 SMB、存储与 Flutter）
@@ -573,6 +643,9 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
   static const Duration _progressUiInterval = Duration(milliseconds: 150);
   final Map<String, DateTime> _lastProgressUiAt = {};
 
+  /// 各任务当前阶段及其开始时刻，仅用于阶段级耗时日志；任务结束即移除。
+  final Map<String, _PhaseTrace> _phaseTraces = {};
+
   TransfersNotifier(this._ref) : super(const AsyncValue.loading()) {
     _init();
   }
@@ -760,18 +833,32 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       return const BackupResult(successCount: 0, failedCount: 0);
     }
 
-    // 先移除这些失败记录，避免续传时与新建的同名任务重复。
-    final failedIds = failed.map((t) => t.id).toSet();
-    final remaining = tasks.where((t) => !failedIds.contains(t.id)).toList();
-    await _storage.saveTransfers(remaining);
-    state = AsyncValue.data(remaining);
-
+    // 按服务器分组待续传项；本地文件已删除的项无法重传，单独记下来随本次移除。
     final byServer = <String, List<String>>{};
+    final missingIds = <String>{};
     for (final t in failed) {
-      // 本地文件可能已被删除，跳过不存在的项。
-      if (!await File(t.localPath).exists()) continue;
+      if (!await File(t.localPath).exists()) {
+        missingIds.add(t.id);
+        continue;
+      }
       byServer.putIfAbsent(t.serverId, () => []).add(t.localPath);
     }
+
+    // 按「目标身份」清理失败记录：与「全部备份」共用 dropStaleFailedUploads，
+    // 保证两条入口的清理规则一致（只动同服务器+同路径的失败上传项）。
+    var remaining = tasks;
+    for (final entry in byServer.entries) {
+      remaining = dropStaleFailedUploads(
+        tasks: remaining,
+        serverId: entry.key,
+        localPaths: entry.value.toSet(),
+      );
+    }
+    if (missingIds.isNotEmpty) {
+      remaining = remaining.where((t) => !missingIds.contains(t.id)).toList();
+    }
+    await _storage.saveTransfers(remaining);
+    state = AsyncValue.data(remaining);
 
     var success = 0;
     var fail = 0;
@@ -829,6 +916,21 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         .map((t) => t.localPath)
         .toSet();
 
+    // P1：本次将重新上传的文件，先把它们的历史失败记录从队列移除，避免新批次的
+    // pending 任务被上批遗留的失败项压在后面（老记录插在新任务之前，当前批次
+    // 一打开传输页根本看不到）。只移除「同服务器 + 同本地路径」的失败上传项，
+    // 其他服务器/其他路径的失败项保留，作为各自的「重试失败」入口。
+    final currentTasks = state.valueOrNull ?? const <TransferTask>[];
+    final cleaned = dropStaleFailedUploads(
+      tasks: currentTasks,
+      serverId: serverId,
+      localPaths: localPaths.toSet(),
+    );
+    if (cleaned.length != currentTasks.length) {
+      state = AsyncValue.data(cleaned);
+      await _storage.saveTransfers(cleaned);
+    }
+
     // 每个本地文件所属的相册名（扁平结构：直接用手机相册名作远端文件夹名）。
     final albumNames = <String, String>{};
     for (final path in localPaths) {
@@ -836,11 +938,15 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
       albumNames[path] = PhotoService.albumNameOf(path);
     }
     Map<String, DateTime> captureTimes = const {};
+    final swCapture = Stopwatch()..start();
     try {
       captureTimes = await PhotoService.captureTimesForPaths(localPaths);
     } catch (e) {
       debugPrint('[backup][time] 无法读取手机相册拍摄时间，将回退文件修改时间：$e');
     }
+    swCapture.stop();
+    debugPrint('[backup][stage] phase=captureTime paths=${localPaths.length} '
+        'matched=${captureTimes.length} ms=${swCapture.elapsedMilliseconds}');
     DateTime? captureTimeFor(String path) =>
         captureTimes[path.replaceAll('\\', '/').toLowerCase()];
 
@@ -852,14 +958,20 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     // 注意：根目录（albumName == ""）也必须查询 share/rootPath 下的清单，
     // 否则根目录同名文件会被误判为「远端不存在」。
     final remoteIndex = <String, Map<String, int>?>{};
+    final swManifest = Stopwatch()..start();
+    var manifestFailed = 0;
     for (final album in albumNames.values.toSet()) {
       final entries = await _smbService.listFilesWithSize(server, album);
       if (entries == null) {
+        manifestFailed += 1;
         debugPrint('[backup] 目录 "${album.isEmpty ? '<根目录>' : album}" 远端清单读取失败，'
             '本次不写该目录下任何文件');
       }
       remoteIndex[album] = entries;
     }
+    swManifest.stop();
+    debugPrint('[backup][stage] phase=manifest albums=${remoteIndex.length} '
+        'failed=$manifestFailed ms=${swManifest.elapsedMilliseconds}');
 
     // 组装冲突候选：正在传输中的文件、本地不可读的文件先落成确定结论，
     // 其余交给纯函数 planConflicts 做「同远端路径分组 + 远端清单」判定。
@@ -918,13 +1030,21 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     // 就不必再算本地哈希——resolveHashProbes 会判 failUnknown，绝不视为「相同」。
     final remoteHashes = <String, String?>{};
     final localHashes = <String, String?>{};
+    final swProbe = Stopwatch()..start();
+    var probedBytes = 0;
     for (final probe in plan.probes) {
       final remotePath = probe.candidate.remotePath;
       final remoteHash = await _smbService.hashRemoteFile(server, remotePath);
       remoteHashes[remotePath] = remoteHash;
       if (remoteHash == null) continue;
+      probedBytes += probe.candidate.size;
       localHashes[remotePath] =
           await PhotoService.hashFile(probe.candidate.localPath);
+    }
+    swProbe.stop();
+    if (plan.probes.isNotEmpty) {
+      debugPrint('[backup][stage] phase=conflictHash probes=${plan.probes.length} '
+          'bytes=$probedBytes ms=${swProbe.elapsedMilliseconds}');
     }
     final probeResults = resolveHashProbes(
       probes: plan.probes,
@@ -1149,6 +1269,8 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
               guard: guard,
               reconnect: reconnect,
             );
+            // 结算最后一个阶段的耗时日志（上传/校验/收尾）。
+            _finishPhaseTrace(item.taskId, item.remotePath);
             if (error == null) {
               _updateTaskComplete(item.taskId, TransferStatus.done);
               successCount += 1;
@@ -1167,6 +1289,8 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
             // 链路已被判定不可用：立即停止领取新文件，剩余项转入失败待续传。
             if (guard.shouldStop) break;
             _updateTaskStatus(item.taskId, TransferStatus.running);
+            // P2：上传前启动摘要预取，与上传并行；锚点用于改名前的稳定性复核。
+            _startHashPrefetch(item);
             await runItem(
               item,
               () => _smbService.uploadFileParallel(
@@ -1175,11 +1299,13 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                 item.localPath,
                 sourceTime: item.captureTime,
                 parallelism: largeParallelism,
-                onProgress: (progress) => _updateTaskProgress(
-                  item.taskId,
-                  (progress * item.size).round(),
-                  progress,
-                ),
+                prefetchedHash: item.prefetchedHash,
+                sourceSize: item.sourceSize,
+                sourceModifiedMs: item.sourceModifiedMs,
+                // 分阶段上报：上传 → 本地摘要 → NAS 回读校验 → 改名回写，
+                // 避免大视频校验的几分钟里进度条冻住被误认为卡死。
+                onPhase: (phase, bytes, total) =>
+                    _onUploadPhase(item, phase, bytes, total),
               ),
             );
           }
@@ -1212,6 +1338,8 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
               }
 
               _updateTaskStatus(item.taskId, TransferStatus.running);
+              // P2：上传前启动摘要预取，与上传并行；锚点用于改名前的稳定性复核。
+              _startHashPrefetch(item);
 
               await runItem(
                 item,
@@ -1221,11 +1349,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                   item.remotePath,
                   item.localPath,
                   sourceTime: item.captureTime,
-                  onProgress: (progress) => _updateTaskProgress(
-                    item.taskId,
-                    (progress * item.size).round(),
-                    progress,
-                  ),
+                  prefetchedHash: item.prefetchedHash,
+                  sourceSize: item.sourceSize,
+                  sourceModifiedMs: item.sourceModifiedMs,
+                  onPhase: (phase, bytes, total) =>
+                      _onUploadPhase(item, phase, bytes, total),
                 ),
                 reconnect: () async {
                   // 超时/写失败后旧连接上的请求可能仍有残留：先废弃关闭它，
@@ -1354,7 +1482,13 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     });
   }
 
-  void _updateTaskProgress(String taskId, int writtenBytes, double progress) {
+  void _updateTaskProgress(
+    String taskId,
+    int writtenBytes,
+    double progress, {
+    TransferPhase? phase,
+    int? phaseBytes,
+  }) {
     // 按任务节流界面刷新：进度条 6~7Hz 已足够顺滑，而每次刷新都要重建整个
     // 任务列表，过密只会挤占上传循环的时间片。
     final now = DateTime.now();
@@ -1365,6 +1499,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     state.whenData((tasks) {
       final updated = tasks.map((t) {
         if (t.id == taskId && t.status == TransferStatus.running) {
+          // 阶段切换时重置「阶段起点/已处理字节」，供界面展示阶段耗时与速度。
+          final phaseChanged = phase != null && phase != t.phase;
+          // 总进度单调不减：事件顺序变化（如预取把 localHash 吸收进上传、或
+          // 失败重试重新进入上传阶段）都不能让进度条回退。
+          final monotonic = progress < t.progress ? t.progress : progress;
           return TransferTask(
             id: t.id,
             serverId: t.serverId,
@@ -1373,11 +1512,14 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
             localPath: t.localPath,
             totalBytes: t.totalBytes,
             writtenBytes: writtenBytes,
-            progress: progress,
+            progress: monotonic,
             status: t.status,
             errorMessage: t.errorMessage,
+            phase: phase ?? t.phase,
+            phaseBytes: phaseBytes ?? (phaseChanged ? 0 : t.phaseBytes),
+            phaseStartedAt: phaseChanged ? now : (t.phaseStartedAt ?? now),
             createdAt: t.createdAt,
-            updatedAt: DateTime.now(),
+            updatedAt: now,
           );
         }
         return t;
@@ -1391,6 +1533,106 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         _storage.saveTransfers(updated);
       }
     });
+  }
+
+  /// P2：在上传前启动本地摘要预取，并记录来源稳定锚点。
+  ///
+  /// 摘要在独立 isolate 内与上传并行计算（[PhotoService.hashFile]），把「上传
+  /// 完成后才顺序重读整份文件」的耗时吸收进上传阶段。锚点（size + modified）
+  /// 供改名前的稳定性复核使用；预取结果为 null（读取失败 / 期间文件被改动）
+  /// 由校验阶段 fail-closed，**不回退**二次顺序重读。
+  void _startHashPrefetch(_PendingUpload item) {
+    try {
+      final stat = File(item.localPath).statSync();
+      item.sourceSize = stat.size;
+      item.sourceModifiedMs = stat.modified.millisecondsSinceEpoch;
+    } catch (e) {
+      debugPrint('[backup][hash] stat 失败 local="${item.localPath}" err=$e');
+      item.sourceSize = item.size;
+      item.sourceModifiedMs = null;
+    }
+    final sw = Stopwatch()..start();
+    item.prefetchedHash = PhotoService.hashFile(item.localPath).then((hash) {
+      debugPrint('[backup][hash] local="${item.localPath}" '
+          'ms=${sw.elapsedMilliseconds} prefetched=true ok=${hash != null}');
+      return hash;
+    });
+  }
+
+  /// 上传阶段的进度回调：把阶段/已处理字节写入任务，并把合成的总进度换算出来。
+  ///
+  /// 进度分布：上传占 0~0.5，本地摘要占 0.5~0.55，NAS 回读校验占 0.55~1.0，
+  /// 只有这样大文件在「写完、正在回读」的几分钟里进度条才持续前进。
+  void _onUploadPhase(
+    _PendingUpload item,
+    TransferPhase phase,
+    int bytes,
+    int total,
+  ) {
+    _tracePhase(item.taskId, item.remotePath, phase, bytes);
+    final t = total > 0 ? total.toDouble() : 0.0;
+    double progress;
+    switch (phase) {
+      case TransferPhase.preparing:
+        progress = 0.0;
+        break;
+      case TransferPhase.uploading:
+        progress = t > 0 ? 0.5 * bytes / t : 0.0;
+        break;
+      case TransferPhase.localHash:
+        progress = 0.5 + (t > 0 ? 0.05 * bytes / t : 0.0);
+        break;
+      case TransferPhase.verifying:
+        progress = 0.55 + (t > 0 ? 0.45 * bytes / t : 0.0);
+        break;
+      case TransferPhase.finalizing:
+        progress = 1.0;
+        break;
+    }
+    _updateTaskProgress(
+      item.taskId,
+      // 校验/收尾阶段整份文件已写完：writtenBytes 保持等于总大小，
+      // 已读回字节单独走 phaseBytes。
+      phase == TransferPhase.uploading ? bytes : item.size,
+      progress,
+      phase: phase,
+      phaseBytes: bytes,
+    );
+  }
+
+  /// 记录任务阶段并输出阶段级耗时日志（阶段切换时结算上一阶段）。
+  void _tracePhase(
+      String taskId, String remotePath, TransferPhase phase, int bytes) {
+    final trace = _phaseTraces[taskId];
+    if (trace == null) {
+      _phaseTraces[taskId] = _PhaseTrace(phase, DateTime.now(), bytes);
+      return;
+    }
+    if (trace.phase != phase) {
+      _logStage(taskId, trace.phase, remotePath, trace.bytes,
+          DateTime.now().difference(trace.startedAt));
+      _phaseTraces[taskId] = _PhaseTrace(phase, DateTime.now(), bytes);
+      return;
+    }
+    trace.bytes = bytes;
+  }
+
+  /// 任务结束时结算最后一个阶段（上传/校验/收尾均会经过这里）。
+  void _finishPhaseTrace(String taskId, String remotePath) {
+    final trace = _phaseTraces.remove(taskId);
+    if (trace == null) return;
+    _logStage(taskId, trace.phase, remotePath, trace.bytes,
+        DateTime.now().difference(trace.startedAt));
+  }
+
+  /// 阶段级耗时日志：任务 ID + 远端路径 + 字节数 + 有效吞吐，便于真机定位慢在哪一段。
+  void _logStage(String taskId, TransferPhase phase, String remotePath,
+      int bytes, Duration elapsed) {
+    final secs = elapsed.inMicroseconds / 1e6;
+    final mbps = secs > 0 ? bytes / 1048576 / secs : 0.0;
+    debugPrint('[backup][stage] task=$taskId phase=${phase.name} '
+        'remote="$remotePath" bytes=$bytes ms=${elapsed.inMilliseconds} '
+        'mbps=${mbps.toStringAsFixed(2)}');
   }
 
   void _updateTaskComplete(String taskId, TransferStatus status, {String? errorMessage}) {

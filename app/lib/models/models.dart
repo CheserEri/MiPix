@@ -255,6 +255,28 @@ class SmbConfig {
 /// 也不是「已备份」（文件并未同步），因此单独成态、不计入 [TransferStatus.failed]。
 enum TransferStatus { pending, running, paused, done, failed, skipped }
 
+/// 传输任务的当前阶段（与 [TransferStatus] 正交，仅上传流程中有意义）。
+///
+/// 大文件「上传完成 → NAS 回读校验 → 改名回写」期间上行流量接近零、却可能
+/// 耗时数分钟，若只显示一个合成进度条，用户会误认为传输卡死。分阶段展示
+/// 让校验/收尾阶段有独立文案与「已读/总量、速度、耗时」。
+enum TransferPhase {
+  /// 准备：排队等待，以及上传前的远端清单读取/冲突比对阶段。
+  preparing,
+
+  /// 正在把本地字节写入远端临时文件。
+  uploading,
+
+  /// 校验第一段：在本地计算源文件 SHA-256。
+  localHash,
+
+  /// 校验第二段：从 NAS 回读临时文件计算 SHA-256。
+  verifying,
+
+  /// 校验通过后的收尾：改名到正式文件名、回写拍摄时间。
+  finalizing,
+}
+
 enum TransferType { download, upload }
 
 class TransferTask {
@@ -268,6 +290,12 @@ class TransferTask {
   final double progress;
   final TransferStatus status;
   final String? errorMessage;
+  /// 当前阶段；仅在 [TransferStatus.running] 时有展示意义。
+  final TransferPhase phase;
+  /// 当前阶段已处理的字节数（上传阶段等于 [writtenBytes]，回读校验阶段为已读回字节）。
+  final int phaseBytes;
+  /// [phase] 的开始时刻，用于界面展示「阶段耗时/速度」。
+  final DateTime? phaseStartedAt;
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -282,6 +310,9 @@ class TransferTask {
     required this.progress,
     required this.status,
     this.errorMessage,
+    this.phase = TransferPhase.preparing,
+    this.phaseBytes = 0,
+    this.phaseStartedAt,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -304,6 +335,14 @@ class TransferTask {
         orElse: () => TransferStatus.pending,
       ),
       errorMessage: json['error_message'] as String?,
+      phase: TransferPhase.values.firstWhere(
+        (e) => e.name == json['phase'],
+        orElse: () => TransferPhase.preparing,
+      ),
+      phaseBytes: (json['phase_bytes'] as int?) ?? 0,
+      phaseStartedAt: json['phase_started_at'] == null
+          ? null
+          : DateTime.parse(json['phase_started_at'] as String),
       createdAt: DateTime.parse(json['created_at'] as String),
       updatedAt: DateTime.parse(json['updated_at'] as String),
     );
@@ -321,6 +360,9 @@ class TransferTask {
       'progress': progress,
       'status': status.name,
       'error_message': errorMessage,
+      'phase': phase.name,
+      'phase_bytes': phaseBytes,
+      'phase_started_at': phaseStartedAt?.toIso8601String(),
       'created_at': createdAt.toIso8601String(),
       'updated_at': updatedAt.toIso8601String(),
     };

@@ -141,15 +141,18 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
                   ),
                 );
               }
+              // P1：运行中 > 等待中 > 近期终态 > 较早终态，保证当前批次一打开
+              // 传输页就能看到正在跑的项，而不是被历史终态淹没。
+              final sorted = [...tasks]..sort(compareTransferTasks);
               return SliverList(
                 delegate: SliverChildBuilderDelegate(
                   (context, index) {
                     return FadeSlideIn(
                       index: index,
-                      child: _transferCard(tasks[index]),
+                      child: _transferCard(sorted[index]),
                     );
                   },
-                  childCount: tasks.length,
+                  childCount: sorted.length,
                 ),
               );
             },
@@ -202,7 +205,12 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     final statusColor = _statusColor(task.status);
     final statusText = _statusText(task.status);
     final total = task.totalBytes > 0 ? task.totalBytes : 1;
-    final progress = task.writtenBytes / total;
+    // 进度取自任务自身的 progress（上传 0~0.5、本地摘要 0.5~0.55、回读校验
+    // 0.55~1.0）。用 writtenBytes/total 的话，大文件「已写完、正在回读校验」
+    // 的几分钟里进度条会一动不动，看起来就是传输卡死。
+    final progress = task.progress.clamp(0.0, 1.0).toDouble();
+    final running = task.status == TransferStatus.running;
+    final detail = running ? _phaseDetail(task) : '';
 
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
@@ -260,8 +268,15 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
             ),
           const SizedBox(height: 6),
           Text(
-            '${_formatBytes(task.writtenBytes)} / ${_formatBytes(total)} · '
-            '${task.transferType == TransferType.upload ? '上传' : '下载'}',
+            running
+                ? (detail.isEmpty
+                    ? _phaseLabel(task)
+                    : '${_phaseLabel(task)} · $detail')
+                : (task.status == TransferStatus.pending ||
+                        task.status == TransferStatus.paused
+                    ? _phaseLabel(task)
+                    : '${_formatBytes(task.writtenBytes)} / ${_formatBytes(total)} · '
+                        '${task.transferType == TransferType.upload ? '上传' : '下载'}'),
             style: TextStyle(
               color: palette.textSecondary,
               fontSize: 11,
@@ -436,5 +451,66 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
+
+  /// 运行中任务的阶段文案：上传 / 本地摘要 / NAS 回读校验 / 改名回写；
+  /// 等待中与暂停的任务单独给出文案，避免显示成「0 B / … · 上传」。
+  String _phaseLabel(TransferTask task) {
+    switch (task.status) {
+      case TransferStatus.pending:
+        return '准备 / 等待上传';
+      case TransferStatus.paused:
+        return '已暂停';
+      default:
+        break;
+    }
+    switch (task.phase) {
+      case TransferPhase.preparing:
+        return '准备 / 冲突比对';
+      case TransferPhase.uploading:
+        return '上传';
+      case TransferPhase.localHash:
+        return '本地摘要计算';
+      case TransferPhase.verifying:
+        return 'NAS 回读校验';
+      case TransferPhase.finalizing:
+        return '改名与时间戳回写';
+    }
+  }
+
+  /// 运行中任务的阶段详情：已处理/总量 · 当前速度 · 阶段耗时。
+  ///
+  /// 校验阶段（本地摘要、NAS 回读）额外展示「已用时长」，避免大文件回读的
+  /// 几分钟里只有字节数在涨、看不出还要多久。
+  String _phaseDetail(TransferTask task) {
+    final parts = <String>[];
+    final total = task.totalBytes;
+    final bytes = task.phase == TransferPhase.uploading
+        ? task.writtenBytes
+        : task.phaseBytes;
+    if (task.phase != TransferPhase.finalizing && total > 0) {
+      parts.add('${_formatBytes(bytes)} / ${_formatBytes(total)}');
+    }
+    final started = task.phaseStartedAt;
+    if (started != null) {
+      final secs = DateTime.now().difference(started).inMilliseconds / 1000.0;
+      if (secs > 0.3) {
+        if (bytes > 0) {
+          parts.add('${(bytes / 1048576 / secs).toStringAsFixed(1)} MB/s');
+        }
+        if (task.phase != TransferPhase.uploading) {
+          parts.add('已用 ${_formatDuration(secs)}');
+        }
+      }
+    }
+    return parts.join(' · ');
+  }
+
+  String _formatDuration(double seconds) {
+    final s = seconds.round();
+    if (s < 60) return '${s}s';
+    final m = s ~/ 60;
+    final r = s % 60;
+    return r == 0 ? '${m}m' : '${m}m${r}s';
   }
 }
