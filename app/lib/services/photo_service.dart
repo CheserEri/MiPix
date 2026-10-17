@@ -195,8 +195,7 @@ class PhotoService {
         final asset = assets.first;
         latestAt = asset.modifiedDateTime;
         relativePath = asset.relativePath;
-        final file = await _resolveFile(asset);
-        coverPath = file?.path;
+        coverPath = await _coverThumbPath(asset);
       }
 
       final rawName = name.toLowerCase();
@@ -440,6 +439,17 @@ class PhotoService {
     return merged.length > count ? merged.sublist(0, count) : merged;
   }
 
+  /// 相册封面路径：图片直接返回其文件路径；**视频必须先抽帧落盘成 JPEG**。
+  ///
+  /// 视频文件本身不能交给图片解码器：`Image.file` 会先把整个文件读进内存再解码，
+  /// 几百 MB 的视频会直接 OOM 让进程 abort（实测 673 MB 视频 → 703,742,088 字节
+  /// 分配失败）。因此视频封面一律先抽帧、缓存成一张小 JPEG 再返回。
+  static Future<String?> _coverThumbPath(AssetEntity asset) async {
+    if (asset.type == AssetType.video) return _videoFramePath(asset);
+    final file = await _resolveFile(asset);
+    return file?.path;
+  }
+
   /// 视频相册封面：取最新一个视频的首帧缩略图，缓存到应用临时目录。
   ///
   /// 视频文件本身无法直接被 Image 渲染，因此需要先用 photo_manager
@@ -447,15 +457,19 @@ class PhotoService {
   static Future<String?> _videoCoverPath() async {
     final assets = await _videoAssets(1);
     if (assets.isEmpty) return null;
+    return _videoFramePath(assets.first);
+  }
 
-    final asset = assets.first;
+  /// 抽取视频首帧并缓存为 JPEG，返回其路径；失败返回 null。
+  static Future<String?> _videoFramePath(AssetEntity asset,
+      {int size = 512}) async {
     try {
       final dir = await getTemporaryDirectory();
-      final file = File('${dir.path}/mipix_video_cover_${asset.id}.jpg');
+      final file = File('${dir.path}/mipix_video_cover_${asset.id}_$size.jpg');
       if (await file.exists() && await file.length() > 0) return file.path;
 
       final data = await asset.thumbnailDataWithSize(
-        const ThumbnailSize(512, 512),
+        ThumbnailSize(size, size),
         quality: 85,
       );
       if (data == null || data.isEmpty) return null;

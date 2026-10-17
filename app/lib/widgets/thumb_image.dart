@@ -16,6 +16,33 @@ bool _isAnimatedImage(String path) {
       lower.endsWith('.apng');
 }
 
+/// 可交给 Flutter 图片解码器的扩展名白名单。
+///
+/// **关键约束：非图片文件绝不能走 [Image.file]。** [Image.file] 会先把整个文件
+/// 读进内存再交给解码器，把几百 MB 的视频当成图片解码会立即 OOM 让进程 abort
+/// （实测 673 MB 视频 → 703,742,088 字节分配失败）。命中不了白名单时一律不解码，
+/// 直接走 [errorBuilder]，从而把这类崩溃挡在所有调用点之外。
+const _imageExtensions = <String>{
+  '.jpg',
+  '.jpeg',
+  '.jfif',
+  '.png',
+  '.apng',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.heic',
+  '.heif',
+  '.avif',
+};
+
+bool _isImagePath(String path) {
+  final lower = path.toLowerCase();
+  final dot = lower.lastIndexOf('.');
+  if (dot < 0) return false;
+  return _imageExtensions.contains(lower.substring(dot));
+}
+
 /// 缩略图 / 相册封面用的图片组件。
 ///
 /// 与 [Image.file] 的唯一区别：动图只解码首帧并立即释放解码器，
@@ -37,6 +64,17 @@ class ThumbImage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 非图片（视频 / 音频等）直接不解码，避免整文件读入内存导致 OOM。
+    if (!_isImagePath(path)) {
+      final onError = errorBuilder;
+      return onError == null
+          ? const SizedBox.shrink()
+          : onError(
+              context,
+              ArgumentError.value(path, 'path', '不是可解码的图片文件'),
+              null,
+            );
+    }
     if (_isAnimatedImage(path)) {
       return Image(
         image: FirstFrameImageProvider(path, targetWidth: cacheWidth),
