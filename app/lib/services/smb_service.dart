@@ -1371,19 +1371,25 @@ class SmbService {
   /// 小文件不启用分片：连接建立 + 认证的固定开销会超过省下的时间，反而更慢。
   static const int uploadParallelThresholdBytes = 8 * 1024 * 1024;
 
-  /// 远端回读校验的并发连接数（P3 原型开关）。
+  /// 远端回读校验的并发连接数（P3，已转正）。
   ///
-  /// **0 = 保持现状**：走 [ _hashRemoteVia] 的单连接顺序回读（一字未动）。
-  /// >1 时才改用 [ _hashRemoteRangeVia] 的多连接区间回读。默认保持 0，
-  /// 只有在真机实测满足升级判据（吞吐 ≥1.8 倍、总时长降 ≥40%、内存增量
-  /// < 64 MiB、连续 3 次无 Samba 资源错误、故障注入均不 rename）后才考虑改写。
-  static const int rangeReadbackConcurrency = 0;
+  /// 0 = 走 [ _hashRemoteVia] 的单连接顺序回读；>1 时改用
+  /// [ _hashRemoteRangeVia] 的多连接区间回读；此外文件不超过
+  /// [rangeReadbackRangeBytes]（只切出 1 个区间）时也回退单连接顺序读，
+  /// 避免为闲置区间白建连接。
+  ///
+  /// S2 真机实测（671MB 单文件、每档 3 次取中位）：单连接 146.0s / 4.6MB/s
+  /// → 2 连接 79.9s / 8.4MB/s → 4 连接 56.8s / 11.8MB/s（单文件关键路径 -41%）
+  /// → 6 连接 50.4s / 13.3MB/s → 8 连接无增益（53.8s）。拐点在 4~6，取 4 为
+  /// 默认：收益已接近上限而连接/CPU 占用更低。15 次运行无 Samba 报错、无 OOM，
+  /// 内存平稳（403~427MB PSS）。
+  static const int rangeReadbackConcurrency = 4;
 
-  /// P3 原型：每段区间回读的字节数。
+  /// 每段区间回读的字节数（P3，本次取值）。
   ///
   /// 区间内仍按底层 `smbReadBlockSize`（≈64 KiB）分块读取，只是不再每个小块都
   /// 重开一次远端文件句柄。句柄开销量随粒度反比变化（1 MiB 粒度会让 1.4 GiB
-  /// 文件付出约 1400 次开关），因此这里取 4 MiB 作为**待测参数**，不是既定默认值。
+  /// 文件付出约 1400 次开关），故取 4 MiB；S2 未做读块实验，维持该值。
   static const int rangeReadbackRangeBytes = 4 * 1024 * 1024;
 
 
@@ -1504,9 +1510,11 @@ class SmbService {
         'ms=${swLocal.elapsedMilliseconds} overlapped=$overlapped');
 
     // 远端回读：并发开关 >1 时走多连接区间回读，否则保持单连接顺序回读。
+    // S1：文件不超过一个区间（4 MiB）时只会切出 1 个区间，多连接区间路径会为
+    // 闲置区间白建连接与 worker（照片场景最常触发），直接回退单连接顺序读。
     final swRemote = Stopwatch()..start();
     final String? actual;
-    if (rangeReadbackConcurrency > 1) {
+    if (rangeReadbackConcurrency > 1 && total > rangeReadbackRangeBytes) {
       actual = await _hashRemoteRangeVia(
         config,
         tempFull,
@@ -1598,6 +1606,9 @@ class SmbService {
     if (concurrency < 2 || expectedSize <= 0) return null;
     final rangeBytes = rangeReadbackRangeBytes;
     final ranges = planRanges(total: expectedSize, rangeBytes: rangeBytes);
+    // S1：连接数与 worker 数按 min(并发, 区间数) 取。区间数少于并发时，多余的
+    // 连接建完就闲置，既白付认证握手，又给 Samba 增加无谓的连接压力。
+    final workers = concurrency < ranges.length ? concurrency : ranges.length;
     final sink = _DigestSink();
     final hasher = sha256.startChunkedConversion(sink);
     var consumed = 0;
@@ -1611,18 +1622,18 @@ class SmbService {
         // 有序 emit 才推进进度：bytesConsumed 单调不减。
         onPhase?.call(TransferPhase.verifying, consumed, expectedSize);
       },
-      maxBufferedBytes: rangeBytes * concurrency * 2,
-      maxOffsetLead: rangeBytes * concurrency * 2,
+      maxBufferedBytes: rangeBytes * workers * 2,
+      maxOffsetLead: rangeBytes * workers * 2,
     );
 
     final connections = <SmbConnect>[];
     final sw = Stopwatch()..start();
     var ok = true;
     debugPrint('[backup][verify] START remote="$tempFull" '
-        'size=$expectedSize ranges=${ranges.length} concurrency=$concurrency');
+        'size=$expectedSize ranges=${ranges.length} concurrency=$workers');
 
     try {
-      for (var i = 0; i < concurrency; i++) {
+      for (var i = 0; i < workers; i++) {
         connections.add(await createConnection(config));
       }
       // 读之前先核对远端大小：与来源不符就无需再读。
@@ -1634,7 +1645,7 @@ class SmbService {
         ok = false;
       } else {
         final scheduler =
-            RangeScheduler(ranges: ranges, concurrency: concurrency);
+            RangeScheduler(ranges: ranges, concurrency: workers);
         // 每个 worker 独占一条连接，从队首按偏移升序领取区间。
         Future<void> worker(SmbConnect connect) async {
           while (true) {
@@ -1680,7 +1691,7 @@ class SmbService {
       return null;
     }
     debugPrint('[backup][verify] range OK remote="$tempFull" '
-        'ranges=${ranges.length} concurrency=$concurrency '
+        'ranges=${ranges.length} concurrency=$workers '
         'ms=${sw.elapsedMilliseconds}');
     return digest.toString();
   }
