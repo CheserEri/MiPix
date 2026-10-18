@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../services/smb_service.dart';
@@ -61,7 +60,8 @@ class _SmbRemoteImageState extends State<SmbRemoteImage> {
           _loading = false;
         });
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[smb] coverLoad FAIL path=${widget.remotePath} ${e.runtimeType} $e');
       if (mounted) setState(() => _loading = false);
     }
   }

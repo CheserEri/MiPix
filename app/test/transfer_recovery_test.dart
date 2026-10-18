@@ -187,6 +187,46 @@ void main() {
       expect(reconnects, 0);
       expect(guard.shouldStop, isTrue);
     });
+
+    test('P0.1 每次失败都回调 onFailure：中间失败带尝试序号与重连结果', () async {
+      final guard = UploadFailureGuard();
+      final events = <UploadFailureEvent>[];
+      var attempts = 0;
+      final error = await uploadWithRetry(
+        guard: guard,
+        upload: () async {
+          attempts += 1;
+          if (attempts < 3) throw StateError('Bad state: StreamSink is closed');
+        },
+        reconnect: () async {},
+        onFailure: events.add,
+      );
+      expect(error, isNull);
+      // upload1 / upload2 各失败一次并上报，upload3 成功不再上报。
+      expect(events.map((e) => e.attempt), [1, 2]);
+      expect(events.every((e) => e.connectionError), isTrue);
+      expect(
+        events.every((e) => e.reconnectAttempted && !e.reconnectFailed),
+        isTrue,
+      );
+      expect(events.every((e) => !e.guardStopped), isTrue);
+    });
+
+    test('P0.1 重连失败时 onFailure 标记 reconnectFailed', () async {
+      final guard = UploadFailureGuard();
+      final events = <UploadFailureEvent>[];
+      final error = await uploadWithRetry(
+        guard: guard,
+        upload: () async => throw TimeoutException('stall'),
+        reconnect: () async => throw const SocketException('no route to host'),
+        onFailure: events.add,
+      );
+      expect(error, isA<TimeoutException>());
+      expect(events.length, 1);
+      expect(events.single.attempt, 1);
+      expect(events.single.reconnectAttempted, isTrue);
+      expect(events.single.reconnectFailed, isTrue);
+    });
   });
 
   group('reconcileSynced', () {
@@ -641,14 +681,14 @@ void main() {
         writtenBytes: 100,
         progress: 0.8,
         status: TransferStatus.running,
-        phase: TransferPhase.verifying,
+        phase: TransferPhase.finalizing,
         phaseBytes: 42,
         phaseStartedAt: DateTime.parse('2026-01-01T00:00:00.000'),
         createdAt: DateTime.parse('2026-01-01T00:00:00.000'),
         updatedAt: DateTime.parse('2026-01-01T00:00:00.000'),
       );
       final back = TransferTask.fromJson(withPhase.toJson());
-      expect(back.phase, TransferPhase.verifying);
+      expect(back.phase, TransferPhase.finalizing);
       expect(back.phaseBytes, 42);
       expect(back.phaseStartedAt, isNotNull);
 

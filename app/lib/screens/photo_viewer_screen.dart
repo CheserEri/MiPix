@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -10,8 +9,9 @@ import '../providers/smb_provider.dart';
 import '../services/smb_service.dart';
 import '../services/photo_service.dart';
 import '../services/local_storage_service.dart';
-import '../widgets/glass_container.dart';
+import '../utils/mipix_theme.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:exif/exif.dart' as exif_pkg;
 import 'package:video_player/video_player.dart';
 
@@ -70,6 +70,9 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
       setState(() => _isZoomed = zoomed);
     }
   }
+
+  /// 两位数补零，用于时间显示。
+  String _two(int v) => v.toString().padLeft(2, '0');
 
   @override
   void initState() {
@@ -202,13 +205,29 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
                               onPressed: () => Navigator.pop(context),
                             ),
                             Expanded(
-                              child: Text(
-                                '${_currentIndex + 1} / ${widget.photos.length}',
-                                style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w500),
-                                textAlign: TextAlign.center,
+                              // 两行居中标题（对齐小米相册）：上行日期，下行时间 · 序号。
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    '${photo.modifiedAt.year}年${photo.modifiedAt.month}月${photo.modifiedAt.day}日',
+                                    style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w600),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                  const SizedBox(height: 1),
+                                  Text(
+                                    '${_two(photo.modifiedAt.hour)}:${_two(photo.modifiedAt.minute)} · '
+                                    '${_currentIndex + 1}/${widget.photos.length}',
+                                    style: const TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w400),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ],
                               ),
                             ),
                             const SizedBox(width: 48),
@@ -489,44 +508,114 @@ class _BottomActionBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final servers = ref.watch(smbServersProvider).valueOrNull ?? [];
-    // 上传锁：该照片已在传输中时，按钮显示「上传中」并禁止重复提交。
-    final isUploading = ref.watch(uploadingPathsProvider).contains(photo.path);
+    // SMB 云相册：只保留「下载」。
+    if (isRemote) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            _ActionButton(
+              icon: Icons.download_outlined,
+              label: '下载',
+              onTap: () => _downloadRemote(context),
+            ),
+          ],
+        ),
+      );
+    }
 
+    // 本地相册：对齐小米相册五键（发送 / 编辑 / 收藏 / 删除 / 更多）。
+    final servers = ref.watch(smbServersProvider).valueOrNull ?? [];
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
           _ActionButton(
-            icon: Icons.share,
-            label: '分享',
+            icon: Icons.ios_share,
+            label: '发送',
             onTap: () => _sharePhoto(context),
           ),
-          if (!isRemote && servers.isNotEmpty)
-            _ActionButton(
-              icon: isUploading ? Icons.cloud_sync : Icons.cloud_upload,
-              label: isUploading ? '上传中' : '备份',
-              onTap: isUploading
-                  ? () => ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('该照片正在上传中')),
-                      )
-                  : () => _backup(context, ref, servers.first.id),
-            ),
-          if (isRemote)
-            _ActionButton(
-              icon: Icons.download,
-              label: '下载',
-              onTap: () => _downloadRemote(context),
-            ),
           _ActionButton(
-            icon: Icons.info_outline,
-            label: '信息',
-            onTap: () => _showInfo(context),
+            icon: Icons.edit_outlined,
+            label: '编辑',
+            onTap: () => _notSupported(context, '编辑'),
+          ),
+          _ActionButton(
+            icon: Icons.favorite_border,
+            label: '收藏',
+            onTap: () => _notSupported(context, '收藏'),
+          ),
+          _ActionButton(
+            icon: Icons.delete_outline,
+            label: '删除',
+            onTap: () => _deleteLocal(context),
+          ),
+          _ActionButton(
+            icon: Icons.more_horiz,
+            label: '更多',
+            onTap: () => _showMore(context, ref, servers),
           ),
         ],
       ),
     );
+  }
+
+  void _notSupported(BuildContext context, String name) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('$name 暂不支持')));
+  }
+
+  /// 「更多」菜单：对齐小米相册——纯文字列表、大圆角弹层、无图标。
+  void _showMore(BuildContext context, WidgetRef ref, List<SmbConfig> servers) {
+    final palette = MiPixPalette.of(context);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: palette.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SizedBox(height: 6),
+            if (servers.isNotEmpty)
+              _MoreMenuItem(
+                label: '备份到 SMB',
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _backup(context, ref, servers.first.id);
+                },
+              ),
+            _MoreMenuItem(
+              label: '详情',
+              onTap: () {
+                Navigator.pop(ctx);
+                _showInfo(context);
+              },
+            ),
+            const SizedBox(height: 10),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 删除本地照片（走系统 MediaStore，会弹出系统确认框）。
+  Future<void> _deleteLocal(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final deleted = await PhotoManager.editor.deleteWithIds([photo.id]);
+      if (deleted.isEmpty) return; // 用户在系统确认框中取消
+      if (context.mounted) Navigator.pop(context);
+      messenger.showSnackBar(const SnackBar(content: Text('已删除')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('删除失败: $e')));
+    }
   }
 
   Future<void> _backup(BuildContext context, WidgetRef ref, String serverId) async {
@@ -607,12 +696,11 @@ class _BottomActionBar extends ConsumerWidget {
     }
   }
 
+  /// 打开照片详情页（对齐小米相册「详情」：整页、返回 + 居中标题 + 标签/值行）。
   void _showInfo(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (_) => _ExifInfoSheet(photo: photo, isRemote: isRemote, serverId: serverId),
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => _PhotoDetailScreen(photo: photo)),
     );
   }
 }
@@ -630,22 +718,16 @@ class _ActionButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 对齐小米相册：图标在上、文字在下，无背景框。
     return GestureDetector(
+      behavior: HitTestBehavior.opaque,
       onTap: onTap,
-      child: AnimatedScale(
-        scale: 1.0,
-        duration: const Duration(milliseconds: 100),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Icon(icon, color: Colors.white, size: 22),
-            ),
+            Icon(icon, color: Colors.white, size: 24),
             const SizedBox(height: 6),
             Text(label,
                 style: const TextStyle(
@@ -841,19 +923,18 @@ class _RemotePhotoViewerState extends State<_RemotePhotoViewer> {
   }
 }
 
-class _ExifInfoSheet extends StatefulWidget {
+/// 照片详情页：对齐小米相册「详情」——整页、返回 + 居中标题，标签/值分行排布。
+class _PhotoDetailScreen extends StatefulWidget {
   final MediaItem photo;
-  final bool isRemote;
-  final String? serverId;
 
-  const _ExifInfoSheet({required this.photo, required this.isRemote, this.serverId});
+  const _PhotoDetailScreen({required this.photo});
 
   @override
-  State<_ExifInfoSheet> createState() => _ExifInfoSheetState();
+  State<_PhotoDetailScreen> createState() => _PhotoDetailScreenState();
 }
 
-class _ExifInfoSheetState extends State<_ExifInfoSheet> {
-  Map<String, dynamic>? _exif;
+class _PhotoDetailScreenState extends State<_PhotoDetailScreen> {
+  Map<String, exif_pkg.IfdTag>? _exif;
   bool _loading = true;
 
   @override
@@ -864,122 +945,296 @@ class _ExifInfoSheetState extends State<_ExifInfoSheet> {
 
   Future<void> _loadExif() async {
     try {
-      if (!widget.isRemote) {
-        final fileBytes = await File(widget.photo.path).readAsBytes();
-        final data = await exif_pkg.readExifFromBytes(fileBytes);
-        _exif = data.map((k, v) => MapEntry(k, v.toString()));
-      } else {
-        final servers = await LocalStorageService().getSmbServers();
-        final server = servers.firstWhere((s) => s.id == widget.serverId);
-        final data = await SmbService().readFile(server, widget.photo.path);
-        final exifData = await exif_pkg.readExifFromBytes(data);
-        _exif = exifData.map((k, v) => MapEntry(k, v.toString()));
-      }
+      final bytes = await File(widget.photo.path).readAsBytes();
+      _exif = await exif_pkg.readExifFromBytes(bytes);
     } catch (_) {}
     if (mounted) setState(() => _loading = false);
   }
 
+  String _two(int v) => v.toString().padLeft(2, '0');
+
+  String? _str(String key) {
+    final tag = _exif?[key];
+    if (tag == null) return null;
+    final s = tag.printable.trim();
+    return s.isEmpty ? null : s;
+  }
+
+  /// 取 EXIF 数值（Ratio / int 统一转 double）。
+  double? _num(String key, [int index = 0]) {
+    final tag = _exif?[key];
+    if (tag == null) return null;
+    final list = tag.values.toList();
+    if (index >= list.length) return null;
+    final v = list[index];
+    if (v is exif_pkg.Ratio) return v.toDouble();
+    if (v is int) return v.toDouble();
+    if (v is double) return v;
+    return null;
+  }
+
+  /// 去掉无意义的小数尾零（1.60 → 1.6，6.55 → 6.55）。
+  String _trimNum(double v) {
+    final s = v.toStringAsFixed(2);
+    return s.endsWith('0') ? s.substring(0, s.length - 1) : s;
+  }
+
+  /// 拍摄时间：优先 EXIF 拍摄时间，回退到文件修改时间。
+  String _shootingTime() {
+    DateTime? dt;
+    final raw = _str('EXIF DateTimeOriginal') ?? _str('Image DateTime');
+    if (raw != null) {
+      final m =
+          RegExp(r'(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2})').firstMatch(raw);
+      if (m != null) {
+        dt = DateTime(
+          int.parse(m.group(1)!),
+          int.parse(m.group(2)!),
+          int.parse(m.group(3)!),
+          int.parse(m.group(4)!),
+          int.parse(m.group(5)!),
+        );
+      }
+    }
+    dt ??= widget.photo.modifiedAt;
+    const week = ['一', '二', '三', '四', '五', '六', '日'];
+    return '${dt.year}年${dt.month}月${dt.day}日\n'
+        '星期${week[dt.weekday - 1]} ${_two(dt.hour)}:${_two(dt.minute)}';
+  }
+
+  /// 拍摄参数：机型 / 光圈·快门·ISO / 焦距·闪光灯。
+  String? _cameraParams() {
+    final lines = <String>[];
+
+    final model = _str('Image Model');
+    final make = _str('Image Make');
+    String maker = '';
+    if (model != null && make != null) {
+      final head = model.toLowerCase().startsWith(make.toLowerCase())
+          ? model
+          : '$make $model';
+      maker = '$head, $make';
+    } else {
+      maker = model ?? make ?? '';
+    }
+    if (maker.isNotEmpty) lines.add(maker);
+
+    final f = _num('EXIF FNumber');
+    final exposure = _num('EXIF ExposureTime');
+    final iso = _num('EXIF ISOSpeedRatings');
+    final line2 = <String>[];
+    if (f != null) line2.add('f/${_trimNum(f)}');
+    if (exposure != null && exposure > 0) {
+      line2.add(exposure >= 1
+          ? '${_trimNum(exposure)}s'
+          : '1/${(1 / exposure).round()}s');
+    }
+    if (iso != null) line2.add('ISO${iso.round()}');
+    if (line2.isNotEmpty) lines.add(line2.join('  '));
+
+    final focal = _num('EXIF FocalLength');
+    final flash = _num('EXIF Flash');
+    final line3 = <String>[];
+    if (focal != null) line3.add('${_trimNum(focal)}mm');
+    if (flash != null) {
+      line3.add((flash.toInt() & 1) == 1 ? '已使用闪光灯' : '未使用闪光灯');
+    }
+    if (line3.isNotEmpty) lines.add(line3.join('  '));
+
+    return lines.isEmpty ? null : lines.join('\n');
+  }
+
+  /// 拍摄地点：由 GPS EXIF 换算为度分秒；无 GPS 时返回 null 隐藏该行。
+  String? _location() {
+    final lat = _gps('GPS GPSLatitude', _str('GPS GPSLatitudeRef'));
+    final lon = _gps('GPS GPSLongitude', _str('GPS GPSLongitudeRef'));
+    if (lat == null || lon == null) return null;
+    return '${_dms(lat, 'NS')}  ${_dms(lon, 'EW')}';
+  }
+
+  double? _gps(String key, String? ref) {
+    final tag = _exif?[key];
+    if (tag == null) return null;
+    final list = tag.values.toList();
+    if (list.length < 3) return null;
+    double comp(int i) {
+      final v = list[i];
+      if (v is exif_pkg.Ratio) return v.toDouble();
+      if (v is int) return v.toDouble();
+      return 0;
+    }
+
+    final deg = comp(0) + comp(1) / 60 + comp(2) / 3600;
+    final r = (ref ?? '').trim().toUpperCase();
+    return (r.startsWith('S') || r.startsWith('W')) ? -deg : deg;
+  }
+
+  String _dms(double v, String refs) {
+    final abs = v.abs();
+    final d = abs.floor();
+    final mFull = (abs - d) * 60;
+    final m = mFull.floor();
+    final s = (mFull - m) * 60;
+    return '$d°$m\'${s.round()}"${v >= 0 ? refs[0] : refs[1]}';
+  }
+
   String _formatSize(int bytes) {
     if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024)
-      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
+
+  /// 路径按小米习惯以「内部存储/」呈现，去掉 Android 绝对前缀。
+  String _displayPath() {
+    const prefix = '/storage/emulated/0/';
+    final p = widget.photo.path;
+    return p.startsWith(prefix) ? '内部存储/${p.substring(prefix.length)}' : p;
   }
 
   @override
   Widget build(BuildContext context) {
-    return DraggableScrollableSheet(
-      expand: false,
-      initialChildSize: 0.5,
-      minChildSize: 0.3,
-      maxChildSize: 0.85,
-      builder: (_, controller) {
-        return GlassContainer(
-          borderRadius:
-              const BorderRadius.vertical(top: Radius.circular(24)),
-          blur: 30,
-          tint: const Color(0xFF0F172A).withValues(alpha: 0.9),
-          child: Container(
-            padding: const EdgeInsets.all(20),
-            child: ListView(
-              controller: controller,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.2),
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text('文件信息',
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleLarge
-                        ?.copyWith(color: Colors.white)),
-                const SizedBox(height: 16),
-                _InfoRow('名称', widget.photo.name),
-                _InfoRow('路径', widget.photo.path),
-                _InfoRow('大小', _formatSize(widget.photo.size)),
-                _InfoRow('类型', widget.photo.mimeType),
-                _InfoRow('时间', widget.photo.modifiedAt.toString()),
-                _InfoRow('分辨率',
-                    '${widget.photo.width} x ${widget.photo.height}'),
-                const SizedBox(height: 20),
-                if (_loading)
-                  const Center(
-                      child: CircularProgressIndicator(
-                          color: Colors.white, strokeWidth: 2))
-                else if (_exif != null && _exif!.isNotEmpty) ...[
-                  Text('EXIF',
-                      style: Theme.of(context)
-                          .textTheme
-                          .titleMedium
-                          ?.copyWith(color: Colors.white)),
-                  const SizedBox(height: 10),
-                  ..._exif!.entries
-                      .take(20)
-                      .map((e) => _InfoRow(e.key, e.value)),
-                ] else
-                  const Text('无 EXIF 数据',
-                      style: TextStyle(color: Colors.white38)),
-              ],
+    final palette = MiPixPalette.of(context);
+    final valueStyle = TextStyle(
+      fontSize: 14,
+      height: 1.55,
+      color: palette.textPrimary,
+    );
+    final subStyle = TextStyle(
+      fontSize: 13.5,
+      height: 1.55,
+      color: palette.textSecondary,
+    );
+    final params = _cameraParams();
+    final location = _location();
+
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: MiPixTheme.overlayStyle(context),
+      child: Scaffold(
+        backgroundColor: palette.background,
+        appBar: AppBar(
+          backgroundColor: palette.background,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          centerTitle: true,
+          leading: IconButton(
+            icon: Icon(Icons.arrow_back, color: palette.textPrimary),
+            onPressed: () => Navigator.pop(context),
+          ),
+          title: Text(
+            '详情',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+              color: palette.textPrimary,
             ),
           ),
-        );
-      },
+        ),
+        body: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
+          children: [
+            _DetailRow(
+              label: '拍摄时间',
+              value: Text(_shootingTime(), style: valueStyle),
+            ),
+            _DetailRow(
+              label: '文件信息',
+              value: Text.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(text: widget.photo.name, style: valueStyle),
+                    TextSpan(
+                      text: '\n${_formatSize(widget.photo.size)}  '
+                          '${widget.photo.width}×${widget.photo.height}px',
+                      style: subStyle,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (params != null)
+              _DetailRow(
+                label: '拍摄参数',
+                value: Text(params, style: valueStyle),
+              ),
+            _DetailRow(
+              label: '文件路径',
+              value: Text(_displayPath(), style: valueStyle),
+            ),
+            if (location != null)
+              _DetailRow(
+                label: '拍摄地点',
+                value: Text(location, style: valueStyle),
+              ),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.only(top: 24),
+                child: Center(
+                  child: SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
 
-class _InfoRow extends StatelessWidget {
+/// 详情页的一行：左标签 + 右值（值可多行）。
+class _DetailRow extends StatelessWidget {
   final String label;
-  final String value;
+  final Widget value;
 
-  const _InfoRow(this.label, this.value);
+  const _DetailRow({required this.label, required this.value});
 
   @override
   Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
+      padding: const EdgeInsets.symmetric(vertical: 14),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 100,
-            child: Text('$label:',
-                style: const TextStyle(
-                    color: Color(0x99FFFFFF), fontSize: 13)),
+            width: 88,
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 14,
+                height: 1.55,
+                color: palette.textSecondary,
+              ),
+            ),
           ),
-          Expanded(
-            child: Text(value,
-                style: const TextStyle(
-                    color: Colors.white, fontSize: 13)),
-          ),
+          const SizedBox(width: 12),
+          Expanded(child: value),
         ],
+      ),
+    );
+  }
+}
+
+/// 「更多」菜单项：纯文字、大间距（对齐小米相册）。
+class _MoreMenuItem extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+
+  const _MoreMenuItem({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
+        child: Text(
+          label,
+          style: TextStyle(fontSize: 16, color: palette.textPrimary),
+        ),
       ),
     );
   }

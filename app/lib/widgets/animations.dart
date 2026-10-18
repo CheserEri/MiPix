@@ -94,6 +94,32 @@ class FadeSlideIn extends StatelessWidget {
   }
 }
 
+/// 新增项入场动画：淡入 + 轻微放大。
+///
+/// 用于动态刷新时新插入的照片瓦片：只有本次新增的项播放，其余项保持静止，
+/// 避免整屏重排时闪跳。动画结束后 Opacity 为 1，不产生额外 saveLayer 开销。
+/// [animate] 为 false 时直接以终态呈现（不播动画）。
+class AppearIn extends StatelessWidget {
+  final Widget child;
+  final bool animate;
+
+  const AppearIn({super.key, required this.child, this.animate = true});
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: animate ? 0.0 : 1.0, end: 1.0),
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+      child: child,
+      builder: (context, value, child) => Opacity(
+        opacity: value,
+        child: Transform.scale(scale: 0.9 + 0.1 * value, child: child),
+      ),
+    );
+  }
+}
+
 /// 照片卡片淡入动画
 class PhotoFadeIn extends StatelessWidget {
   final Widget child;

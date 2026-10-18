@@ -12,7 +12,19 @@ class CacheService {
   static const _cacheMetadataKey = 'cache_metadata';
   static const _albumCachePrefix = 'album_cache_';
   static const _imageCachePrefix = 'image_cache_';
-  static const _thumbnailCachePrefix = 'thumb2_cache_';
+  /// 缩略图缓存文件名前缀。
+  ///
+  /// v3：动画格式（GIF/APNG/WebP）缩略图由「GIF→JPEG」改为「取首帧→PNG」，
+  /// 旧 v2 的 JPEG 缩略图存在颜色失真，递增前缀使旧缓存整体失效。
+  static const _thumbnailCachePrefix = 'thumb3_cache_';
+
+  /// 历史缩略图前缀，仅用于清理/失效，避免旧版本文件长期残留占用空间。
+  static const _legacyThumbnailCachePrefixes = ['thumb2_cache_'];
+
+  /// 文件名是否属于缩略图缓存（含历史前缀）。
+  static bool _isThumbnailCacheFile(String filePath) =>
+      filePath.contains(_thumbnailCachePrefix) ||
+      _legacyThumbnailCachePrefixes.any(filePath.contains);
   static const _defaultCacheDuration = Duration(days: 7);
   static const _thumbnailSize = 200;
   static const _cacheLimitKey = 'cache_limit_bytes';
@@ -73,7 +85,7 @@ class CacheService {
   }
 
   bool _isCacheFile(String filePath) =>
-      filePath.contains(_imageCachePrefix) || filePath.contains(_thumbnailCachePrefix);
+      filePath.contains(_imageCachePrefix) || _isThumbnailCacheFile(filePath);
 
   /// 超出上限时按「最久未修改优先」删除缓存文件。
   /// 缩略图体积很小、命中收益高，优先淘汰原图。
@@ -252,7 +264,7 @@ class CacheService {
   Future<void> invalidateImage(String serverId, String imagePath) async {
     await ensureInitialized();
     final safeName = _sanitizePath(imagePath);
-    for (final prefix in [_imageCachePrefix, _thumbnailCachePrefix]) {
+    for (final prefix in [_imageCachePrefix, _thumbnailCachePrefix, ..._legacyThumbnailCachePrefixes]) {
       final file = File(path.join(_cacheDir.path, '$prefix${serverId}_$safeName'));
       if (file.existsSync()) {
         try {
@@ -323,8 +335,11 @@ class CacheService {
     try {
       // 解码+缩放+编码是 CPU 密集操作，在主线程执行会造成网格滚动掉帧。
       // 整体搬到独立 Isolate，主线程只收发字节，避免卡顿。
+      // 动画格式（GIF/APNG/WebP）取首帧并编码为 PNG，避免颜色失真（见
+      // [_isAnimatedPath] 与 [_generateThumbnailInIsolate]）。
+      final animated = _isAnimatedPath(imagePath);
       final thumbnailBytes = await Isolate.run(
-        () => _generateThumbnailInIsolate(originalBytes, _thumbnailSize),
+        () => _generateThumbnailInIsolate(originalBytes, _thumbnailSize, animated: animated),
       );
       // 空列表表示解码失败，回退原图。
       if (thumbnailBytes.isEmpty) return originalBytes;
@@ -356,8 +371,8 @@ class CacheService {
         }
       }
     }
-    final files = _cacheDir.listSync().where((f) => 
-      f.path.contains(_imageCachePrefix) || f.path.contains(_thumbnailCachePrefix)
+    final files = _cacheDir.listSync().where((f) =>
+      f.path.contains(_imageCachePrefix) || _isThumbnailCacheFile(f.path)
     );
     for (final file in files) {
       final stat = await file.stat();
@@ -373,8 +388,8 @@ class CacheService {
     for (final key in keys) {
       await _prefs!.remove(key);
     }
-    final files = _cacheDir.listSync().where((f) => 
-      f.path.contains(_imageCachePrefix) || f.path.contains(_thumbnailCachePrefix)
+    final files = _cacheDir.listSync().where((f) =>
+      f.path.contains(_imageCachePrefix) || _isThumbnailCacheFile(f.path)
     );
     for (final file in files) {
       await file.delete();
@@ -386,14 +401,30 @@ class CacheService {
   }
 }
 
-/// 在独立 Isolate 中解码原图并缩放生成缩略图 JPEG。
+/// 是否为动画图像格式。这些格式多为调色板 + 透明像素，
+/// 直接走「解码原图 → 缩放 → encodeJpg」会因 JPEG 无 alpha 通道且色度二次
+/// 采样，出现透明区变黑、纯色块边缘渗出绿/紫色块等颜色失真。
+bool _isAnimatedPath(String imagePath) {
+  final lower = imagePath.toLowerCase();
+  return lower.endsWith('.gif') || lower.endsWith('.apng') || lower.endsWith('.webp');
+}
+
+/// 在独立 Isolate 中解码原图并缩放生成缩略图。
 ///
 /// 必须为顶层函数（不可捕获实例状态），供 [Isolate.run] 调用。
 /// 按原始宽高比缩放到 [thumbnailSize] 以内、不补齐成正方形，
 /// 避免 copyResize 的 maintainAspect 产生上下黑边。
+/// [animated] 为真时只取首帧并编码为 PNG（保留调色板原色与 alpha，规避
+/// JPEG 颜色失真），同时避免网格内动图持续出帧空耗 CPU。
 /// 解码失败返回空列表，由调用方回退原图。
-Uint8List _generateThumbnailInIsolate(Uint8List originalBytes, int thumbnailSize) {
-  final image = img.decodeImage(originalBytes);
+Uint8List _generateThumbnailInIsolate(
+  Uint8List originalBytes,
+  int thumbnailSize, {
+  bool animated = false,
+}) {
+  final image = animated
+      ? img.decodeImage(originalBytes, frame: 0)
+      : img.decodeImage(originalBytes);
   if (image == null) return Uint8List(0);
 
   final srcW = image.width;
@@ -414,5 +445,7 @@ Uint8List _generateThumbnailInIsolate(Uint8List originalBytes, int thumbnailSize
     height: targetH,
     interpolation: img.Interpolation.average,
   );
-  return Uint8List.fromList(img.encodeJpg(thumbnail, quality: 70));
+  return Uint8List.fromList(
+    animated ? img.encodePng(thumbnail) : img.encodeJpg(thumbnail, quality: 70),
+  );
 }

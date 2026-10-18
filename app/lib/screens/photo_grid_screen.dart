@@ -1,13 +1,17 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
+import 'package:photo_manager/photo_manager.dart';
+import 'package:share_plus/share_plus.dart';
 import '../models/models.dart';
 import '../providers/album_provider.dart';
+import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
 import '../services/smb_service.dart';
+import '../services/photo_service.dart';
 import '../services/local_storage_service.dart';
 import '../utils/mipix_theme.dart';
 import '../widgets/animations.dart';
@@ -15,6 +19,10 @@ import '../widgets/glass_container.dart';
 import '../widgets/local_media_thumb.dart';
 import 'photo_viewer_screen.dart';
 
+/// 相册内页：进入某个相册后的照片网格。
+///
+/// 布局对齐小米相册：4 列密排（3px 间距）、左对齐日期分组头、居中标题；
+/// 支持多选（瓦片右下角圆形勾选圈 + 分组头「全选」胶囊）。
 class PhotoGridScreen extends ConsumerStatefulWidget {
   final String albumId;
   final String albumName;
@@ -36,8 +44,25 @@ class PhotoGridScreen extends ConsumerStatefulWidget {
 }
 
 class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
+  /// 设为封面场景下的单选（按文件名）。
   String? _selectedPhotoName;
+
+  /// 普通浏览场景下的多选状态：选中的 [MediaItem.id] 集合。
+  bool _multiSelect = false;
+  final Set<String> _selected = {};
+
+  /// 本次动态刷新相对上次新增的照片 id：只让这些瓦片播放入场动画。
+  Set<String> _newIds = {};
+
   final ScrollController _scrollController = ScrollController();
+
+  /// 4 列密排，与小米相册一致。
+  static const SliverGridDelegateWithFixedCrossAxisCount _gridDelegate =
+      SliverGridDelegateWithFixedCrossAxisCount(
+    crossAxisCount: 4,
+    crossAxisSpacing: 3,
+    mainAxisSpacing: 3,
+  );
 
   @override
   void initState() {
@@ -63,42 +88,240 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   void _loadMore() {
     if (!widget.isLocal) {
       final path = ref.read(smbCurrentPathProvider);
-      ref.read(smbItemsPagedProvider((serverId: widget.albumId, path: path)).notifier).loadMore();
+      ref
+          .read(smbItemsPagedProvider((serverId: widget.albumId, path: path))
+              .notifier)
+          .loadMore();
     }
   }
+
+  /// 刷新当前相册内容（返回查看器删除照片后也会调用）。
+  void _refresh() {
+    if (widget.isLocal) {
+      ref.invalidate(albumItemsProvider(widget.albumId));
+    } else {
+      final path = ref.read(smbCurrentPathProvider);
+      ref
+          .read(smbItemsPagedProvider((serverId: widget.albumId, path: path))
+              .notifier)
+          .load();
+    }
+  }
+
+  List<MediaItem> _localItems() =>
+      ref.read(albumItemsProvider(widget.albumId)).valueOrNull ??
+      const <MediaItem>[];
+
+  List<MediaItem> _remoteItems() {
+    final path = ref.read(smbCurrentPathProvider);
+    return ref
+            .read(smbItemsPagedProvider((serverId: widget.albumId, path: path)))
+            .valueOrNull
+            ?.items ??
+        const <MediaItem>[];
+  }
+
+  List<MediaItem> _allItems() => widget.isLocal ? _localItems() : _remoteItems();
+
+  void _exitMultiSelect() {
+    setState(() {
+      _multiSelect = false;
+      _selected.clear();
+    });
+  }
+
+  void _selectAll() {
+    final items = _allItems();
+    setState(() {
+      if (items.isNotEmpty && _selected.length == items.length) {
+        _selected.clear();
+      } else {
+        _selected
+          ..clear()
+          ..addAll(items.map((e) => e.id));
+      }
+    });
+  }
+
+  void _toggleGroupSelection(List<MediaItem> group) {
+    final ids = group.map((e) => e.id).toSet();
+    final allSelected = ids.every(_selected.contains);
+    setState(() {
+      if (allSelected) {
+        _selected.removeAll(ids);
+      } else {
+        _selected.addAll(ids);
+      }
+    });
+  }
+
+  void _enterMultiSelect(String id) {
+    setState(() {
+      _multiSelect = true;
+      _selected.add(id);
+    });
+    HapticFeedback.mediumImpact();
+  }
+
+  void _toggleSelect(String id) {
+    setState(() {
+      if (_selected.contains(id)) {
+        _selected.remove(id);
+      } else {
+        _selected.add(id);
+      }
+    });
+    HapticFeedback.lightImpact();
+  }
+
+  void _openViewer(List<MediaItem> items, MediaItem item,
+      {required bool isRemote}) {
+    final index = items.indexWhere((e) => e.id == item.id);
+    Navigator.push(
+      context,
+      PageFadeTransition(
+        child: PhotoViewerScreen(
+          photos: items,
+          initialIndex: index < 0 ? 0 : index,
+          isRemote: isRemote,
+          serverId: isRemote ? widget.albumId : null,
+        ),
+      ),
+    ).then((_) {
+      if (mounted) _refresh();
+    });
+  }
+
+  void _notSupported(String name) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('$name 暂不支持')));
+  }
+
+  // ---------------------------------------------------------------------------
+  // 顶栏
+  // ---------------------------------------------------------------------------
+
+  PreferredSizeWidget _buildAppBar(MiPixPalette palette, bool multi) {
+    if (multi) {
+      return AppBar(
+        backgroundColor: palette.background,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        centerTitle: true,
+        leading: IconButton(
+          icon: Icon(Icons.close, color: palette.textPrimary),
+          onPressed: _exitMultiSelect,
+        ),
+        title: Text(
+          '已选择 ${_selected.length} 项',
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+            color: palette.textPrimary,
+          ),
+        ),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.select_all, color: palette.textPrimary),
+            onPressed: _selectAll,
+            tooltip: '全选',
+          ),
+        ],
+      );
+    }
+    return AppBar(
+      backgroundColor: palette.background,
+      elevation: 0,
+      scrolledUnderElevation: 0,
+      centerTitle: true,
+      title: Text(
+        widget.albumName,
+        style: TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+          color: palette.textPrimary,
+        ),
+      ),
+      iconTheme: IconThemeData(color: palette.textPrimary),
+      actions: widget.isSettingCover
+          ? null
+          : [
+              PopupMenuButton<String>(
+                icon: Icon(Icons.more_vert, color: palette.textPrimary),
+                onSelected: (v) {
+                  if (v == 'select') {
+                    setState(() => _multiSelect = true);
+                  } else {
+                    _refresh();
+                  }
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'select', child: Text('选择')),
+                  PopupMenuItem(value: 'refresh', child: Text('刷新')),
+                ],
+              ),
+            ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 页面构建
+  // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
     if (widget.isLocal) {
+      // 系统媒体库变化（如本相册内新增截图）时自动刷新，无需手动刷新。
+      ref.listen(mediaChangeTickProvider, (_, __) {
+        ref.invalidate(albumItemsProvider(widget.albumId));
+      });
+      // 记录本次刷新增的照片 id，只让新瓦片播放入场动画。
+      ref.listen<AsyncValue<List<MediaItem>>>(
+        albumItemsProvider(widget.albumId),
+        (prev, next) {
+          final prevItems = prev?.valueOrNull;
+          final nextItems = next.valueOrNull;
+          if (prevItems == null || nextItems == null) return;
+          final prevIds = prevItems.map((e) => e.id).toSet();
+          final added = nextItems
+              .where((e) => !prevIds.contains(e.id))
+              .map((e) => e.id)
+              .toSet();
+          if (added.isEmpty) return;
+          setState(() => _newIds = added);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && _newIds.isNotEmpty) {
+              setState(() => _newIds = {});
+            }
+          });
+        },
+      );
       return _buildLocalGrid();
     } else {
       return _buildRemoteGrid();
     }
   }
 
+  /// 依据瓦片的 [ValueKey]（照片 id）找到它在分组内的新下标，
+  /// 使 Sliver 在列表头部插入新照片时搬移已有瓦片而非重建它们。
+  int? _indexByKey(List<MediaItem> items, Key key) {
+    if (key is! ValueKey<String>) return null;
+    final i = items.indexWhere((p) => p.id == key.value);
+    return i < 0 ? null : i;
+  }
+
   Widget _buildLocalGrid() {
     final palette = MiPixPalette.of(context);
     final itemsAsync = ref.watch(albumItemsProvider(widget.albumId));
     final uploading = ref.watch(uploadingPathsProvider);
+    final coverMode = widget.isSettingCover;
+    final multi = _multiSelect && !coverMode;
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: MiPixTheme.overlayStyle(context),
       child: Scaffold(
         backgroundColor: palette.background,
-        appBar: AppBar(
-          backgroundColor: palette.background,
-          elevation: 0,
-          scrolledUnderElevation: 0,
-          title: Text(
-            widget.albumName,
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: palette.textPrimary,
-            ),
-          ),
-          iconTheme: IconThemeData(color: palette.textPrimary),
-        ),
+        appBar: _buildAppBar(palette, multi),
         body: itemsAsync.when(
           loading: () => Center(
             child: CircularProgressIndicator(color: palette.accent),
@@ -109,120 +332,96 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
           ),
           data: (items) {
             if (items.isEmpty) {
-              return EmptyStateWidget(
+              return const EmptyStateWidget(
                 icon: Icons.photo_library_outlined,
                 title: '暂无照片',
                 subtitle: '该相册里还没有可显示的内容',
               );
             }
-            return GridView.builder(
+            final grouped = _groupByDate(items);
+            return CustomScrollView(
               controller: _scrollController,
-              padding: const EdgeInsets.fromLTRB(2, 2, 2, 24),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                crossAxisSpacing: 2,
-                mainAxisSpacing: 2,
-              ),
-              itemCount: items.length,
-              itemBuilder: (context, index) {
-                final item = items[index];
-                final isSelected = _selectedPhotoName == item.name;
-                return BounceTap(
-                  onTap: widget.isSettingCover
-                      ? () {
-                          setState(() {
-                            if (isSelected) {
-                              _selectedPhotoName = null;
-                            } else {
-                              _selectedPhotoName = item.name;
-                            }
-                          });
-                        }
-                      : () {
-                          Navigator.push(
-                            context,
-                            PageFadeTransition(
-                              child: PhotoViewerScreen(
-                                photos: items,
-                                initialIndex: index,
-                                isRemote: false,
-                              ),
-                            ),
-                          );
-                        },
-                  child: RepaintBoundary(
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        DecoratedBox(
-                          decoration: BoxDecoration(
-                            border: isSelected
-                                ? Border.all(color: palette.accent, width: 3)
-                                : null,
-                          ),
-                          child: LocalMediaThumb(item: item),
-                        ),
-                        // 上传锁命中时显示「上传中」。
-                        if (uploading.contains(item.path))
-                          Positioned(
-                            right: 3,
-                            bottom: 3,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 4,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withValues(alpha: 0.45),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: const Text(
-                                '上传中',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  height: 1.1,
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
+              slivers: [
+                const SliverToBoxAdapter(child: SizedBox(height: 4)),
+                for (final entry in grouped.entries) ...[
+                  SliverToBoxAdapter(
+                    child: _GroupHeader(
+                      text: _formatDateHeader(entry.key),
+                      multiSelect: multi,
+                      allSelected: entry.value
+                          .every((it) => _selected.contains(it.id)),
+                      onToggleAll: () => _toggleGroupSelection(entry.value),
                     ),
                   ),
-                );
-              },
+                  SliverGrid(
+                    gridDelegate: _gridDelegate,
+                    delegate: SliverChildBuilderDelegate(
+                      (context, index) {
+                        final item = entry.value[index];
+                        final selected = coverMode
+                            ? _selectedPhotoName == item.name
+                            : _selected.contains(item.id);
+                        return AppearIn(
+                          key: ValueKey(item.id),
+                          animate: _newIds.contains(item.id),
+                          child: _buildTile(
+                            isRemote: false,
+                            item: item,
+                            selected: selected,
+                            multiSelect: multi,
+                            coverBorder: coverMode,
+                            badge: (!multi && uploading.contains(item.path))
+                                ? _uploadBadge()
+                                : null,
+                            onTap: () {
+                              if (coverMode) {
+                                setState(() {
+                                  _selectedPhotoName =
+                                      selected ? null : item.name;
+                                });
+                                return;
+                              }
+                              if (multi) {
+                                _toggleSelect(item.id);
+                                return;
+                              }
+                              _openViewer(items, item, isRemote: false);
+                            },
+                            onLongPress: coverMode
+                                ? null
+                                : () {
+                                    if (!_multiSelect) {
+                                      _enterMultiSelect(item.id);
+                                    }
+                                  },
+                          ),
+                        );
+                      },
+                      findChildIndexCallback: (key) =>
+                          _indexByKey(entry.value, key),
+                      childCount: entry.value.length,
+                    ),
+                  ),
+                ],
+                const SliverPadding(padding: EdgeInsets.only(bottom: 24)),
+              ],
             );
           },
         ),
-        floatingActionButton: widget.isSettingCover && _selectedPhotoName != null
-            ? FloatingActionButton.extended(
-                onPressed: () async {
-                  if (widget.albumPath == null) return;
-                  try {
-                    final smbService = SmbService();
-                    final coverPath = widget.albumPath!.isEmpty
-                        ? _selectedPhotoName!
-                        : '${widget.albumPath}/$_selectedPhotoName!';
-                    await smbService.setCustomCover(
-                      widget.albumId,
-                      widget.albumPath!,
-                      coverPath,
-                    );
-                    if (mounted) {
-                      Navigator.pop(context, coverPath);
-                    }
-                  } catch (e) {
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('设置失败: $e'), backgroundColor: Colors.red),
-                      );
-                    }
-                  }
-                },
-                icon: const Icon(Icons.check),
-                label: const Text('设为封面'),
-                backgroundColor: palette.accent,
+        bottomSheet: multi && _selected.isNotEmpty
+            ? _SelectionActionBar(
+                actions: [
+                  _SelectionAction(Icons.ios_share, '发送', _shareSelected),
+                  _SelectionAction(
+                      Icons.auto_awesome, '创作', () => _notSupported('创作')),
+                  _SelectionAction(Icons.add_box_outlined, '添加到',
+                      () => _notSupported('添加到')),
+                  _SelectionAction(Icons.delete_outline, '删除', _deleteSelected),
+                ],
               )
+            : null,
+        floatingActionButton: coverMode && _selectedPhotoName != null
+            ? _buildCoverFab(palette)
             : null,
       ),
     );
@@ -231,26 +430,15 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   Widget _buildRemoteGrid() {
     final palette = MiPixPalette.of(context);
     final path = ref.watch(smbCurrentPathProvider);
-    final pagedAsync = ref.watch(smbItemsPagedProvider((serverId: widget.albumId, path: path)));
+    final pagedAsync =
+        ref.watch(smbItemsPagedProvider((serverId: widget.albumId, path: path)));
+    final multi = _multiSelect;
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: MiPixTheme.overlayStyle(context),
       child: Scaffold(
         backgroundColor: palette.background,
-        appBar: AppBar(
-          backgroundColor: palette.background,
-          elevation: 0,
-          scrolledUnderElevation: 0,
-          title: Text(
-            widget.albumName,
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: palette.textPrimary,
-            ),
-          ),
-          iconTheme: IconThemeData(color: palette.textPrimary),
-        ),
+        appBar: _buildAppBar(palette, multi),
         body: pagedAsync.when(
           loading: () {
             final progress = ref.watch(
@@ -265,12 +453,13 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
           data: (page) {
             final items = page.items;
             if (items.isEmpty) {
-              return EmptyStateWidget(
+              return const EmptyStateWidget(
                 icon: Icons.photo_library_outlined,
                 title: '暂无照片',
                 subtitle: '该相册里还没有可显示的内容',
               );
             }
+            final grouped = _groupByDate(items);
             return NotificationListener<ScrollNotification>(
               onNotification: (notification) {
                 if (notification is ScrollEndNotification) {
@@ -281,105 +470,307 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
                 }
                 return false;
               },
-              child: GridView.builder(
+              child: CustomScrollView(
                 controller: _scrollController,
-                padding: const EdgeInsets.fromLTRB(2, 2, 2, 24),
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 3,
-                  crossAxisSpacing: 2,
-                  mainAxisSpacing: 2,
-                ),
-                itemCount: items.length + (page.hasMore ? 1 : 0),
-                itemBuilder: (context, index) {
-                  if (index >= items.length) {
-                    return Center(
+                slivers: [
+                  const SliverToBoxAdapter(child: SizedBox(height: 4)),
+                  for (final entry in grouped.entries) ...[
+                    SliverToBoxAdapter(
+                      child: _GroupHeader(
+                        text: _formatDateHeader(entry.key),
+                        multiSelect: multi,
+                        allSelected: entry.value
+                            .every((it) => _selected.contains(it.id)),
+                        onToggleAll: () => _toggleGroupSelection(entry.value),
+                      ),
+                    ),
+                    SliverGrid(
+                      gridDelegate: _gridDelegate,
+                      delegate: SliverChildBuilderDelegate(
+                        (context, index) {
+                          final item = entry.value[index];
+                          final selected = _selected.contains(item.id);
+                          return _buildTile(
+                            isRemote: true,
+                            item: item,
+                            selected: selected,
+                            multiSelect: multi,
+                            onTap: () {
+                              if (multi) {
+                                _toggleSelect(item.id);
+                                return;
+                              }
+                              _openViewer(items, item, isRemote: true);
+                            },
+                            onLongPress: () {
+                              if (!_multiSelect) _enterMultiSelect(item.id);
+                            },
+                          );
+                        },
+                        childCount: entry.value.length,
+                      ),
+                    ),
+                  ],
+                  if (page.hasMore)
+                    SliverToBoxAdapter(
                       child: Padding(
                         padding: const EdgeInsets.all(16),
-                        child: CircularProgressIndicator(
-                          color: palette.accent,
-                          strokeWidth: 2,
-                        ),
-                      ),
-                    );
-                  }
-                  final item = items[index];
-                  final isSelected = _selectedPhotoName == item.name;
-                  return BounceTap(
-                    onTap: widget.isSettingCover
-                        ? () {
-                            setState(() {
-                              if (isSelected) {
-                                _selectedPhotoName = null;
-                              } else {
-                                _selectedPhotoName = item.name;
-                              }
-                            });
-                          }
-                        : () {
-                            Navigator.push(
-                              context,
-                              PageFadeTransition(
-                                child: PhotoViewerScreen(
-                                  photos: items,
-                                  initialIndex: index,
-                                  isRemote: true,
-                                  serverId: widget.albumId,
-                                ),
-                              ),
-                            );
-                          },
-                    child: RepaintBoundary(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          border: isSelected
-                              ? Border.all(
-                                  color: palette.accent, width: 3)
-                              : null,
-                        ),
-                        child: _RemoteImage(
-                          serverId: widget.albumId,
-                          remotePath: item.path,
+                        child: Center(
+                          child: CircularProgressIndicator(
+                            color: palette.accent,
+                            strokeWidth: 2,
+                          ),
                         ),
                       ),
                     ),
-                  );
-                },
+                  const SliverPadding(padding: EdgeInsets.only(bottom: 24)),
+                ],
               ),
             );
           },
         ),
-      floatingActionButton: widget.isSettingCover && _selectedPhotoName != null
-          ? FloatingActionButton.extended(
-              onPressed: () async {
-                if (widget.albumPath == null) return;
-                try {
-                  final smbService = SmbService();
-                  final coverPath = widget.albumPath!.isEmpty
-                      ? _selectedPhotoName!
-                      : '${widget.albumPath}/$_selectedPhotoName!';
-                  await smbService.setCustomCover(
-                    widget.albumId,
-                    widget.albumPath!,
-                    coverPath,
-                  );
-                  if (mounted) {
-                    Navigator.pop(context, coverPath);
-                  }
-                } catch (e) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('设置失败: $e'), backgroundColor: Colors.red),
-                    );
-                  }
-                }
-              },
-              icon: const Icon(Icons.check),
-              label: const Text('设为封面'),
-              backgroundColor: palette.accent,
-            )
-          : null,
+        bottomSheet: multi && _selected.isNotEmpty
+            ? _SelectionActionBar(
+                actions: [
+                  _SelectionAction(Icons.download_outlined, '下载', _downloadSelected),
+                ],
+              )
+            : null,
       ),
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 选中态操作
+  // ---------------------------------------------------------------------------
+
+  Future<void> _shareSelected() async {
+    final selected =
+        _localItems().where((it) => _selected.contains(it.id)).toList();
+    if (selected.isEmpty) return;
+    try {
+      await Share.shareXFiles(selected.map((e) => XFile(e.path)).toList());
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('发送失败: $e')));
+      }
+    }
+  }
+
+  Future<void> _deleteSelected() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ids = _selected.toList();
+    if (ids.isEmpty) return;
+    try {
+      final deleted = await PhotoManager.editor.deleteWithIds(ids);
+      if (deleted.isEmpty) return;
+      if (mounted) {
+        setState(() {
+          _multiSelect = false;
+          _selected.clear();
+        });
+      }
+      _refresh();
+      messenger.showSnackBar(SnackBar(content: Text('已删除 ${deleted.length} 项')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('删除失败: $e')));
+    }
+  }
+
+  Future<void> _downloadSelected() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final selected =
+        _remoteItems().where((it) => _selected.contains(it.id)).toList();
+    if (selected.isEmpty) return;
+    messenger.showSnackBar(
+        SnackBar(content: Text('开始下载 ${selected.length} 项…')));
+    var ok = 0;
+    var fail = 0;
+    try {
+      final servers = await LocalStorageService().getSmbServers();
+      final server = servers.firstWhere((s) => s.id == widget.albumId);
+      for (final item in selected) {
+        try {
+          final data = await SmbService().readFile(server, item.path);
+          if (data.isEmpty) throw Exception('文件内容为空');
+          await PhotoService.saveBytesToGallery(
+            data,
+            filename: item.name,
+            relativePath: 'Pictures/MiPix',
+          );
+          ok++;
+        } catch (_) {
+          fail++;
+        }
+      }
+    } catch (_) {
+      fail = selected.length;
+    }
+    if (mounted) {
+      setState(() {
+        _multiSelect = false;
+        _selected.clear();
+      });
+    }
+    messenger.showSnackBar(SnackBar(
+      content: Text(
+          fail == 0 ? '已下载 $ok 项到系统相册' : '下载完成：成功 $ok，失败 $fail'),
+    ));
+  }
+
+  // ---------------------------------------------------------------------------
+  // 网格单元与公共部件
+  // ---------------------------------------------------------------------------
+
+  Widget _buildTile({
+    required bool isRemote,
+    required MediaItem item,
+    required bool selected,
+    required bool multiSelect,
+    Widget? badge,
+    bool coverBorder = false,
+    required VoidCallback onTap,
+    VoidCallback? onLongPress,
+  }) {
+    final palette = MiPixPalette.of(context);
+    return BounceTap(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: RepaintBoundary(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (isRemote)
+              _RemoteImage(serverId: widget.albumId, remotePath: item.path)
+            else
+              LocalMediaThumb(item: item),
+            // 设封面场景：选中瓦片加蓝色描边。
+            if (coverBorder && selected)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: palette.accent, width: 3),
+                    ),
+                  ),
+                ),
+              ),
+            if (badge != null) Positioned(right: 3, bottom: 3, child: badge),
+            if (multiSelect) _selectionOverlay(selected, palette),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _selectionOverlay(bool selected, MiPixPalette palette) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Stack(
+          children: [
+            if (selected)
+              Positioned.fill(
+                child: Container(color: Colors.black.withValues(alpha: 0.32)),
+              ),
+            Positioned(
+              right: 5,
+              bottom: 5,
+              child: selected
+                  ? Container(
+                      width: 22,
+                      height: 22,
+                      decoration: BoxDecoration(
+                        color: palette.accent,
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.check,
+                          size: 15, color: Colors.white),
+                    )
+                  : Container(
+                      width: 22,
+                      height: 22,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.9),
+                          width: 1.6,
+                        ),
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _uploadBadge() => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.45),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: const Text(
+          '上传中',
+          style: TextStyle(fontSize: 10, height: 1.1, color: Colors.white),
+        ),
+      );
+
+  Widget _buildCoverFab(MiPixPalette palette) {
+    return FloatingActionButton.extended(
+      onPressed: () async {
+        if (widget.albumPath == null) return;
+        try {
+          final smbService = SmbService();
+          final coverPath = widget.albumPath!.isEmpty
+              ? _selectedPhotoName!
+              : '${widget.albumPath}/$_selectedPhotoName!';
+          await smbService.setCustomCover(
+            widget.albumId,
+            widget.albumPath!,
+            coverPath,
+          );
+          if (mounted) {
+            Navigator.pop(context, coverPath);
+          }
+        } catch (e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('设置失败: $e'), backgroundColor: Colors.red),
+            );
+          }
+        }
+      },
+      icon: const Icon(Icons.check),
+      label: const Text('设为封面'),
+      backgroundColor: palette.accent,
+    );
+  }
+
+  Map<DateTime, List<MediaItem>> _groupByDate(List<MediaItem> photos) {
+    final map = <DateTime, List<MediaItem>>{};
+    for (final photo in photos) {
+      final date = DateTime(
+        photo.modifiedAt.year,
+        photo.modifiedAt.month,
+        photo.modifiedAt.day,
+      );
+      map.putIfAbsent(date, () => []).add(photo);
+    }
+    return Map.fromEntries(
+      map.entries.toList()..sort((a, b) => b.key.compareTo(a.key)),
+    );
+  }
+
+  String _formatDateHeader(DateTime date) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final yesterday = today.subtract(const Duration(days: 1));
+    if (date == today) return '今天';
+    if (date == yesterday) return '昨天';
+    // 与小米相册一致：只显示「M月d日」，不带年份与星期。
+    return DateFormat('M月d日').format(date);
   }
 
   /// 远程相册首次进入需全量探测 EXIF 拍摄时间（大相册耗时较久），
@@ -417,6 +808,125 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
               style: TextStyle(fontSize: 13, color: palette.textSecondary),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 日期分组头：左对齐日期文本，多选时右侧带「全选」胶囊（对齐小米相册）。
+class _GroupHeader extends StatelessWidget {
+  final String text;
+  final bool multiSelect;
+  final bool allSelected;
+  final VoidCallback? onToggleAll;
+
+  const _GroupHeader({
+    required this.text,
+    required this.multiSelect,
+    this.allSelected = false,
+    this.onToggleAll,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 12, 8),
+      child: Row(
+        children: [
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+              color: palette.textPrimary,
+              height: 1.2,
+            ),
+          ),
+          const Spacer(),
+          if (multiSelect)
+            GestureDetector(
+              onTap: onToggleAll,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                decoration: BoxDecoration(
+                  color: palette.fill,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Text(
+                  allSelected ? '取消' : '全选',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: palette.textSecondary,
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 单个选中操作。
+class _SelectionAction {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  const _SelectionAction(this.icon, this.label, this.onTap);
+}
+
+/// 多选底部操作栏：图标在上、文字在下（对齐小米相册）。
+class _SelectionActionBar extends StatelessWidget {
+  final List<_SelectionAction> actions;
+
+  const _SelectionActionBar({required this.actions});
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = MiPixPalette.of(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: palette.background,
+        border: Border(top: BorderSide(color: palette.divider)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              for (final action in actions)
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: action.onTap,
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(action.icon, size: 24, color: palette.textPrimary),
+                        const SizedBox(height: 6),
+                        Text(
+                          action.label,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w500,
+                            color: palette.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -545,7 +1055,8 @@ class _ImageLoadingController {
     try {
       // 网格只需缩略图，避免下载整张原图。
       return await smbService.readThumbnail(server, remotePath);
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[smb] thumbLoad FAIL path=$remotePath ${e.runtimeType} $e');
       return Uint8List(0);
     }
   }

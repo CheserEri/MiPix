@@ -66,24 +66,39 @@ abstract class SmbConnect {
     Function(SmbConnect)? onDisconnect,
   }) async {
     SmbTransport transport = SmbTransport(config, host);
-    if (!await transport.ensureConnected()) {
-      throw "Can't connect to $host";
-    }
-    SmbConnect connect;
-    if (!transport.isSMB2()) {
-      connect = Smb1Connect(config, transport);
-    } else {
-      connect = Smb2Connect(config, transport);
-    }
-    final session = connect.initSession();
-    await session.setup();
+    // 建连（协商 / 会话建立）任一阶段失败都必须关闭底层 socket 再上抛。
+    //
+    // 否则每次失败的 connectAuth 都会泄漏一条已 ESTABLISHED 的 TCP 连接：
+    // 服务端（Win7 等）会持续计数，几次抖动后即报
+    // "No more connections can be made to this remote computer"，此后连正常
+    // 读取也会因重试不断新建连接而雪崩。实测曾累积到 420 条泄漏连接。
+    try {
+      if (!await transport.ensureConnected()) {
+        throw "Can't connect to $host";
+      }
+      SmbConnect connect;
+      if (!transport.isSMB2()) {
+        connect = Smb1Connect(config, transport);
+      } else {
+        connect = Smb2Connect(config, transport);
+      }
+      final session = connect.initSession();
+      await session.setup();
 
-    if (onDisconnect != null) {
-      transport.onDisconnect = (_) {
-        onDisconnect.call(connect);
-      };
+      if (onDisconnect != null) {
+        transport.onDisconnect = (_) {
+          onDisconnect.call(connect);
+        };
+      }
+      return connect;
+    } catch (_) {
+      try {
+        await transport.close();
+      } catch (_) {
+        // socket 尚未建立时 close 可能抛 LateInitializationError，忽略即可。
+      }
+      rethrow;
     }
-    return connect;
   }
 
   static Future<SmbConnect> connectAuth({

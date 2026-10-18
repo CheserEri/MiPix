@@ -46,10 +46,45 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     super.dispose();
   }
 
+  /// 依据瓦片的 [ValueKey]（照片 id）找到它在分组内的新下标。
+  ///
+  /// 列表头部插入新照片时，Sliver 借助该回调「搬移」已有瓦片而不是重建，
+  /// 于是只有真正新增的瓦片播放入场动画，其余瓦片保持静止不闪跳。
+  int? _indexByKey(List<MediaItem> items, Key key) {
+    if (key is! ValueKey<String>) return null;
+    final i = items.indexWhere((p) => p.id == key.value);
+    return i < 0 ? null : i;
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context); // AutomaticKeepAliveClientMixin 要求先调用
     final palette = MiPixPalette.of(context);
+
+    // 系统媒体库变化（如截图 / 拍照 / 下载图片）时自动刷新，无需重开或手动刷新。
+    ref.listen(mediaChangeTickProvider, (_, __) {
+      ref.read(localPhotosProvider.notifier).load(fromChange: true);
+    });
+
+    // 列表刷新后在「非顶部」被插入新内容时补偿滚动偏移，使当前可视内容保持
+    // 不动；位于顶部时不补偿，让新照片自然地出现在顶部。
+    ref.listen<AsyncValue<List<MediaItem>>>(localPhotosProvider, (prev, next) {
+      final pos =
+          _scrollController.hasClients ? _scrollController.position : null;
+      if (pos == null || pos.pixels <= 1) return;
+      final oldExtent = pos.maxScrollExtent;
+      final oldOffset = pos.pixels;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) return;
+        final p = _scrollController.position;
+        final delta = p.maxScrollExtent - oldExtent;
+        if (delta.abs() < 0.5) return;
+        final target =
+            (oldOffset + delta).clamp(0.0, p.maxScrollExtent).toDouble();
+        if ((target - p.pixels).abs() > 0.5) _scrollController.jumpTo(target);
+      });
+    });
+
     final photosAsync = ref.watch(localPhotosProvider);
     final access = ref.watch(localAccessProvider).valueOrNull;
     final isMultiSelect = ref.watch(isMultiSelectProvider);
@@ -95,6 +130,17 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
               style: TextStyle(color: palette.textSecondary)),
         ),
         data: (photos) {
+          // 本次变更刷新增的照片：新瓦片播放一次入场动画后立即清空，
+          // 避免滚动重建时重复播放。
+          final newIds = ref.watch(newlyAddedPhotoIdsProvider);
+          if (newIds.isNotEmpty) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted &&
+                  ref.read(newlyAddedPhotoIdsProvider).isNotEmpty) {
+                ref.read(newlyAddedPhotoIdsProvider.notifier).state = {};
+              }
+            });
+          }
           if (access != null && !access.canRead) {
             return EmptyStateWidget(
               icon: Icons.lock_outline,
@@ -148,29 +194,35 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                       (context, index) {
                         final photo = entry.value[index];
                         final isSelected = selected.contains(photo.id);
-                        return _PhotoTile(
-                          photo: photo,
-                          isMultiSelect: isMultiSelect,
-                          isSelected: isSelected,
-                          isSynced: synced.contains(photo.path),
-                          isUploading: uploading.contains(photo.path),
-                          onTap: () {
-                            if (isMultiSelect) {
-                              togglePhotoSelection(ref, photo.id);
-                              HapticFeedback.lightImpact();
-                            } else {
-                              _openViewer(photos, photo);
-                            }
-                          },
-                          onLongPress: () {
-                            if (!isMultiSelect) {
-                              toggleMultiSelect(ref);
-                              togglePhotoSelection(ref, photo.id);
-                              HapticFeedback.mediumImpact();
-                            }
-                          },
+                        return AppearIn(
+                          key: ValueKey(photo.id),
+                          animate: newIds.contains(photo.id),
+                          child: _PhotoTile(
+                            photo: photo,
+                            isMultiSelect: isMultiSelect,
+                            isSelected: isSelected,
+                            isSynced: synced.contains(photo.path),
+                            isUploading: uploading.contains(photo.path),
+                            onTap: () {
+                              if (isMultiSelect) {
+                                togglePhotoSelection(ref, photo.id);
+                                HapticFeedback.lightImpact();
+                              } else {
+                                _openViewer(photos, photo);
+                              }
+                            },
+                            onLongPress: () {
+                              if (!isMultiSelect) {
+                                toggleMultiSelect(ref);
+                                togglePhotoSelection(ref, photo.id);
+                                HapticFeedback.mediumImpact();
+                              }
+                            },
+                          ),
                         );
                       },
+                      findChildIndexCallback: (key) =>
+                          _indexByKey(entry.value, key),
                       childCount: entry.value.length,
                     ),
                   ),
@@ -230,7 +282,10 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
           initialIndex: index,
         ),
       ),
-    );
+    ).then((_) {
+      // 查看器里可能删除了照片，返回后刷新列表。
+      if (mounted) ref.read(localPhotosProvider.notifier).load();
+    });
   }
 
     void _showBackupDialog(List<String> photoIds) {

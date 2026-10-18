@@ -257,9 +257,8 @@ enum TransferStatus { pending, running, paused, done, failed, skipped }
 
 /// 传输任务的当前阶段（与 [TransferStatus] 正交，仅上传流程中有意义）。
 ///
-/// 大文件「上传完成 → NAS 回读校验 → 改名回写」期间上行流量接近零、却可能
-/// 耗时数分钟，若只显示一个合成进度条，用户会误认为传输卡死。分阶段展示
-/// 让校验/收尾阶段有独立文案与「已读/总量、速度、耗时」。
+/// 上传完成后、改名回写前会做一次远端长度比对，这一步走 stat、近似零成本，
+/// 不再回读整份内容重算 SHA-256，因此没有独立的校验阶段。
 enum TransferPhase {
   /// 准备：排队等待，以及上传前的远端清单读取/冲突比对阶段。
   preparing,
@@ -267,13 +266,7 @@ enum TransferPhase {
   /// 正在把本地字节写入远端临时文件。
   uploading,
 
-  /// 校验第一段：在本地计算源文件 SHA-256。
-  localHash,
-
-  /// 校验第二段：从 NAS 回读临时文件计算 SHA-256。
-  verifying,
-
-  /// 校验通过后的收尾：改名到正式文件名、回写拍摄时间。
+  /// 落盘长度比对通过后的收尾：改名到正式文件名、回写拍摄时间。
   finalizing,
 }
 
@@ -292,7 +285,7 @@ class TransferTask {
   final String? errorMessage;
   /// 当前阶段；仅在 [TransferStatus.running] 时有展示意义。
   final TransferPhase phase;
-  /// 当前阶段已处理的字节数（上传阶段等于 [writtenBytes]，回读校验阶段为已读回字节）。
+  /// 当前阶段已处理的字节数（上传阶段等于 [writtenBytes]）。
   final int phaseBytes;
   /// [phase] 的开始时刻，用于界面展示「阶段耗时/速度」。
   final DateTime? phaseStartedAt;

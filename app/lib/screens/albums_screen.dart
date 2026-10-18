@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/album_provider.dart';
 import '../providers/app_provider.dart';
-import '../models/models.dart';import '../providers/smb_provider.dart';
+import '../models/models.dart';import '../providers/photo_provider.dart';
+import '../providers/smb_provider.dart';
 import '../widgets/glass_container.dart';
 import '../widgets/animations.dart';
 import '../widgets/smb_server_switcher.dart';
@@ -37,6 +38,10 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen>
   @override
   Widget build(BuildContext context) {
     super.build(context); // AutomaticKeepAliveClientMixin 要求先调用
+    // 系统媒体库变化（如新增截图）时自动刷新相册列表（封面 / 张数）。
+    ref.listen(mediaChangeTickProvider, (_, __) {
+      ref.read(localLibraryProvider.notifier).load();
+    });
     final palette = MiPixPalette.of(context);
     final localLibrary = ref.watch(localLibraryProvider);
     // 当前生效的服务器：默认服务器已被删除/未设置时回退到第一台。

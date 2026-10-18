@@ -10,7 +10,6 @@ import '../widgets/animations.dart';
 import 'albums_screen.dart';
 import 'photos_screen.dart';
 import 'settings_screen.dart';
-import 'smb_screen.dart';
 import 'transfers_screen.dart';
 
 /// 与小米相册一致：顶部标签栏 + 支持左右滑动切换页面。
@@ -71,6 +70,9 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   @override
   Widget build(BuildContext context) {
+    // 启动系统媒体库变更监听：截图 / 拍照 / 下载图片后，照片与相册会自动刷新，
+    // 无需重开应用或手动刷新。
+    ref.watch(mediaWatcherProvider);
     // 切换服务器时立即对新服务器核对一次备份状态。
     ref.listen(effectiveServerIdProvider, (prev, next) {
       if (next != null && next != prev) _reconcileCurrent();
@@ -157,13 +159,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
       tooltip: '更多',
       onSelected: (value) {
         switch (value) {
-          case 'smb':
-            // 配置 SMB 服务器入口收进「⋮」设置中，不再占用顶部导航栏。
-            Navigator.push(
-              context,
-              PageSlideTransition(child: const SmbScreen()),
-            );
-            break;
           case 'photos':
             ref.read(localPhotosProvider.notifier).load();
             break;
@@ -183,7 +178,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
         }
       },
       itemBuilder: (_) => const [
-        PopupMenuItem(value: 'smb', child: Text('SMB 服务器')),
         PopupMenuItem(value: 'settings', child: Text('设置')),
         PopupMenuItem(value: 'photos', child: Text('刷新照片')),
         PopupMenuItem(value: 'albums', child: Text('刷新相册')),

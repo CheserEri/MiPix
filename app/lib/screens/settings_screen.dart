@@ -1,10 +1,17 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../models/models.dart';
 import '../providers/app_provider.dart';
+import '../providers/smb_provider.dart';
+import '../providers/transfer_provider.dart';
 import '../services/cache_service.dart';
 import '../services/smb_service.dart';
 import '../utils/mipix_theme.dart';
+import 'smb_screen.dart';
 
+/// 设置页：对齐小米相册「设置」——大标题随滚动收起居中、纯列表分行、
+/// 小号灰色分组标题、整行描边分隔线，行内右侧为箭头或开关，不使用图标块与卡片外框。
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
 
@@ -12,130 +19,127 @@ class SettingsScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final themeMode = ref.watch(themeProvider);
     final palette = MiPixPalette.of(context);
+    final servers =
+        ref.watch(smbServersProvider).valueOrNull ?? const <SmbConfig>[];
+    final activeId = ref.watch(effectiveServerIdProvider);
+    SmbConfig? active;
+    for (final s in servers) {
+      if (s.id == activeId) {
+        active = s;
+        break;
+      }
+    }
 
-    return Scaffold(
-      backgroundColor: palette.background,
-      appBar: AppBar(
-        backgroundColor: palette.background,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-        title: Text(
-          '设置',
-          style: TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.w600,
-            color: palette.textPrimary,
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: MiPixTheme.overlayStyle(context),
+      // 小米设置页大标题：展开时大号粗体、滚动后收起并居中变小。
+      // SliverAppBar.large 正是按「展开=headlineMedium / 收起=titleLarge」取字号，
+      // 故此处去掉全局 appBarTheme.titleTextStyle（否则两者同号），
+      // 并把 headlineMedium 覆写为小米风格的 30 号粗体。
+      child: Theme(
+        data: Theme.of(context).copyWith(
+          appBarTheme: AppBarThemeData(
+            backgroundColor: palette.background,
+            surfaceTintColor: Colors.transparent,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+            centerTitle: true,
+            iconTheme: IconThemeData(color: palette.textPrimary),
+            systemOverlayStyle: MiPixTheme.overlayStyle(context),
+          ),
+          textTheme: Theme.of(context).textTheme.copyWith(
+            headlineMedium: TextStyle(
+              fontSize: 30,
+              fontWeight: FontWeight.w700,
+              color: palette.textPrimary,
+            ),
           ),
         ),
-        iconTheme: IconThemeData(color: palette.textPrimary),
-      ),
-      body: CustomScrollView(
-        slivers: [
-          const SliverToBoxAdapter(child: SizedBox(height: 12)),
-          SliverToBoxAdapter(
-            child: _SectionCard(
-              title: '外观',
-              children: [
-                _SettingsTile(
-                  icon: Icons.dark_mode,
-                  iconColor: const Color(0xFF94A3B8),
-                  title: '主题模式',
-                  subtitle: _themeLabel(themeMode),
-                  onTap: () => _showThemePicker(context, ref),
-                  showDivider: false,
+        child: Scaffold(
+          backgroundColor: palette.background,
+          body: CustomScrollView(
+            slivers: [
+              SliverAppBar.large(
+                pinned: true,
+                leading: IconButton(
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: () => Navigator.pop(context),
                 ),
-              ],
-            ),
-          ),
-          const SliverToBoxAdapter(child: SizedBox(height: 16)),
-          SliverToBoxAdapter(
-            child: _SectionCard(
-              title: '存储',
-              children: [
-                const _SettingsTile(
-                  icon: Icons.folder,
-                  iconColor: Color(0xFF60A5FA),
-                  title: '本地相册根目录',
-                  subtitle: '/storage/emulated/0/Pictures',
-                ),
-                const _SettingsTile(
-                  icon: Icons.cloud_download,
-                  iconColor: Color(0xFF34D399),
-                  title: '下载目录',
-                  subtitle: '/storage/emulated/0/Download/MiPix',
-                  showDivider: false,
-                ),
-              ],
-            ),
-          ),
-          const SliverToBoxAdapter(child: SizedBox(height: 16)),
-          const SliverToBoxAdapter(child: _TransferSection()),
-          const SliverToBoxAdapter(child: SizedBox(height: 16)),
-          const SliverToBoxAdapter(child: _CacheSection()),
-          const SliverToBoxAdapter(child: SizedBox(height: 16)),
-          SliverToBoxAdapter(
-            child: _SectionCard(
-              title: '关于',
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 64,
-                        height: 64,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(18),
-                          color: palette.fill,
-                          border: Border.all(color: palette.divider),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.all(8),
-                          child: Image.asset('assets/branding/mipix_logo_ui.png'),
-                        ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '米影相册',
-                              style: TextStyle(
-                                color: palette.textPrimary,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w700,
-                              ),
+                title: const Text('设置'),
+              ),
+              SliverToBoxAdapter(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _Section(
+                      title: '云服务',
+                      first: true,
+                      children: [
+                        _SettingsRow(
+                          title: 'SMB 服务器',
+                          subtitle: _serverSubtitle(servers, active),
+                          showDivider: false,
+                          onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const SmbScreen(),
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              '版本 1.0.0',
-                              style: TextStyle(
-                                color: palette.textSecondary,
-                                fontSize: 13,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              '纯本地 SMB 相册管理',
-                              style: TextStyle(
-                                color: palette.textSecondary,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
+                      ],
+                    ),
+                    _Section(
+                      title: '外观',
+                      children: [
+                        _SettingsRow(
+                          title: '主题模式',
+                          subtitle: _themeLabel(themeMode),
+                          showDivider: false,
+                          onTap: () => _showThemePicker(context, ref),
+                        ),
+                      ],
+                    ),
+                    _Section(
+                      title: '存储',
+                      children: const [
+                        _SettingsRow(
+                          title: '本地相册根目录',
+                          subtitle: '/storage/emulated/0/Pictures',
+                        ),
+                        _SettingsRow(
+                          title: '下载目录',
+                          subtitle: '/storage/emulated/0/Download/MiPix',
+                          showDivider: false,
+                        ),
+                      ],
+                    ),
+                    const _TransferSection(),
+                    const _CacheSection(),
+                    _Section(
+                      title: '关于',
+                      children: const [
+                        _SettingsRow(
+                          title: '米影相册',
+                          subtitle: '版本 1.0.0 · 纯本地 SMB 相册管理',
+                          showDivider: false,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 32),
+                  ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-          const SliverToBoxAdapter(child: SizedBox(height: 32)),
-        ],
+        ),
       ),
     );
+  }
+
+  String _serverSubtitle(List<SmbConfig> servers, SmbConfig? active) {
+    if (servers.isEmpty) return '未配置，点击添加服务器';
+    final base = '已配置 ${servers.length} 台';
+    return active == null ? base : '$base · 当前 ${active.name}';
   }
 
   String _themeLabel(ThemeMode mode) {
@@ -181,24 +185,26 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ),
             const SizedBox(height: 16),
-            ...ThemeMode.values.map((mode) => ListTile(
-              leading: Icon(
-                mode == ThemeMode.system
-                    ? Icons.brightness_auto
-                    : mode == ThemeMode.light
-                        ? Icons.light_mode
-                        : Icons.dark_mode,
-                color: palette.textSecondary,
-              ),
-              title: Text(
-                _themeLabel(mode),
-                style: TextStyle(color: palette.textPrimary),
-              ),
+            ...ThemeMode.values.map(
+              (mode) => ListTile(
+                leading: Icon(
+                  mode == ThemeMode.system
+                      ? Icons.brightness_auto
+                      : mode == ThemeMode.light
+                      ? Icons.light_mode
+                      : Icons.dark_mode,
+                  color: palette.textSecondary,
+                ),
+                title: Text(
+                  _themeLabel(mode),
+                  style: TextStyle(color: palette.textPrimary),
+                ),
                 onTap: () {
                   ref.read(themeProvider.notifier).setMode(mode);
                   Navigator.pop(ctx);
                 },
-            )),
+              ),
+            ),
             const SizedBox(height: 16),
           ],
         ),
@@ -207,60 +213,51 @@ class SettingsScreen extends ConsumerWidget {
   }
 }
 
-class _SectionCard extends StatelessWidget {
+/// 一个分组：小号灰色标题 + 若干行。
+class _Section extends StatelessWidget {
   final String title;
   final List<Widget> children;
+  final bool first;
 
-  const _SectionCard({required this.title, required this.children});
+  const _Section({
+    required this.title,
+    required this.children,
+    this.first = false,
+  });
 
   @override
   Widget build(BuildContext context) {
     final palette = MiPixPalette.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-            child: Text(
-              title,
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-                color: palette.textSecondary,
-              ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: EdgeInsets.fromLTRB(20, first ? 4 : 22, 20, 6),
+          child: Text(
+            title,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              color: palette.textSecondary,
             ),
           ),
-          Container(
-            decoration: BoxDecoration(
-              color: palette.surface,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: palette.divider),
-            ),
-            child: Column(
-              children: children,
-            ),
-          ),
-        ],
-      ),
+        ),
+        ...children,
+      ],
     );
   }
 }
 
-class _SettingsTile extends StatelessWidget {
-  final IconData icon;
-  final Color iconColor;
+/// 设置行：对齐小米相册——左侧标题（可选灰色副标题），右侧箭头，下方整行分隔线。
+class _SettingsRow extends StatelessWidget {
   final String title;
-  final String subtitle;
+  final String? subtitle;
   final VoidCallback? onTap;
   final bool showDivider;
 
-  const _SettingsTile({
-    required this.icon,
-    required this.iconColor,
+  const _SettingsRow({
     required this.title,
-    required this.subtitle,
+    this.subtitle,
     this.onTap,
     this.showDivider = true,
   });
@@ -271,42 +268,53 @@ class _SettingsTile extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        ListTile(
+        InkWell(
           onTap: onTap,
-          leading: Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              color: iconColor.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: TextStyle(
+                          fontSize: 16.5,
+                          fontWeight: FontWeight.w600,
+                          color: palette.textPrimary,
+                          height: 1.3,
+                        ),
+                      ),
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          subtitle!,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: palette.textSecondary,
+                            height: 1.4,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (onTap != null) ...[
+                  const SizedBox(width: 12),
+                  Icon(
+                    Icons.chevron_right,
+                    color: palette.textSecondary,
+                    size: 20,
+                  ),
+                ],
+              ],
             ),
-            child: Icon(icon, size: 18, color: iconColor),
           ),
-          title: Text(
-            title,
-            style: TextStyle(
-              color: palette.textPrimary,
-              fontSize: 15,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          subtitle: Text(
-            subtitle,
-            style: TextStyle(
-              color: palette.textSecondary,
-              fontSize: 13,
-            ),
-          ),
-          trailing: onTap != null
-              ? Icon(Icons.chevron_right, color: palette.textSecondary, size: 20)
-              : null,
-          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
         ),
         if (showDivider)
-          Padding(
-            padding: const EdgeInsets.only(left: 68),
-            child: Divider(height: 1, thickness: 1, color: palette.divider),
-          ),
+          Divider(height: 1, thickness: 1, indent: 20, color: palette.divider),
       ],
     );
   }
@@ -319,23 +327,24 @@ class _TransferSection extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final concurrency = ref.watch(uploadConcurrencyProvider);
-    return _SectionCard(
+    return _Section(
       title: '传输',
       children: [
-        _SettingsTile(
-          icon: Icons.swap_vert,
-          iconColor: const Color(0xFF38BDF8),
+        _SettingsRow(
           title: '备份并发数',
           subtitle: '同时上传 $concurrency 个文件',
-          onTap: () => _pickConcurrency(context, ref, concurrency),
           showDivider: false,
+          onTap: () => _pickConcurrency(context, ref, concurrency),
         ),
       ],
     );
   }
 
   Future<void> _pickConcurrency(
-      BuildContext context, WidgetRef ref, int current) async {
+    BuildContext context,
+    WidgetRef ref,
+    int current,
+  ) async {
     final palette = MiPixPalette.of(context);
     final chosen = await showModalBottomSheet<int>(
       context: context,
@@ -547,27 +556,22 @@ class _CacheSectionState extends State<_CacheSection> {
 
   @override
   Widget build(BuildContext context) {
-    return _SectionCard(
+    return _Section(
       title: '缓存',
       children: [
-        _SettingsTile(
-          icon: Icons.sd_storage,
-          iconColor: const Color(0xFFF59E0B),
+        _SettingsRow(
           title: '已用缓存',
           subtitle: _size == null ? '统计中…' : _formatBytes(_size!),
         ),
-        _SettingsTile(
-          icon: Icons.straighten,
-          iconColor: const Color(0xFFA78BFA),
+        _SettingsRow(
           title: '缓存上限',
           subtitle: _limit == null ? '统计中…' : _formatBytes(_limit!),
           onTap: _pickLimit,
         ),
-        _SettingsTile(
-          icon: Icons.delete_outline,
-          iconColor: const Color(0xFFF87171),
+        _SettingsRow(
           title: '清除缓存',
           subtitle: _busy ? '正在清理…' : '删除所有已缓存的缩略图与原图',
+          showDivider: false,
           onTap: _busy ? null : _clearCache,
         ),
       ],

@@ -102,8 +102,8 @@ class _SmbServerDialogState extends State<_SmbServerDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              _buildField(_hostCtrl, 'Samba服务器地址', hint: '10.147.20.50'),
-              _buildField(_userCtrl, '用户名', hint: 'naeuta'),
+              _buildField(_hostCtrl, 'Samba服务器地址', hint: '例如 192.168.1.2'),
+              _buildField(_userCtrl, '用户名', hint: '例如 guest'),
               _buildField(
                 _passCtrl,
                 '密码',

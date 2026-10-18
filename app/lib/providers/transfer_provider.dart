@@ -22,15 +22,6 @@ class _PendingUpload {
   /// 任务记录 id，在批量创建任务时才生成。
   String taskId = '';
 
-  /// P2：上传前启动、上传期间并行完成的本地摘要预取；null 表示未预取。
-  Future<String?>? prefetchedHash;
-
-  /// P2：启动摘要与上传前记录的来源稳定锚点（size + modified 毫秒）。
-  ///
-  /// 仅用于改名前的**稳定性检查**（发现变化即 fail-closed），不是强一致性证明。
-  int? sourceSize;
-  int? sourceModifiedMs;
-
   _PendingUpload({
     required this.localPath,
     required this.remotePath,
@@ -121,6 +112,20 @@ class UploadFailureGuard {
   }
 }
 
+/// 单次上传失败的诊断事件（结构化日志用）。
+///
+/// 由 [uploadWithRetry] 在每次失败时经 `onFailure` 回调上报，只携带定位
+/// 「首个断链点」所需的最小上下文：第几次尝试、是否连接类错误、是否触发
+/// 重连及重连结果、是否已命中批次停止阈值。
+typedef UploadFailureEvent = ({
+  Object error,
+  int attempt,
+  bool connectionError,
+  bool reconnectAttempted,
+  bool reconnectFailed,
+  bool guardStopped,
+});
+
 /// 上传一个文件，连接类错误时先废弃旧连接、再有限次重试同一文件。
 ///
 /// 返回值：`null` 表示成功；否则返回导致最终失败的异常。
@@ -129,38 +134,72 @@ class UploadFailureGuard {
 /// [reconnect]：它由调用方提供，负责关掉已死的连接并新建一条。
 /// 重连本身失败时立即收敛为失败，避免在没有可用连接的情况下继续空转重试。
 ///
+/// [onFailure] 在**每一次**失败（含后续重试成功的中间失败）时回调，供调用方
+/// 落结构化诊断日志——首个失败往往就是根因，不能只在最终收敛时才记录。
+///
 /// 抽出为顶层函数以便单测：只依赖传入的闭包，不触碰 SMB 与存储。
 Future<Object?> uploadWithRetry({
   required Future<void> Function() upload,
   required UploadFailureGuard guard,
   Future<void> Function()? reconnect,
   int maxRetries = 3,
+  void Function(UploadFailureEvent event)? onFailure,
 }) async {
   var left = maxRetries;
+  var attempt = 0;
   while (true) {
+    attempt += 1;
     try {
       await upload();
       guard.recordSuccess();
       return null;
     } catch (e) {
       guard.record(e);
-      if (!SmbService.isConnectionError(e) || left <= 0 || guard.shouldStop) {
+      final connectionError = SmbService.isConnectionError(e);
+      final retryable = connectionError && left > 0 && !guard.shouldStop;
+      var reconnectAttempted = false;
+      var reconnectFailed = false;
+      if (retryable) {
+        left -= 1;
+        if (reconnect != null) {
+          reconnectAttempted = true;
+          try {
+            await reconnect();
+          } catch (reconnectError) {
+            // 重建连接都失败了，说明链路确实不可用：立即收敛，不再重试。
+            guard.record(reconnectError);
+            reconnectFailed = true;
+          }
+        }
+        // 大文件（分片并行）没有外部连接可重建：uploadFileParallel 每次调用
+        // 都会自行新建分片连接，直接重试即为「换一批新连接」。
+      }
+      onFailure?.call((
+        error: e,
+        attempt: attempt,
+        connectionError: connectionError,
+        reconnectAttempted: reconnectAttempted,
+        reconnectFailed: reconnectFailed,
+        guardStopped: guard.shouldStop,
+      ));
+      if (!retryable || reconnectFailed) {
         return e;
       }
-      left -= 1;
-      if (reconnect != null) {
-        try {
-          await reconnect();
-        } catch (reconnectError) {
-          // 重建连接都失败了，说明链路确实不可用：立即收敛，不再重试。
-          guard.record(reconnectError);
-          return e;
-        }
-      }
-      // 大文件（分片并行）没有外部连接可重建：uploadFileParallel 每次调用
-      // 都会自行新建分片连接，直接重试即为「换一批新连接」。
     }
   }
+}
+
+/// 把异常压成单行、定长、不含密码的诊断摘要。
+///
+/// 换行统一成空格并截断到 200 字符；若调用方给出 [redact]（如 SMB 密码），
+/// 在摘要中出现时一律替换为 `***`，避免把敏感配置写进日志。
+String _sanitizeError(Object error, [String? redact]) {
+  var text = error.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (redact != null && redact.isNotEmpty) {
+    text = text.replaceAll(redact, '***');
+  }
+  const maxLen = 200;
+  return text.length <= maxLen ? text : '${text.substring(0, maxLen)}…';
 }
 
 /// 计算「与服务器核对后仍视为已备份」的本地路径集合。
@@ -916,7 +955,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         .map((t) => t.localPath)
         .toSet();
 
-    // P1：本次将重新上传的文件，先把它们的历史失败记录从队列移除，避免新批次的
+    // 本次将重新上传的文件，先把它们的历史失败记录从队列移除，避免新批次的
     // pending 任务被上批遗留的失败项压在后面（老记录插在新任务之前，当前批次
     // 一打开传输页根本看不到）。只移除「同服务器 + 同本地路径」的失败上传项，
     // 其他服务器/其他路径的失败项保留，作为各自的「重试失败」入口。
@@ -1268,6 +1307,14 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
               upload: upload,
               guard: guard,
               reconnect: reconnect,
+              // 每次上传失败都留一条结构化诊断，首个失败即根因所在。
+              onFailure: (event) => _logUploadFailure(
+                taskId: item.taskId,
+                remotePath: item.remotePath,
+                totalBytes: item.size,
+                event: event,
+                redact: server.password,
+              ),
             );
             // 结算最后一个阶段的耗时日志（上传/校验/收尾）。
             _finishPhaseTrace(item.taskId, item.remotePath);
@@ -1277,6 +1324,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
               syncedPaths.add(item.localPath);
               uploadedRemotePaths.add(item.remotePath);
             } else {
+              // 终态失败补一条汇总，明确是否因链路被判不可用而收敛。
+              debugPrint('[backup][fail] FINAL task=${item.taskId} '
+                  'remote="${item.remotePath}" guardStop=${guard.shouldStop} '
+                  'type=${error.runtimeType} '
+                  'err=${_sanitizeError(error, server.password)}');
               _updateTaskComplete(item.taskId, TransferStatus.failed,
                   errorMessage: error.toString());
               failedCount += 1;
@@ -1289,8 +1341,6 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
             // 链路已被判定不可用：立即停止领取新文件，剩余项转入失败待续传。
             if (guard.shouldStop) break;
             _updateTaskStatus(item.taskId, TransferStatus.running);
-            // P2：上传前启动摘要预取，与上传并行；锚点用于改名前的稳定性复核。
-            _startHashPrefetch(item);
             await runItem(
               item,
               () => _smbService.uploadFileParallel(
@@ -1299,11 +1349,6 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                 item.localPath,
                 sourceTime: item.captureTime,
                 parallelism: largeParallelism,
-                prefetchedHash: item.prefetchedHash,
-                sourceSize: item.sourceSize,
-                sourceModifiedMs: item.sourceModifiedMs,
-                // 分阶段上报：上传 → 本地摘要 → NAS 回读校验 → 改名回写，
-                // 避免大视频校验的几分钟里进度条冻住被误认为卡死。
                 onPhase: (phase, bytes, total) =>
                     _onUploadPhase(item, phase, bytes, total),
               ),
@@ -1330,6 +1375,11 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                   connections[index] = await openConnection(index);
                 } catch (e) {
                   guard.record(e);
+                  // 连接池槽位重连失败，记录槽位/异常类型/脱敏摘要。
+                  debugPrint('[backup][fail] RECONNECT task=${item.taskId} '
+                      'remote="${item.remotePath}" slot=$index '
+                      'guardStop=${guard.shouldStop} type=${e.runtimeType} '
+                      'err=${_sanitizeError(e, server.password)}');
                   _updateTaskComplete(item.taskId, TransferStatus.failed,
                       errorMessage: '重连失败：$e');
                   failedCount += 1;
@@ -1338,8 +1388,6 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
               }
 
               _updateTaskStatus(item.taskId, TransferStatus.running);
-              // P2：上传前启动摘要预取，与上传并行；锚点用于改名前的稳定性复核。
-              _startHashPrefetch(item);
 
               await runItem(
                 item,
@@ -1349,11 +1397,17 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
                   item.remotePath,
                   item.localPath,
                   sourceTime: item.captureTime,
-                  prefetchedHash: item.prefetchedHash,
-                  sourceSize: item.sourceSize,
-                  sourceModifiedMs: item.sourceModifiedMs,
                   onPhase: (phase, bytes, total) =>
                       _onUploadPhase(item, phase, bytes, total),
+                  // 断链时在 uploadFileVia 内部重建连接并**从已写偏移续传**，
+                  // 避免小文件/单连接大文件每次重试都从 0 重来。
+                  reconnect: () async {
+                    // 超时/写失败后旧连接上的请求可能仍有残留：先废弃关闭它，
+                    // 保证旧请求不会和续传请求并行写同一个 .mipixtmp。
+                    await _closeQuietly(connections[index]);
+                    connections[index] = await openConnection(index);
+                    return connections[index];
+                  },
                 ),
                 reconnect: () async {
                   // 超时/写失败后旧连接上的请求可能仍有残留：先废弃关闭它，
@@ -1501,8 +1555,8 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         if (t.id == taskId && t.status == TransferStatus.running) {
           // 阶段切换时重置「阶段起点/已处理字节」，供界面展示阶段耗时与速度。
           final phaseChanged = phase != null && phase != t.phase;
-          // 总进度单调不减：事件顺序变化（如预取把 localHash 吸收进上传、或
-          // 失败重试重新进入上传阶段）都不能让进度条回退。
+          // 总进度单调不减：事件顺序变化（如失败重试重新进入上传阶段）
+          // 都不能让进度条回退。
           final monotonic = progress < t.progress ? t.progress : progress;
           return TransferTask(
             id: t.id,
@@ -1535,34 +1589,10 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     });
   }
 
-  /// P2：在上传前启动本地摘要预取，并记录来源稳定锚点。
-  ///
-  /// 摘要在独立 isolate 内与上传并行计算（[PhotoService.hashFile]），把「上传
-  /// 完成后才顺序重读整份文件」的耗时吸收进上传阶段。锚点（size + modified）
-  /// 供改名前的稳定性复核使用；预取结果为 null（读取失败 / 期间文件被改动）
-  /// 由校验阶段 fail-closed，**不回退**二次顺序重读。
-  void _startHashPrefetch(_PendingUpload item) {
-    try {
-      final stat = File(item.localPath).statSync();
-      item.sourceSize = stat.size;
-      item.sourceModifiedMs = stat.modified.millisecondsSinceEpoch;
-    } catch (e) {
-      debugPrint('[backup][hash] stat 失败 local="${item.localPath}" err=$e');
-      item.sourceSize = item.size;
-      item.sourceModifiedMs = null;
-    }
-    final sw = Stopwatch()..start();
-    item.prefetchedHash = PhotoService.hashFile(item.localPath).then((hash) {
-      debugPrint('[backup][hash] local="${item.localPath}" '
-          'ms=${sw.elapsedMilliseconds} prefetched=true ok=${hash != null}');
-      return hash;
-    });
-  }
-
   /// 上传阶段的进度回调：把阶段/已处理字节写入任务，并把合成的总进度换算出来。
   ///
-  /// 进度分布：上传占 0~0.5，本地摘要占 0.5~0.55，NAS 回读校验占 0.55~1.0，
-  /// 只有这样大文件在「写完、正在回读」的几分钟里进度条才持续前进。
+  /// 进度分布：上传占 0~1.0；上传完成后只做一次远端长度比对（走 stat、近似零
+  /// 成本），随后进入收尾。
   void _onUploadPhase(
     _PendingUpload item,
     TransferPhase phase,
@@ -1577,13 +1607,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
         progress = 0.0;
         break;
       case TransferPhase.uploading:
-        progress = t > 0 ? 0.5 * bytes / t : 0.0;
-        break;
-      case TransferPhase.localHash:
-        progress = 0.5 + (t > 0 ? 0.05 * bytes / t : 0.0);
-        break;
-      case TransferPhase.verifying:
-        progress = 0.55 + (t > 0 ? 0.45 * bytes / t : 0.0);
+        progress = t > 0 ? bytes / t : 0.0;
         break;
       case TransferPhase.finalizing:
         progress = 1.0;
@@ -1591,8 +1615,7 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     }
     _updateTaskProgress(
       item.taskId,
-      // 校验/收尾阶段整份文件已写完：writtenBytes 保持等于总大小，
-      // 已读回字节单独走 phaseBytes。
+      // 收尾阶段整份文件已写完：writtenBytes 保持等于总大小。
       phase == TransferPhase.uploading ? bytes : item.size,
       progress,
       phase: phase,
@@ -1633,6 +1656,30 @@ class TransfersNotifier extends StateNotifier<AsyncValue<List<TransferTask>>> {
     debugPrint('[backup][stage] task=$taskId phase=${phase.name} '
         'remote="$remotePath" bytes=$bytes ms=${elapsed.inMilliseconds} '
         'mbps=${mbps.toStringAsFixed(2)}');
+  }
+
+  /// 单次上传/重连失败的结构化诊断日志。
+  ///
+  /// 输出定位「首个断链点」所需的最小字段：任务 ID、远端路径、当前阶段与已处理
+  /// 字节、第几次尝试、异常类型与脱敏摘要、重连结果、是否命中批次停止阈值。
+  /// 不输出配置对象或会话密钥；异常摘要经 [_sanitizeError] 脱敏与截断。
+  void _logUploadFailure({
+    required String taskId,
+    required String remotePath,
+    required int totalBytes,
+    required UploadFailureEvent event,
+    String? redact,
+  }) {
+    final trace = _phaseTraces[taskId];
+    final reconnect = event.reconnectAttempted
+        ? (event.reconnectFailed ? 'failed' : 'ok')
+        : 'none';
+    debugPrint('[backup][fail] task=$taskId remote="$remotePath" '
+        'phase=${trace?.phase.name ?? "unknown"} '
+        'bytes=${trace?.bytes ?? 0}/$totalBytes attempt=${event.attempt} '
+        'connErr=${event.connectionError} reconnect=$reconnect '
+        'guardStop=${event.guardStopped} type=${event.error.runtimeType} '
+        'err=${_sanitizeError(event.error, redact)}');
   }
 
   void _updateTaskComplete(String taskId, TransferStatus status, {String? errorMessage}) {

@@ -84,8 +84,15 @@ class PhotoService {
   PhotoService._();
 
   /// 统一排序：创建时间倒序。
+  ///
+  /// 注意：[FilterOptionGroup.createTimeCond] 默认是 `DateTimeCond.def()`，其
+  /// `max` 为「构造那一刻」的 `DateTime.now()`。而 `_descOrder` 是 `static final`
+  /// 只会构造一次，原生查询便会带上 `DATE_ADDED <= 启动时刻` 的条件，导致应用
+  /// 启动之后新拍 / 新截图的照片被永久过滤掉（表现为动态刷新失效）。这里必须
+  /// 显式忽略创建时间约束。
   static final FilterOptionGroup _descOrder = FilterOptionGroup(
     orders: const [OrderOption(type: OrderOptionType.createDate, asc: false)],
+    createTimeCond: DateTimeCond.def().copyWith(ignore: true),
   );
 
   /// 位置信息权限的通道（原生侧实现见 MainActivity.ensureMediaLocation）。
@@ -501,7 +508,8 @@ class PhotoService {
     );
     if (paths.isEmpty) return [];
 
-    final assets = await paths.first.getAssetListRange(start: 0, end: count);
+    final album = paths.first;
+    final assets = await album.getAssetListRange(start: 0, end: count);
     if (filter == null) return _toMediaItems(assets);
 
     final items = <MediaItem>[];

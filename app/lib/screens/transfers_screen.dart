@@ -205,9 +205,7 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     final statusColor = _statusColor(task.status);
     final statusText = _statusText(task.status);
     final total = task.totalBytes > 0 ? task.totalBytes : 1;
-    // 进度取自任务自身的 progress（上传 0~0.5、本地摘要 0.5~0.55、回读校验
-    // 0.55~1.0）。用 writtenBytes/total 的话，大文件「已写完、正在回读校验」
-    // 的几分钟里进度条会一动不动，看起来就是传输卡死。
+    // 进度取自任务自身的 progress（上传阶段即 0~1.0）。
     final progress = task.progress.clamp(0.0, 1.0).toDouble();
     final running = task.status == TransferStatus.running;
     final detail = running ? _phaseDetail(task) : '';
@@ -469,19 +467,12 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
         return '准备 / 冲突比对';
       case TransferPhase.uploading:
         return '上传';
-      case TransferPhase.localHash:
-        return '本地摘要计算';
-      case TransferPhase.verifying:
-        return 'NAS 回读校验';
       case TransferPhase.finalizing:
         return '改名与时间戳回写';
     }
   }
 
   /// 运行中任务的阶段详情：已处理/总量 · 当前速度 · 阶段耗时。
-  ///
-  /// 校验阶段（本地摘要、NAS 回读）额外展示「已用时长」，避免大文件回读的
-  /// 几分钟里只有字节数在涨、看不出还要多久。
   String _phaseDetail(TransferTask task) {
     final parts = <String>[];
     final total = task.totalBytes;

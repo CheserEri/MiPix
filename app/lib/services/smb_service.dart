@@ -6,10 +6,10 @@ import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:smb_connect/smb_connect.dart';
-import 'package:smb_connect/src/exceptions.dart' show SmbException;
+import 'package:smb_connect/src/exceptions.dart'
+    show SmbException, SmbAuthException;
 import '../models/models.dart';
 import 'cache_service.dart';
-import 'range_hash_sequencer.dart';
 
 /// 收集流式哈希的最终摘要（`startChunkedConversion` 需要 `Sink<Digest>`）。
 /// 每次哈希都新建一个实例，避免复用上次的部分结果。
@@ -26,9 +26,9 @@ class _DigestSink implements Sink<Digest> {
 class _ConnectionWrapper {
   final SmbConnect connect;
   DateTime lastUsed;
-  bool isValid;
+  bool isValid = true;
 
-  _ConnectionWrapper(this.connect, this.lastUsed, {this.isValid = true});
+  _ConnectionWrapper(this.connect, this.lastUsed);
 }
 
 class MediaItemPage {
@@ -44,47 +44,10 @@ typedef ScanProgressCallback = void Function(int done, int total);
 
 /// 上传流程中的阶段进度回调：阶段 + 该阶段已处理字节 + 该阶段总量。
 ///
-/// 上传与校验分成多个阶段上报，界面才能在大文件「写完、正在回读校验」的
-/// 几分钟里显示独立文案与「已读/总量、速度、耗时」，而不是一条冻住的进度条。
+/// 上传分成多个阶段上报，界面才能显示独立文案与「已处理/总量、速度、耗时」。
 /// [total] 为 0 表示该阶段总量未知（如收尾阶段）。
 typedef UploadPhaseCallback = void Function(
     TransferPhase phase, int bytes, int total);
-
-/// 上传后回读校验的最终判定：[rename] 允许改名，[deleteAndFail] 删临时文件并失败。
-enum VerifyOutcome {
-  /// 本地与远端摘要一致、远端长度相符、源文件稳定：允许 rename。
-  rename,
-
-  /// 任一条件为「不知道 / 不等 / 不稳定」：删临时文件并按失败处理（fail-closed）。
-  deleteAndFail,
-}
-
-/// 上传后回读校验的判定（顶层纯函数，便于单测；不依赖 SMB、文件系统与 Flutter）。
-///
-/// fail-closed 的单一判定点，任一「不确定」都收敛为 [VerifyOutcome.deleteAndFail]：
-///  * [localHash] 或 [remoteHash] 为 null：摘要缺失（读取失败 / 未能确认内容）；
-///  * 两摘要不等：NAS 上的真实字节与手机端不一致；
-///  * [remoteSize] != [expectedSize]：远端长度与来源不符；
-///  * [sourceStable] 为 false：哈希 / 上传期间源文件 size 或 modified 发生变化。
-///
-/// 注：[sourceStable] 是**稳定性检查**而非强一致性证明——文件长度可能不变、
-/// 文件系统时间戳也可能有精度限制，因此它只用于「发现变化即 fail-closed」，
-/// 不能声称检出了所有同长度、同时间戳的内容变化。
-VerifyOutcome decideVerify({
-  required String? localHash,
-  required String? remoteHash,
-  required int remoteSize,
-  required int expectedSize,
-  required bool sourceStable,
-}) {
-  if (!sourceStable) return VerifyOutcome.deleteAndFail;
-  if (localHash == null || remoteHash == null) {
-    return VerifyOutcome.deleteAndFail;
-  }
-  if (localHash != remoteHash) return VerifyOutcome.deleteAndFail;
-  if (remoteSize != expectedSize) return VerifyOutcome.deleteAndFail;
-  return VerifyOutcome.rename;
-}
 
 class SmbService {
   final Map<String, _ConnectionWrapper> _connections = {};
@@ -106,12 +69,6 @@ class SmbService {
     return _prefs!;
   }
 
-  String _normalizePath(String path) {
-    if (path.isEmpty) return '';
-    final trimmed = path.replaceAll(RegExp(r'^/+|/+$'), '');
-    return '/$trimmed';
-  }
-
   String _buildSMBPath(SmbConfig config, String path) {
     final share = config.share.replaceAll(RegExp(r'^/+|/+$'), '');
     final root = config.rootPath.replaceAll(RegExp(r'^/+|/+$'), '');
@@ -127,45 +84,159 @@ class SmbService {
     return buffer.toString();
   }
 
-  Future<SmbConnect> _getConnection(SmbConfig config) async {
-    final key = '${config.host}:${config.username}';
-    final now = DateTime.now();
+  /// 建连串行锁。
+  ///
+  /// 库里 `SmbConnect.shareTree(share)` 是懒加载且**非并发安全**的：
+  /// `initTree()` 每次都新建一个 `Smb2Session`，且 `_trees[share] = tree` 是在
+  /// `await tree.setup()`（整段 NTLM 会话建立 + TREE_CONNECT）**之后**才赋值。
+  /// 于是多个并发首次调用都会看到 `_trees[share] == null`，各自在同一条
+  /// transport 上跑一遍会话建立、报文交错，服务端直接拒绝 → `SmbAuthException`。
+  /// 这正是「8 路并发加载缩略图 → 只有前几张成功，其余全部碎图」的根因。
+  /// 因此建连必须串行，并在对外发布连接前把 session/tree 预热好。
+  Future<void> _connectLock = Future<void>.value();
 
-    if (_connections.containsKey(key)) {
-      final wrapper = _connections[key]!;
-      if (wrapper.isValid && now.difference(wrapper.lastUsed) < _maxConnectionAge) {
-        // 不再每次调用都做一次 listShares() 探活：该往返在批量扫描（如逐文件读头）
-        // 时会被放大成主要开销。连接失效由各调用方的重试与 _invalidateConnection 兜底。
-        wrapper.lastUsed = now;
-        return wrapper.connect;
-      }
-      await wrapper.connect.close();
-      _connections.remove(key);
+  Future<T> _withConnectLock<T>(Future<T> Function() action) {
+    final result = _connectLock.then((_) => action());
+    _connectLock =
+        result.then<void>((_) {}, onError: (Object e, StackTrace s) {});
+    return result;
+  }
+
+  /// 同时进行中的「新建连接」上限。
+  ///
+  /// 部分 Windows 服务器（家用版尤其明显）对同一客户端的并发 SMB 连接数上限很低，
+  /// 一旦瞬时新建的连接数超过上限，服务端会直接拒绝并回
+  /// "No more connections can be made to this remote computer…"；而失败后的重试
+  /// 又会继续新建连接，形成雪崩（实测峰值曾冲到 17 条）。
+  /// 因此所有 [SmbConnect.connectAuth] 统一经过此闸门限流，把建连峰值压到服务端可接受的范围。
+  static const int _maxConcurrentConnects = 3;
+  int _activeConnects = 0;
+  Completer<void>? _connectGate;
+
+  Future<void> _acquireConnectSlot() async {
+    while (_activeConnects >= _maxConcurrentConnects) {
+      final gate = _connectGate ??= Completer<void>();
+      await gate.future;
     }
+    _activeConnects++;
+  }
 
+  void _releaseConnectSlot() {
+    _activeConnects--;
+    final gate = _connectGate;
+    _connectGate = null;
+    gate?.complete();
+  }
+
+  /// 经 [_maxConcurrentConnects] 闸门限流的建连入口，替代直接调用
+  /// [SmbConnect.connectAuth]。
+  Future<SmbConnect> _connectAuthGated(
+    SmbConfig config, {
+    void Function(SmbConnect)? onDisconnect,
+  }) async {
+    await _acquireConnectSlot();
     try {
-      final connect = await SmbConnect.connectAuth(
+      return await SmbConnect.connectAuth(
         host: config.host,
         domain: config.domain,
         username: config.username,
         password: config.password ?? '',
+        onDisconnect: onDisconnect,
+      );
+    } finally {
+      _releaseConnectSlot();
+    }
+  }
+
+  /// 连接类错误重试前的退避等待：让瞬时并发峰值自然消散，
+  /// 避免失败重试在几十毫秒内叠加成更大的连接风暴。
+  Future<void> _retryBackoff(int retriesLeft) =>
+      Future<void>.delayed(Duration(milliseconds: 200 * (3 - retriesLeft)));
+
+  /// 诊断用字符串：`SmbException.toString()` 未覆写，直接打印只会得到
+  /// "Instance of 'SmbAuthException'"，因此取其 `message`（内含 NT 状态名）。
+  static String _errStr(Object e) => e is SmbException
+      ? '${e.runtimeType}(${e.message})'
+      : '${e.runtimeType} $e';
+
+  Future<SmbConnect> _getConnection(SmbConfig config) async {
+    final key = '${config.host}:${config.username}';
+    final cached = _connections[key];
+    if (cached != null &&
+        cached.isValid &&
+        DateTime.now().difference(cached.lastUsed) < _maxConnectionAge) {
+      // 不再每次调用都做一次 listShares() 探活：该往返在批量扫描（如逐文件读头）
+      // 时会被放大成主要开销。连接失效由各调用方的重试与 _invalidateConnection 兜底。
+      cached.lastUsed = DateTime.now();
+      return cached.connect;
+    }
+
+    return _withConnectLock(() async {
+      // 双检：锁内再判一次，避免并发调用重复建连。
+      final existing = _connections[key];
+      if (existing != null &&
+          existing.isValid &&
+          DateTime.now().difference(existing.lastUsed) < _maxConnectionAge) {
+        existing.lastUsed = DateTime.now();
+        return existing.connect;
+      }
+      if (existing != null) {
+        _connections.remove(key);
+        await _closeQuietly(existing.connect);
+      }
+
+      final connect = await _connectAuthGated(
+        config,
         onDisconnect: (c) {
           _connections[key]?.isValid = false;
           _connections.remove(key);
         },
       );
-      _connections[key] = _ConnectionWrapper(connect, now);
+      // 预热：先 touch 一次共享根目录，把 session + tree 建好再发布。
+      // 目录路径本就被 `_collectAlbums` / `getAllMediaItems` 用 FILE_OPEN 打开过，
+      // 是安全调用；只有预热成功才发布，否则上抛交由调用方重试。
+      try {
+        await connect.file(_buildSMBPath(config, '')).timeout(_stallTimeout);
+      } catch (e) {
+        debugPrint('[smb] warmup FAIL host=${config.host} ${_errStr(e)}');
+        await _closeQuietly(connect);
+        _connections.remove(key);
+        rethrow;
+      }
+      _connections[key] = _ConnectionWrapper(connect, DateTime.now());
       return connect;
-    } catch (e) {
-      _connections.remove(key);
-      rethrow;
-    }
+    });
   }
 
   void _invalidateConnection(String host, String username) {
     final key = '$host:$username';
-    _connections[key]?.isValid = false;
+    final wrapper = _connections[key];
     _connections.remove(key);
+    if (wrapper == null) return;
+    wrapper.isValid = false;
+    // 必须真正关闭被废弃的连接：只从池里摘掉会让 socket 与远端会话一直挂着，
+    // 服务端会话迟迟不释放，累积到上限后连新建会话都会被拒（SmbAuthException）。
+    unawaited(_closeQuietly(wrapper.connect));
+  }
+
+  /// 判定 SMB 异常是否属于「重建连接后可重试」的连接层面错误。
+  ///
+  /// 注意：库内 `SmbException extends Error`（**不是** [Exception]），因此调用方
+  /// 的重试分支必须额外用 `catch (e)` 兜住 [Error]，否则
+  /// `StateError: Bad state: StreamSink is closed` 这类连接崩坏会直接穿透重试、
+  /// 让读取一次性失败（表现为 SMB 缩略图显示碎图占位）。
+  ///
+  /// [SmbAuthException] 也按可重试处理：Win7 服务端在并发会话较多时会瞬时拒绝
+  /// 新建会话，重建连接重试即可成功（离线探针复现过该瞬时失败）。
+  bool _isConnectionError(SmbException e) {
+    if (e is SmbAuthException) return true;
+    final msg = e.toString().toLowerCase();
+    return msg.contains('network name') ||
+        msg.contains('nt_status') ||
+        msg.contains('not available') ||
+        msg.contains('disconnected') ||
+        msg.contains('connection reset') ||
+        msg.contains('reset by peer');
   }
 
   Future<bool> testConnection(SmbConfig config) async {
@@ -238,8 +309,6 @@ class SmbService {
         final folder = await connect.file(smbPath);
         // 目录不存在属于正常语义（该相册尚未备份过），不是读取失败。
         if (!folder.isExists) {
-          debugPrint('[diag-smb] listFilesWithSize ABSENT path="$path" '
-              'smbPath="$smbPath"');
           return <String, int>{};
         }
         final files = await connect.listFiles(folder);
@@ -247,8 +316,6 @@ class SmbService {
           for (final f in files)
             if (!f.isDirectory()) f.name: f.size,
         };
-        debugPrint('[diag-smb] listFilesWithSize path="$path" smbPath="$smbPath" '
-            'files=${files.length} entries=${result.length}');
         return result;
       } catch (e) {
         lastError = e;
@@ -256,8 +323,7 @@ class SmbService {
         _invalidateConnection(config.host, config.username);
       }
     }
-    debugPrint('[diag-smb] listFilesWithSize FAIL path="$path" smbPath="$smbPath" '
-        'share="${config.share}" root="${config.rootPath}" host="${config.host}" '
+    debugPrint('[smb] listFilesWithSize FAIL path="$path" smbPath="$smbPath" '
         'err=$lastError');
     return null;
   }
@@ -293,8 +359,8 @@ class SmbService {
         final hasher = sha256.startChunkedConversion(digestSink);
         var read = 0;
         final stream = await connect.openRead(file);
-        // 与 _hashRemoteVia 同样加「无新数据即判卡死」的看门狗：这里整份读大文件，
-        // 链路静默断开时若没有看门狗，整批备份会停在比对阶段不动。
+        // 加「无新数据即判卡死」的看门狗：这里整份读大文件，链路静默断开时若
+        // 没有看门狗，整批备份会停在比对阶段不动。
         await for (final chunk in stream.timeout(_stallTimeout)) {
           hasher.add(chunk);
           read += chunk.length;
@@ -355,7 +421,7 @@ class SmbService {
               path: path.isEmpty ? file.name : '$path/${file.name}',
               source: SmbSource(config.id),
               mimeType: _getMimeType(file.name),
-              size: file.size ?? 0,
+              size: file.size,
               width: 0,
               height: 0,
               // 库的 SMBUtil.readTime 返回的已经是「自 1970 起的毫秒数」，
@@ -397,8 +463,12 @@ class SmbService {
   }
 
   /// 扫描时同时建立的独立连接数。同一条 SMB 连接上的读操作无法真正并行，
-  /// 必须用多条连接才能把逐文件读头的耗时分摊开（NAS 连接数上限较低时会自动降级）。
-  static const int _exifScanConnections = 8;
+  /// 必须用多条连接才能把逐文件读头的耗时分摊开。
+  ///
+  /// 取 3 是折中：更低会让大相册的首屏日期校准明显变慢，更高则会在部分
+  /// Windows 服务器（家用版并发连接上限很低）上与缩略图抢耗尽连接配额，
+  /// 反而导致整屏碎图（详见 [_maxConcurrentConnects]）。
+  static const int _exifScanConnections = 3;
 
   /// 扫描进度落盘间隔（每处理这么多项写一次 EXIF 缓存），
   /// 兼顾中断续传与避免高频序列化整个映射表。
@@ -444,12 +514,7 @@ class SmbService {
     try {
       for (var i = 0; i < _exifScanConnections; i++) {
         try {
-          connections.add(await SmbConnect.connectAuth(
-            host: config.host,
-            domain: config.domain,
-            username: config.username,
-            password: config.password ?? '',
-          ));
+          connections.add(await _connectAuthGated(config));
         } catch (_) {
           break;
         }
@@ -727,9 +792,7 @@ class SmbService {
 
     SmbFile? latest;
     for (final image in imageFiles) {
-      if (latest == null ||
-          (image.lastModified != null &&
-              image.lastModified > (latest.lastModified ?? 0))) {
+      if (latest == null || image.lastModified > latest.lastModified) {
         latest = image;
       }
     }
@@ -798,7 +861,12 @@ class SmbService {
   static const int _rangeChunkParallelism = 4;
   static const int _rangeParallelThresholdBytes = 512 * 1024;
 
-  Future<Uint8List> readFile(SmbConfig config, String remotePath, {bool useCache = true}) async {
+  Future<Uint8List> readFile(
+    SmbConfig config,
+    String remotePath, {
+    bool useCache = true,
+    bool useParallel = true,
+  }) async {
     await _ensureCacheInitialized();
     if (useCache) {
       final cachedFile = await _cacheService.getCachedImage(config.id, remotePath);
@@ -819,14 +887,14 @@ class SmbService {
         final size = file.size;
 
         Uint8List result;
-        if (size > 0 && size >= _rangeParallelThresholdBytes) {
+        if (useParallel && size > 0 && size >= _rangeParallelThresholdBytes) {
           // 大文件：多连接并行分块下载。
           result = await _readFileParallel(config, fullPath, size);
         } else {
           // 小文件或大小未知：单连接顺序读取。
           final stream = await connect.openRead(file);
           final bytes = <int>[];
-          await for (final chunk in stream) {
+          await for (final chunk in stream.timeout(_stallTimeout)) {
             bytes.addAll(chunk);
           }
           result = Uint8List.fromList(bytes);
@@ -835,17 +903,15 @@ class SmbService {
         await _cacheService.cacheImage(config.id, remotePath, result);
         return result;
       } on SmbException catch (e) {
-        final msg = e.toString().toLowerCase();
-        final isConnectionError = msg.contains('network name') ||
-                                   msg.contains('nt_status') ||
-                                   msg.contains('not available') ||
-                                   msg.contains('disconnected') ||
-                                   msg.contains('connection reset') ||
-                                   msg.contains('reset by peer');
-        if (!isConnectionError) rethrow;
+        debugPrint('[smb] readFile smbErr retries=$retries path=$remotePath ${_errStr(e)}');
+        if (!_isConnectionError(e)) rethrow;
         if (retries == 0) rethrow;
         _invalidateConnection(config.host, config.username);
-      } on Exception {
+        await _retryBackoff(retries);
+      } catch (e) {
+        debugPrint('[smb] readFile err retries=$retries path=$remotePath ${_errStr(e)}');
+        // 库内 SmbConnectException / StateError / SocketException / TimeoutException
+        // 均属 [Error] 或非连接异常：读取幂等，一律失效连接后重试，避免一次性碎图。
         if (retries == 0) rethrow;
         _invalidateConnection(config.host, config.username);
       }
@@ -877,17 +943,12 @@ class SmbService {
   /// 用全新（不进连接池）的 SMB 连接读取 [start, end) 字节，读完即关闭连接，
   /// 保证各分块互不干扰、可真正并行。
   Future<Uint8List> _readRange(SmbConfig config, String fullPath, int start, int end) async {
-    final connect = await SmbConnect.connectAuth(
-      host: config.host,
-      domain: config.domain,
-      username: config.username,
-      password: config.password ?? '',
-    );
+    final connect = await _connectAuthGated(config);
     try {
       final file = await connect.file(fullPath);
       final stream = await connect.openRead(file, start, end);
       final bytes = <int>[];
-      await for (final chunk in stream) {
+      await for (final chunk in stream.timeout(_stallTimeout)) {
         bytes.addAll(chunk);
         if (bytes.length >= end - start) break;
       }
@@ -949,12 +1010,25 @@ class SmbService {
           return embedded;
         }
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[smb] readThumbnail header FAIL path=$remotePath ${_errStr(e)}');
       // 局部读取失败时回退到全量读取。
     }
 
     // 2) 回退：全量读取原图后再缩放生成缩略图（原图本身也会被缓存）。
-    final originalData = await readFile(config, remotePath, useCache: true);
+    //
+    // 这里必须走单连接（[readFile] 的 useParallel: false）：网格会 8 路并发加载
+    // 缩略图，若比照原图查看走 4 连接并行分块，8 路并发将同时新建 32 条 SMB
+    // 会话，Win7 服务端会因会话耗尽而拒绝（SmbAuthException/断链），
+    // 结果就是「无内嵌 EXIF 缩略图且 ≥512KiB 的照片」缩略图全部碎图。
+    // 缩略图只需把整图缩到 200px，走共享池连接顺序读取即可，且天然受益于
+    // 连接复用与请求串行化。
+    final originalData = await readFile(
+      config,
+      remotePath,
+      useCache: true,
+      useParallel: false,
+    );
     final thumbnail = await _cacheService.generateAndCacheThumbnail(
       config.id,
       remotePath,
@@ -972,17 +1046,15 @@ class SmbService {
         final connect = await _getConnection(config);
         return await _readHeaderVia(connect, config, remotePath, maxBytes);
       } on SmbException catch (e) {
-        final msg = e.toString().toLowerCase();
-        final isConnectionError = msg.contains('network name') ||
-                                   msg.contains('nt_status') ||
-                                   msg.contains('not available') ||
-                                   msg.contains('disconnected') ||
-                                   msg.contains('connection reset') ||
-                                   msg.contains('reset by peer');
-        if (!isConnectionError) rethrow;
+        debugPrint('[smb] readHeader smbErr retries=$retries path=$remotePath ${_errStr(e)}');
+        if (!_isConnectionError(e)) rethrow;
         if (retries == 0) rethrow;
         _invalidateConnection(config.host, config.username);
-      } on Exception {
+        await _retryBackoff(retries);
+      } catch (e) {
+        debugPrint('[smb] readHeader err retries=$retries path=$remotePath ${_errStr(e)}');
+        // 库内 SmbConnectException / StateError / TimeoutException 都属 [Error]：
+        // 不能用 `on Exception` 兜，否则会穿透重试直接碎图。
         if (retries == 0) rethrow;
         _invalidateConnection(config.host, config.username);
       }
@@ -1006,9 +1078,13 @@ class SmbService {
     final end = (size > 0 && size < maxBytes) ? size : maxBytes;
     final stream = await connect.openRead(file, 0, end);
     final bytes = <int>[];
-    await for (final chunk in stream) {
+    // 【不能提前 break】底层 smbOpenRead 是 async* 生成器，`smbCloseFile(...)`
+    // 位于最后一个 yield 之后：消费者一旦提前取消订阅（break），该方法就不会执行，
+    // 远端文件句柄只在连接销毁时才回收。共享连接上会不断累积未关闭句柄，最终
+    // 让服务端拒绝后续 CREATE，表现为读取/缩略图失败。该流只产出 end 字节
+    // （length = end - start），完整消费即可自然结束。
+    await for (final chunk in stream.timeout(_stallTimeout)) {
       bytes.addAll(chunk);
-      if (bytes.length >= end) break;
     }
     return Uint8List.fromList(bytes);
   }
@@ -1318,16 +1394,13 @@ class SmbService {
     SmbConfig config, {
     Function(SmbConnect)? onDisconnect,
   }) {
-    return SmbConnect.connectAuth(
-      host: config.host,
-      domain: config.domain,
-      username: config.username,
-      password: config.password ?? '',
-      onDisconnect: onDisconnect,
-    );
+    return _connectAuthGated(config, onDisconnect: onDisconnect);
   }
 
   /// 用指定连接创建单级远端目录（已存在时忽略）。
+  ///
+  /// 建目录也纳入 [_stallTimeout] 看门狗：服务端因残留锁不回 ACK 时，不能把这个
+  /// await 无限挂住（否则整批卡死且无日志）。超时即按连接类错误抛出，由调用方收敛。
   Future<void> createDirectoryVia(
     SmbConnect connect,
     SmbConfig config,
@@ -1336,7 +1409,7 @@ class SmbService {
     final normalized = path.replaceAll(RegExp(r'^/+|/+$'), '');
     if (normalized.isEmpty) return;
     try {
-      await connect.createFolder(_buildSMBPath(config, normalized));
+      await _guard(connect.createFolder(_buildSMBPath(config, normalized)));
     } catch (_) {
       // 目录已存在等情况忽略；真正的写入失败会在上传阶段暴露。
     }
@@ -1371,27 +1444,18 @@ class SmbService {
   /// 小文件不启用分片：连接建立 + 认证的固定开销会超过省下的时间，反而更慢。
   static const int uploadParallelThresholdBytes = 8 * 1024 * 1024;
 
-  /// 远端回读校验的并发连接数（P3，已转正）。
+  /// 单条上传连接（分片或单连接）在断链后允许的最大重连续传次数。
   ///
-  /// 0 = 走 [ _hashRemoteVia] 的单连接顺序回读；>1 时改用
-  /// [ _hashRemoteRangeVia] 的多连接区间回读；此外文件不超过
-  /// [rangeReadbackRangeBytes]（只切出 1 个区间）时也回退单连接顺序读，
-  /// 避免为闲置区间白建连接。
+  /// 实测服务端（Win7 / SMB2）在写入过程中会偶发长时间不响应：库内
+  /// `SmbTransport.waitResponseTimeout`（3 秒）一到就会**重发同一个请求**，
+  /// 服务端随即断开该连接，客户端随后的写入命中已关闭的 socket，抛出
+  /// `Bad state: StreamSink is closed`。这是服务端行为，客户端无法避免；
+  /// 能做的只有在断链后重建连接、从**最后一个已确认写入的偏移**继续，
+  /// 而不是把整个文件判失败（大文件从头重来等于永远传不完）。
   ///
-  /// S2 真机实测（671MB 单文件、每档 3 次取中位）：单连接 146.0s / 4.6MB/s
-  /// → 2 连接 79.9s / 8.4MB/s → 4 连接 56.8s / 11.8MB/s（单文件关键路径 -41%）
-  /// → 6 连接 50.4s / 13.3MB/s → 8 连接无增益（53.8s）。拐点在 4~6，取 4 为
-  /// 默认：收益已接近上限而连接/CPU 占用更低。15 次运行无 Samba 报错、无 OOM，
-  /// 内存平稳（403~427MB PSS）。
-  static const int rangeReadbackConcurrency = 4;
-
-  /// 每段区间回读的字节数（P3，本次取值）。
-  ///
-  /// 区间内仍按底层 `smbReadBlockSize`（≈64 KiB）分块读取，只是不再每个小块都
-  /// 重开一次远端文件句柄。句柄开销量随粒度反比变化（1 MiB 粒度会让 1.4 GiB
-  /// 文件付出约 1400 次开关），故取 4 MiB；S2 未做读块实验，维持该值。
-  static const int rangeReadbackRangeBytes = 4 * 1024 * 1024;
-
+  /// 实测 200MB 分片约需 3~4 次重连，这里给到 20 次，覆盖数 GB 级单文件；
+  /// 重连本身失败（服务端不可达）会直接上抛，不会消耗这个次数。
+  static const int _shardMaxReconnects = 20;
 
   /// 单次 SMB 写入调用的「卡死」上限。
   ///
@@ -1404,156 +1468,34 @@ class SmbService {
   /// 给单次 SMB 调用加卡死上限。
   static Future<T> _guard<T>(Future<T> future) => future.timeout(_stallTimeout);
 
-  /// 计算本地文件的 SHA-256（小写十六进制）。
-  Future<String> _hashLocalFile(String path,
-      {void Function(int read, int total)? onProgress}) async {
-    final sink = _DigestSink();
-    final hasher = sha256.startChunkedConversion(sink);
-    final total = await File(path).length();
-    var read = 0;
-    await for (final chunk in File(path).openRead()) {
-      hasher.add(chunk);
-      read += chunk.length;
-      onProgress?.call(read, total);
-    }
-    hasher.close();
-    final digest = sink.value;
-    if (digest == null) throw Exception('本地文件哈希计算失败：$path');
-    return digest.toString();
-  }
-
-  /// 通过指定连接读取远端文件并计算 SHA-256；不存在或读到的字节数不符时返回 null。
+  /// 上传后、改名前的落盘完整性校验。
   ///
-  /// [onProgress] 按「已读字节 / 总字节」回调，让调用方能把这段耗时上报到界面。
-  /// 读取流带「无新数据即视为卡死」的看门狗：底层 Socket 在链路静默断开时会被
-  /// 挂住十几分钟，而这里没有看门狗的话整批备份就停在「校验中」不动了。
-  Future<String?> _hashRemoteVia(
-    SmbConnect connect,
-    String smbPath, {
-    void Function(int read, int total)? onProgress,
-  }) async {
-    try {
-      final file = await connect.file(smbPath);
-      if (!file.isExists || file.isDirectory()) return null;
-      final expectedSize = file.size;
-      final sink = _DigestSink();
-      final hasher = sha256.startChunkedConversion(sink);
-      var read = 0;
-      final stream = await connect.openRead(file);
-      await for (final chunk in stream.timeout(_stallTimeout)) {
-        hasher.add(chunk);
-        read += chunk.length;
-        onProgress?.call(read, expectedSize);
-      }
-      hasher.close();
-      final digest = sink.value;
-      if (digest == null || read != expectedSize) {
-        debugPrint('[backup][verify] remote="$smbPath" '
-            'size=$expectedSize read=$read');
-        return null;
-      }
-      return digest.toString();
-    } catch (e) {
-      debugPrint('[backup][verify] remote read error: $e');
-      return null;
-    }
-  }
-
-  /// 上传后、改名前的回读校验。
+  /// 「写入 API 返回成功」并不等于字节全部落盘——写入过程中若链路中断，服务端
+  /// 可能只收到部分字节，临时文件长度就会小于来源。因此改名之前比对远端临时文件
+  /// 长度与本地源文件长度，不等即删掉临时文件并抛错，由上层按失败处理，正式文件
+  /// 名上始终保留旧文件（fail-closed）。
   ///
-  /// 「写入 API 返回成功」并不等于字节落盘正确——网络与服务端都可能静默截短或
-  /// 改写内容（本项目的 GPS 丢失事故正是这种长度不变的静默差异）。因此改名之前
-  /// 必须把远端临时文件读回来算一次 SHA-256，与本地源文件一致才允许改名；
-  /// 不一致时删掉临时文件并抛错，由上层按失败处理，正式文件名上始终保留旧文件。
-  ///
-  /// [prefetchedHash] 为「上传期间已并行启动的本地摘要」（P2）：等待它即可拿到
-  /// 期望摘要，把本地重读整份文件的耗时吸收进上传阶段。为 null 时回退到顺序
-  /// [_hashLocalFile]，其他调用方零影响；**预取已执行但结果为 null** 表示
-  /// 「未能确认内容」，此时不再二次顺序重读，直接 fail-closed。
-  ///
-  /// [sourceSize] / [sourceModifiedMs] 是启动摘要与上传前记录的来源稳定锚点；
-  /// 改名之前复核二者是否仍然一致，发现变化一律 fail-closed（见 [decideVerify]）。
+  /// 这里只做一次远端 stat（成本近似为零），不再回读整份内容重算 SHA-256：全量
+  /// 回读在大文件上耗时数分钟且失败率高，而它查不出「长度不变、内容静默变化」
+  /// 这一类问题（GPS 丢失发生在手机端读取阶段，与上传落盘无关）。
   Future<void> _verifyUploadedTemp(
     SmbConnect connect,
-    SmbConfig config,
     String tempFull,
-    String localPath, {
-    UploadPhaseCallback? onPhase,
-    Future<String?>? prefetchedHash,
-    int? sourceSize,
-    int? sourceModifiedMs,
-  }) async {
-    final total = sourceSize ?? File(localPath).lengthSync();
-    final overlapped = prefetchedHash != null;
-    debugPrint('[backup][verify] START local="$localPath" size=$total '
-        'prefetched=$overlapped');
-
-    // 校验要读两遍整份文件：先本地哈希、再远端回读。预取摘要（P2）在上传期间
-    // 已并行算完，这里只等待结果；未预取时保持原有顺序哈希并上报 localHash 阶段。
-    final swLocal = Stopwatch()..start();
-    String? expected;
-    if (prefetchedHash != null) {
-      try {
-        expected = await prefetchedHash;
-      } catch (e) {
-        // 预取异常（isolate 启动失败等）同样按「未能确认内容」处理，fail-closed。
-        debugPrint('[backup][hash] 预取摘要异常 local="$localPath" err=$e');
-        expected = null;
-      }
-    } else {
-      expected = await _hashLocalFile(localPath,
-          onProgress: (read, t) =>
-              onPhase?.call(TransferPhase.localHash, read, t));
-    }
-    swLocal.stop();
-    debugPrint('[backup][stage] phase=localHash remote="$localPath" '
-        'ms=${swLocal.elapsedMilliseconds} overlapped=$overlapped');
-
-    // 远端回读：并发开关 >1 时走多连接区间回读，否则保持单连接顺序回读。
-    // S1：文件不超过一个区间（4 MiB）时只会切出 1 个区间，多连接区间路径会为
-    // 闲置区间白建连接与 worker（照片场景最常触发），直接回退单连接顺序读。
-    final swRemote = Stopwatch()..start();
-    final String? actual;
-    if (rangeReadbackConcurrency > 1 && total > rangeReadbackRangeBytes) {
-      actual = await _hashRemoteRangeVia(
-        config,
-        tempFull,
-        expectedSize: total,
-        concurrency: rangeReadbackConcurrency,
-        onPhase: onPhase,
-      );
-    } else {
-      actual = await _hashRemoteVia(connect, tempFull,
-          onProgress: (read, t) =>
-              onPhase?.call(TransferPhase.verifying, read, t));
-    }
-    swRemote.stop();
+    String localPath,
+  ) async {
+    final total = File(localPath).lengthSync();
     final remoteSize = await _remoteFileSize(connect, tempFull);
-
-    // 改名前的来源稳定性复核：发现 size / modified 变化即 fail-closed。
-    final sourceStable =
-        await _sourceStable(localPath, sourceSize, sourceModifiedMs);
-    final outcome = decideVerify(
-      localHash: expected,
-      remoteHash: actual,
-      remoteSize: remoteSize,
-      expectedSize: total,
-      sourceStable: sourceStable,
-    );
-    if (outcome == VerifyOutcome.deleteAndFail) {
-      debugPrint('[backup][verify] FAIL local="$localPath" '
-          'localHash=${expected ?? "null"} remoteHash=${actual ?? "null"} '
-          'remoteSize=$remoteSize expectedSize=$total '
-          'sourceStable=$sourceStable');
+    if (remoteSize != total) {
+      debugPrint('[backup][verify] SIZE MISMATCH local="$localPath" '
+          'remote=$remoteSize expected=$total');
       try {
         await _guard(_deleteRemoteIfExists(connect, tempFull));
       } catch (_) {
         // 清理失败不掩盖真正的校验失败原因。
       }
-      throw Exception('上传后校验失败：NAS 端内容与手机端不一致（已丢弃临时文件）');
+      throw Exception('上传后校验失败：NAS 端文件长度与手机端不一致（已丢弃临时文件）');
     }
-    debugPrint('[backup][verify] OK local="$localPath" hash=$expected '
-        'remoteMs=${swRemote.elapsedMilliseconds}');
+    debugPrint('[backup][verify] SIZE OK local="$localPath" size=$total');
   }
 
   /// 远端临时文件的真实大小；不存在或读取失败返回 -1（判定为不一致，fail-closed）。
@@ -1567,167 +1509,17 @@ class SmbService {
     }
   }
 
-  /// 复核源文件是否与启动时的锚点一致（「稳定性检查」）。
-  ///
-  /// 只比较 size + modified：长度可能不变、时间戳也可能有精度限制，因此这不能
-  /// 严格证明内容未被原位改写，只用于「发现变化即 fail-closed」。未提供锚点
-  /// （未预取摘要的调用方）时视为不检查，保持既有行为。
-  static Future<bool> _sourceStable(
-      String localPath, int? size, int? modifiedMs) async {
-    if (size == null && modifiedMs == null) return true;
-    try {
-      final stat = await File(localPath).stat();
-      if (size != null && stat.size != size) return false;
-      if (modifiedMs != null &&
-          stat.modified.millisecondsSinceEpoch != modifiedMs) {
-        return false;
-      }
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /// 用 [concurrency] 条独立连接并行回读远端临时文件并计算 SHA-256（P3 原型）。
-  ///
-  /// 每条连接按区间打开远端句柄读一段，数据交给 [RangeHashSequencer] 按偏移有序
-  /// 重排后喂入唯一的 SHA-256 sink——乱序到达绝不直接进摘要。任一段失败 / 短读 /
-  /// 超时 / 顺序异常（重叠、越界）/ 长度不符 → 返回 null；调用方据此删临时文件
-  /// 并按失败处理，**绝不 rename**。
-  ///
-  /// 返回前必定关闭全部回读连接：服务端会因未关闭的句柄拒绝 rename。
-  Future<String?> _hashRemoteRangeVia(
-    SmbConfig config,
-    String tempFull, {
-    required int expectedSize,
-    required int concurrency,
-    UploadPhaseCallback? onPhase,
-  }) async {
-    if (concurrency < 2 || expectedSize <= 0) return null;
-    final rangeBytes = rangeReadbackRangeBytes;
-    final ranges = planRanges(total: expectedSize, rangeBytes: rangeBytes);
-    // S1：连接数与 worker 数按 min(并发, 区间数) 取。区间数少于并发时，多余的
-    // 连接建完就闲置，既白付认证握手，又给 Samba 增加无谓的连接压力。
-    final workers = concurrency < ranges.length ? concurrency : ranges.length;
-    final sink = _DigestSink();
-    final hasher = sha256.startChunkedConversion(sink);
-    var consumed = 0;
-    // 有界重排：最坏缓冲 = 并发数 × 区间长度（在飞行的区间同时乱序到达），
-    // 硬界取两倍留余量，绝不随文件大小增长。
-    final sequencer = RangeHashSequencer(
-      totalBytes: expectedSize,
-      onOrdered: (chunk) {
-        hasher.add(chunk);
-        consumed += chunk.length;
-        // 有序 emit 才推进进度：bytesConsumed 单调不减。
-        onPhase?.call(TransferPhase.verifying, consumed, expectedSize);
-      },
-      maxBufferedBytes: rangeBytes * workers * 2,
-      maxOffsetLead: rangeBytes * workers * 2,
-    );
-
-    final connections = <SmbConnect>[];
-    final sw = Stopwatch()..start();
-    var ok = true;
-    debugPrint('[backup][verify] START remote="$tempFull" '
-        'size=$expectedSize ranges=${ranges.length} concurrency=$workers');
-
-    try {
-      for (var i = 0; i < workers; i++) {
-        connections.add(await createConnection(config));
-      }
-      // 读之前先核对远端大小：与来源不符就无需再读。
-      final remoteSize = await _remoteFileSize(connections.first, tempFull);
-      if (remoteSize != expectedSize) {
-        debugPrint('[backup][verify] range SIZE MISMATCH '
-            'remote=$remoteSize expected=$expectedSize');
-        sequencer.abort();
-        ok = false;
-      } else {
-        final scheduler =
-            RangeScheduler(ranges: ranges, concurrency: workers);
-        // 每个 worker 独占一条连接，从队首按偏移升序领取区间。
-        Future<void> worker(SmbConnect connect) async {
-          while (true) {
-            final range = scheduler.take();
-            if (range == null) return;
-            final swRange = Stopwatch()..start();
-            try {
-              await _readRangeInto(connect, tempFull, range, sequencer);
-              debugPrint('[backup][verify] range=${range.start}-${range.end} '
-                  'bytes=${range.length} ms=${swRange.elapsedMilliseconds}');
-            } finally {
-              scheduler.finish(range);
-            }
-          }
-        }
-
-        await Future.wait(connections.map(worker));
-
-        if (!sequencer.isComplete) {
-          debugPrint('[backup][verify] range INCOMPLETE '
-              'consumed=${sequencer.bytesConsumed} expected=$expectedSize');
-          ok = false;
-        }
-      }
-    } catch (e) {
-      debugPrint('[backup][verify] range read error: $e');
-      sequencer.abort();
-      ok = false;
-    } finally {
-      // rename 前必须关闭全部回读连接：句柄未关时服务端会拒绝 rename。
-      for (final connect in connections) {
-        await _closeQuietly(connect);
-      }
-    }
-
-    hasher.close();
-    final digest = sink.value;
-    sw.stop();
-    if (!ok || !sequencer.isComplete || digest == null) {
-      debugPrint('[backup][verify] range FAIL remote="$tempFull" '
-          'ok=$ok complete=${sequencer.isComplete} '
-          'consumed=${sequencer.bytesConsumed} expected=$expectedSize');
-      return null;
-    }
-    debugPrint('[backup][verify] range OK remote="$tempFull" '
-        'ranges=${ranges.length} concurrency=$workers '
-        'ms=${sw.elapsedMilliseconds}');
-    return digest.toString();
-  }
-
-  /// 读一个区间内**实际读到**的字节，按真实长度交给 [sequencer]。
-  ///
-  /// 按真实读到的字节推进偏移（短读只推进读到的长度，绝不假定读满）；区间读完
-  /// 仍有缺口时抛出，由调用方收敛为「校验失败、绝不 rename」。
-  Future<void> _readRangeInto(
-    SmbConnect connect,
-    String smbPath,
-    HashRange range,
-    RangeHashSequencer sequencer,
-  ) async {
-    final file = await _guard(connect.file(smbPath));
-    // 每个区间独立打开 / 关闭远端句柄（openRead 内部在流结束时关闭）。
-    final stream = await connect.openRead(file, range.start, range.end);
-    var offset = range.start;
-    await for (final chunk in stream.timeout(_stallTimeout)) {
-      if (chunk.isEmpty) continue;
-      sequencer.accept(offset, chunk);
-      offset += chunk.length;
-    }
-    if (offset != range.end) {
-      throw StateError('远端区间短读 [${range.start},${range.end}) '
-          'read=${offset - range.start}');
-    }
-  }
-
   /// 用指定连接上传一个本地文件。
   ///
-  /// 供并行备份的 worker 复用其独占连接；连接的创建/重连/关闭由调用方管理。
+  /// 供并行备份的 worker 复用其独占连接；连接的创建 / 关闭由调用方管理。
   /// 逐块从磁盘读取，不会把整个文件（视频可达 GB 级）读进内存。
   ///
-  /// [prefetchedHash] / [sourceSize] / [sourceModifiedMs] 为 P2 的「上传期间预取
-  /// 摘要 + 来源稳定锚点」，透传给回读校验；不传即保持原有顺序哈希路径。
+  /// 支持**断链续传**：内容一律先写 `.mipixtmp` 临时文件；单连接从 0 顺序写保证
+  /// 远端已写偏移之前的字节必然正确，因此重试 / 重连时若临时文件已存在且长度落在
+  /// `(0, total)` 之间，就从该长度（≈ 服务端当前大小）继续写，而不是从 0 重来。
+  /// 服务端偶发断链（见 [_shardMaxReconnects]）时，若提供 [reconnect] 会在本函数内
+  /// 重建连接续传；未提供 [reconnect] 时按连接类错误上抛，由调用方重试再次进入本
+  /// 函数（临时文件仍在，同样会续传）。
   Future<void> uploadFileVia(
     SmbConnect connect,
     SmbConfig config,
@@ -1735,64 +1527,103 @@ class SmbService {
     String localPath, {
     DateTime? sourceTime,
     UploadPhaseCallback? onPhase,
-    Future<String?>? prefetchedHash,
-    int? sourceSize,
-    int? sourceModifiedMs,
+    Future<SmbConnect> Function()? reconnect,
   }) async {
     final tempFull = _buildSMBPath(config, '$remotePath$uploadTempSuffix');
+    final total = await File(localPath).length();
+    final reader = await File(localPath).open();
+    // 捕获为 final 局部变量，便于在 catch 之后保持非空提升（参数在跨块时会失效）。
+    final reconnectFn = reconnect;
 
-    // 清掉上次中断可能残留的临时文件，保证本次从零写入（否则写短了会留旧内容的尾巴）。
-    await _guard(_deleteRemoteIfExists(connect, tempFull));
-
-    final tempFile = await _guard(connect.createFile(tempFull));
-    final writer = await _guard(connect.openWrite(tempFile));
-    final source = File(localPath);
-    final total = await source.length();
-    final reader = await source.open();
-
+    var activeConnect = connect;
+    var offset = 0;
+    var reconnects = 0;
     try {
-      var written = 0;
-      while (true) {
-        final chunk = await reader.read(_uploadChunkSize);
-        if (chunk.isEmpty) break;
-        writer.add(chunk);
-        await _guard(writer.flush());
-        written += chunk.length;
-        onPhase?.call(TransferPhase.uploading, written, total);
+      // 先探测远端临时文件：存在且长度 ∈ (0, total) 即从该处续传；否则清掉重写，
+      // 既避免上次中断留下的旧内容变成后缀尾巴，也避免长度已满时越写越错。
+      final existing = await _guard(_remoteFileSize(activeConnect, tempFull));
+      if (existing > 0 && existing < total) {
+        offset = existing;
+        debugPrint('[backup][resume] 单连接续传 remote="$remotePath" '
+            'offset=$offset total=$total');
+      } else {
+        await _guard(_deleteRemoteIfExists(activeConnect, tempFull));
+        await _guard(activeConnect.createFile(tempFull));
       }
-      await _guard(writer.close());
+
+      while (offset < total) {
+        // 本地读取位置同步到续传偏移：断链时已读过的那一块要重读。
+        await reader.setPosition(offset);
+        try {
+          // 每轮（首传 / 重连续传）都重开远端句柄并定位到续传偏移：新句柄位置是 0，
+          // 不定位就会把后续数据全部写回文件头。
+          final file = await _guard(activeConnect.file(tempFull));
+          final remote =
+              await _guard(activeConnect.open(file, mode: FileMode.write));
+          await remote.setPosition(offset);
+          try {
+            while (offset < total) {
+              final remaining = total - offset;
+              final want =
+                  remaining < _uploadChunkSize ? remaining : _uploadChunkSize;
+              final chunk = await reader.read(want);
+              if (chunk.isEmpty) break;
+              // 该库的 writeFrom 不会自行推进位置，每次写入前都要显式定位。
+              await remote.setPosition(offset);
+              await _guard(remote.writeFrom(chunk));
+              offset += chunk.length;
+              onPhase?.call(TransferPhase.uploading, offset, total);
+            }
+          } finally {
+            // 连接可能已被服务端重置：句柄关闭同样加超时兜底，避免空转拖停整批。
+            try {
+              await _guard(remote.close());
+            } catch (_) {}
+          }
+        } catch (e) {
+          // 非连接类错误（权限 / 逻辑）直接上抛；连接类错误才值得重建续传。
+          if (reconnectFn == null || !SmbService.isConnectionError(e)) rethrow;
+          reconnects += 1;
+          if (reconnects > _shardMaxReconnects) rethrow;
+          debugPrint('[backup][resume] 单连接断链 remote="$remotePath" '
+              'offset=$offset reconnect=$reconnects type=${e.runtimeType} err=$e');
+          // 重建一条可用连接后继续续传（偏移不变，只换连接与句柄）。
+          activeConnect = await reconnectFn();
+          continue;
+        }
+        // 内层已把 [offset, total) 全部写完，无需再续传。
+        break;
+      }
     } finally {
       await reader.close();
     }
 
-    // 回读校验通过后才允许改名（见 _verifyUploadedTemp）。
-    await _verifyUploadedTemp(connect, config, tempFull, localPath,
-        onPhase: onPhase,
-        prefetchedHash: prefetchedHash,
-        sourceSize: sourceSize,
-        sourceModifiedMs: sourceModifiedMs);
+    // 落盘长度比对通过后才允许改名（见 _verifyUploadedTemp）。
+    await _verifyUploadedTemp(activeConnect, tempFull, localPath);
 
     // 收尾阶段：改名到正式文件名、再回写拍摄时间。
     onPhase?.call(TransferPhase.finalizing, 0, 0);
     // 整份写完才改名到正式文件名，同名旧文件由 replace 覆盖。
+    final finalFile = await _guard(activeConnect.file(tempFull));
     final swRename = Stopwatch()..start();
     try {
-      await _guard(connect.rename(
-        tempFile,
+      await _guard(activeConnect.rename(
+        finalFile,
         _buildSMBPath(config, remotePath),
         replace: true,
       ));
     } catch (e) {
       // 改名失败（例如目的地已被服务端句柄锁死）时清掉临时文件，
       // 否则会在远端堆积一份与正式文件等大的残片。
-      await _guard(_deleteRemoteIfExists(connect, tempFull));
+      await _guard(_deleteRemoteIfExists(activeConnect, tempFull));
       rethrow;
     }
     swRename.stop();
     debugPrint('[backup][stage] phase=rename remote="$remotePath" '
         'ms=${swRename.elapsedMilliseconds}');
 
-    await _applySourceTime(connect, config, remotePath, localPath, sourceTime);
+    await _applySourceTime(
+        activeConnect, config, remotePath, localPath, sourceTime);
   }
 
   /// 把远端正式文件的创建与修改时间回写为手机相册的拍摄时间。
@@ -1808,11 +1639,12 @@ class SmbService {
       final remoteFile =
           await _guard(connect.file(_buildSMBPath(config, remotePath)));
       final sw = Stopwatch()..start();
-      await connect.setFileTime(
+      // setFileTime 同样加卡死上限：服务端持锁不回 ACK 时不能无限挂住收尾阶段。
+      await _guard(connect.setFileTime(
         remoteFile,
         lastWriteTime: time,
         createTime: time,
-      );
+      ));
       sw.stop();
       debugPrint('[backup][stage] phase=setFileTime remote="$remotePath" '
           'ms=${sw.elapsedMilliseconds}');
@@ -1829,9 +1661,6 @@ class SmbService {
   ///
   /// 低于 [uploadParallelThresholdBytes] 或 [parallelism] < 2 时直接回落到单连接
   /// [uploadFileVia]，避免小文件被连接建立/认证开销拖累。
-  ///
-  /// [prefetchedHash] / [sourceSize] / [sourceModifiedMs] 同 [uploadFileVia]：
-  /// P2 的「上传期间预取摘要 + 来源稳定锚点」透传，不传即保持原有顺序哈希路径。
   Future<void> uploadFileParallel(
     SmbConfig config,
     String remotePath,
@@ -1839,22 +1668,24 @@ class SmbService {
     DateTime? sourceTime,
     int parallelism = _uploadChunkParallelism,
     UploadPhaseCallback? onPhase,
-    Future<String?>? prefetchedHash,
-    int? sourceSize,
-    int? sourceModifiedMs,
   }) async {
     final total = await File(localPath).length();
     if (total < uploadParallelThresholdBytes || parallelism < 2) {
-      final connect = await createConnection(config);
+      // 单连接路径（含并发=1 时的大文件）：断链时由本函数负责重建连接并续传，
+      // 新建的连接全部登记在 [conns] 里，结束时统一关闭。
+      // 建连也加卡死上限：服务端残留锁 / 不响应时不能把整个上传挂死在这里。
+      final conns = <SmbConnect>[await _guard(createConnection(config))];
       try {
-        await uploadFileVia(connect, config, remotePath, localPath,
-            sourceTime: sourceTime,
-            onPhase: onPhase,
-            prefetchedHash: prefetchedHash,
-            sourceSize: sourceSize,
-            sourceModifiedMs: sourceModifiedMs);
+        await uploadFileVia(conns.first, config, remotePath, localPath,
+            sourceTime: sourceTime, onPhase: onPhase, reconnect: () async {
+          final next = await _guard(createConnection(config));
+          conns.add(next);
+          return next;
+        });
       } finally {
-        await _closeQuietly(connect);
+        for (final c in conns) {
+          await _closeQuietly(c);
+        }
       }
       return;
     }
@@ -1864,7 +1695,7 @@ class SmbService {
     // 用一条独立连接做「准备 + 收尾」：先清掉上次中断残留的临时文件，再建出一个
     // 空文件。分片写入要以 FileMode.write 打开已存在的文件（该库的 open 只发
     // FILE_OPEN，不会创建），且各连接共用同一个文件——默认共享模式允许这样做。
-    final setup = await createConnection(config);
+    final setup = await _guard(createConnection(config));
 
     try {
       try {
@@ -1924,12 +1755,8 @@ class SmbService {
         await _closeQuietly(connect);
       }
 
-      // 回读校验通过后才允许改名（见 _verifyUploadedTemp）。
-      await _verifyUploadedTemp(setup, config, tempFull, localPath,
-          onPhase: onPhase,
-          prefetchedHash: prefetchedHash,
-          sourceSize: sourceSize,
-          sourceModifiedMs: sourceModifiedMs);
+      // 落盘长度比对通过后才允许改名（见 _verifyUploadedTemp）。
+      await _verifyUploadedTemp(setup, tempFull, localPath);
 
       // 收尾阶段：改名到正式文件名、再回写拍摄时间。
       onPhase?.call(TransferPhase.finalizing, 0, 0);
@@ -1961,8 +1788,13 @@ class SmbService {
 
   /// 把本地文件 [start, end) 字节区间写入远端 [tempFull] 的对应偏移。
   ///
-  /// 自己新建一条连接并登记到 [connections]，由调用方在全部结束后统一关闭；
-  /// 逐块读写，不会把整个文件读进内存。
+  /// 每轮（首传或重连续传）都新建一条连接并登记到 [connections]，写完当前区间
+  /// 后自行关闭句柄与连接；调用方也会在整批结束后统一关闭 [connections]，对已关
+  /// 连接是幂等的 no-op。逐块读写，不会把整个文件读进内存。
+  ///
+  /// 写入过程中连接被服务端断开时（见 [_shardMaxReconnects]），不把整个文件
+  /// 判失败，而是重建连接、重新打开远端句柄，从**最后一个已确认写入的偏移**
+  /// 继续写——已确认的字节不会重写，未写完的部分接着写。
   Future<void> _writeRange({
     required SmbConfig config,
     required String tempFull,
@@ -1972,36 +1804,55 @@ class SmbService {
     required List<SmbConnect> connections,
     required void Function(int) report,
   }) async {
-    final connect = await _guard(createConnection(config));
-    connections.add(connect);
-    final reader = await File(localPath).open();
+    final source = await File(localPath).open();
+    var offset = start;
+    var reconnects = 0;
     try {
-      final file = await _guard(connect.file(tempFull));
-      final remote = await _guard(connect.open(file, mode: FileMode.write));
-      try {
-        // 本地读取必须定位到本分片起点：RandomAccessFile 从当前位置顺序读，
-        // 不定位的话每个分片都会从文件头开始读，把前段数据写到自己的偏移上，
-        // 结果就是整份文件内容错位。
-        await reader.setPosition(start);
-        var offset = start;
-        while (offset < end) {
-          final remaining = end - offset;
-          final want = remaining < _uploadChunkSize ? remaining : _uploadChunkSize;
-          final chunk = await reader.read(want);
-          if (chunk.isEmpty) break;
-          // 该库的 writeFrom 不会自行推进位置，每次写入前都要显式定位。
-          await remote.setPosition(offset);
-          await _guard(remote.writeFrom(chunk));
-          offset += chunk.length;
-          report(chunk.length);
+      await source.setPosition(start);
+      while (offset < end) {
+        // 每轮（首传或重连续传）都重新建连、重新打开远端句柄，并定位到续传偏移：
+        // 新句柄的位置是 0，不定位就会把后续数据全部写回文件头。
+        final connect = await _guard(createConnection(config));
+        connections.add(connect);
+        final file = await _guard(connect.file(tempFull));
+        final remote = await _guard(connect.open(file, mode: FileMode.write));
+        await remote.setPosition(offset);
+        // 本地读取位置也要同步回续传偏移（断链时已读过的那一块要重读）。
+        await source.setPosition(offset);
+
+        var failed = false;
+        try {
+          while (offset < end) {
+            final remaining = end - offset;
+            final want =
+                remaining < _uploadChunkSize ? remaining : _uploadChunkSize;
+            final chunk = await source.read(want);
+            if (chunk.isEmpty) break;
+            // 该库的 writeFrom 不会自行推进位置，每次写入前都要显式定位。
+            await remote.setPosition(offset);
+            await _guard(remote.writeFrom(chunk));
+            offset += chunk.length;
+            report(chunk.length);
+          }
+        } catch (e) {
+          reconnects += 1;
+          if (reconnects > _shardMaxReconnects) rethrow;
+          failed = true;
+          debugPrint('[backup][resume] 分片 $start..$end 断链 offset=$offset '
+              'reconnect=$reconnects type=${e.runtimeType} err=$e');
+        } finally {
+          // 连接可能已被服务端重置：不加超时的话，这条 tree disconnect 会在
+          // 库内部按「3 秒响应超时 × 5 次重试」空转 15 秒，把整批传输拖停。
+          try {
+            await _guard(remote.close());
+          } catch (_) {}
+          await _closeQuietly(connect);
         }
-      } finally {
-        // 连接可能已被服务端重置：不加超时的话，这条 tree disconnect 会在
-        // 库内部按「3 秒响应超时 × 5 次重试」空转 15 秒，把整批传输拖停。
-        await _guard(remote.close());
+        // 本轮没失败即该分片已写完。
+        if (!failed) break;
       }
     } finally {
-      await reader.close();
+      await source.close();
     }
   }
 
