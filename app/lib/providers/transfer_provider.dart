@@ -143,6 +143,7 @@ Future<Object?> uploadWithRetry({
   required UploadFailureGuard guard,
   Future<void> Function()? reconnect,
   int maxRetries = 3,
+  Duration Function(int attempt)? backoff,
   void Function(UploadFailureEvent event)? onFailure,
 }) async {
   var left = maxRetries;
@@ -166,13 +167,25 @@ Future<Object?> uploadWithRetry({
           try {
             await reconnect();
           } catch (reconnectError) {
-            // 重建连接都失败了，说明链路确实不可用：立即收敛，不再重试。
-            guard.record(reconnectError);
+            // 重建连接失败**不等于**链路已废：Wi-Fi 瞬断/网卡漫游的那几秒里，
+            // 新建连接必然全部失败（`Can't connect to …`）。若在此处立即收敛，
+            // 一次网络抖动就会把文件判死——这正是本函数要避免的场景。改为继续
+            // 消耗重试预算，靠下面的退避等到链路恢复后再试。
+            //
+            // 注意：这里**不再**把 reconnectError 计入 guard。同一个失败回合里
+            // 上传失败与重连失败是同一件事的两面，重复计数会让「链路不可用」
+            // 阈值提前一倍触发，一次短抖动就可能把整批剩余文件全部误判失败。
             reconnectFailed = true;
           }
         }
         // 大文件（分片并行）没有外部连接可重建：uploadFileParallel 每次调用
         // 都会自行新建分片连接，直接重试即为「换一批新连接」。
+        //
+        // 指数退避（1s→2s→4s→8s 封顶）：给瞬时断网/漫游留出恢复窗口，等效于
+        // 「检测到网络丢失后等它回来再继续」；同时避免重试在几十毫秒内叠成
+        // 连接风暴把服务端的连接闸门顶穿。
+        await Future<void>.delayed(
+            backoff?.call(attempt) ?? _defaultUploadBackoff(attempt));
       }
       onFailure?.call((
         error: e,
@@ -182,11 +195,17 @@ Future<Object?> uploadWithRetry({
         reconnectFailed: reconnectFailed,
         guardStopped: guard.shouldStop,
       ));
-      if (!retryable || reconnectFailed) {
+      if (!retryable) {
         return e;
       }
     }
   }
+}
+
+/// [uploadWithRetry] 的默认退避阶梯：1s、2s、4s，之后 8s 封顶。
+Duration _defaultUploadBackoff(int attempt) {
+  final seconds = 1 << (attempt - 1);
+  return Duration(seconds: seconds > 8 ? 8 : seconds);
 }
 
 /// 把异常压成单行、定长、不含密码的诊断摘要。

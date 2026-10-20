@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mipix_app/models/models.dart';
 import 'package:mipix_app/providers/transfer_provider.dart';
 import 'package:mipix_app/services/smb_service.dart';
+import 'package:smb_connect/src/exceptions.dart' show SmbException;
 
 /// 构造一个冲突候选，减少测试噪音。
 ConflictCandidate _cand(String localPath, String album, String remotePath, int size) {
@@ -51,6 +52,35 @@ void main() {
       expect(SmbService.isConnectionError(ArgumentError('invalid argument')), isFalse);
       expect(SmbService.isConnectionError(Exception('Access is denied.')), isFalse);
     });
+
+    test('建连失败（裸字符串）也属于连接类错误', () {
+      // 回归：vendored smb_connect 建连失败抛的是裸字符串而不是 SocketException。
+      // 漏判会让一次 Wi-Fi 抖动把文件直接判死（线上 7 个失败的主因）。
+      expect(SmbService.isConnectionError("Can't connect to 192.168.31.184"), isTrue);
+      expect(SmbService.isConnectionError("Can't connect to nas"), isTrue);
+      expect(
+        SmbService.isConnectionError(
+            const SocketException('Connection refused')),
+        isTrue,
+      );
+      expect(
+        SmbService.isConnectionError(
+            const SocketException('Network is unreachable')),
+        isTrue,
+      );
+    });
+
+    test('SmbException 按 message 判定：toString 只有 "Instance of ..."', () {
+      // 回归：SmbException 未覆写 toString()，只看 toString 会把会话过期当成
+      // 业务失败直接丢弃（现场 IMG_20260823_042756.jpg 的失败原因）。
+      final sessionGone = SmbException('NT_STATUS_NETWORK_NAME_DELETED');
+      expect(sessionGone.toString(), "Instance of 'SmbException'");
+      expect(SmbService.isConnectionError(sessionGone), isTrue);
+      expect(
+        SmbService.isConnectionError(SmbException('NT_STATUS_USER_SESSION_DELETED')),
+        isTrue,
+      );
+    });
   });
 
   group('UploadFailureGuard', () {
@@ -89,6 +119,7 @@ void main() {
       var attempts = 0;
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async {
           attempts += 1;
           calls.add('upload$attempts');
@@ -103,12 +134,13 @@ void main() {
       expect(calls, ['upload1', 'reconnect', 'upload2', 'reconnect', 'upload3']);
     });
 
-    test('重连失败立即收敛为失败，不再空转重试', () async {
+    test('重连失败不再立即收敛：退避后继续重试，直到预算耗尽', () async {
       final guard = UploadFailureGuard();
       var uploads = 0;
       var reconnects = 0;
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async {
           uploads += 1;
           throw TimeoutException('stall');
@@ -119,8 +151,32 @@ void main() {
         },
       );
       expect(error, isA<TimeoutException>());
-      expect(uploads, 1);
-      expect(reconnects, 1);
+      // maxRetries = 3 → 共 4 次上传尝试：前 3 次各消耗一次预算并尝试重连。
+      // 关键回归点：重连失败**不再**让第 1 次就直接判死。
+      expect(uploads, 4);
+      expect(reconnects, 3);
+    });
+
+    test('瞬断后链路恢复：重连先失败（连不上）后成功，文件最终成功', () async {
+      final guard = UploadFailureGuard();
+      var uploads = 0;
+      var reconnects = 0;
+      final error = await uploadWithRetry(
+        guard: guard,
+        backoff: (_) => Duration.zero,
+        upload: () async {
+          uploads += 1;
+          if (uploads < 3) throw StateError('Bad state: StreamSink is closed');
+        },
+        reconnect: () async {
+          reconnects += 1;
+          // 前两次重连都撞上「连不上服务端」，第三次网络已恢复。
+          if (reconnects < 3) throw "Can't connect to 192.168.31.184";
+        },
+      );
+      expect(error, isNull);
+      expect(uploads, 3);
+      expect(reconnects, 2);
     });
 
     test('非连接类错误不重试（如权限不足）', () async {
@@ -145,6 +201,7 @@ void main() {
       var attempts = 0;
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async {
           attempts += 1;
           if (attempts < 2) throw const SocketException('reset');
@@ -159,6 +216,7 @@ void main() {
       var uploads = 0;
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async {
           uploads += 1;
           throw TimeoutException('stall');
@@ -176,6 +234,7 @@ void main() {
       var reconnects = 0;
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async {
           uploads += 1;
           throw TimeoutException('stall');
@@ -194,6 +253,7 @@ void main() {
       var attempts = 0;
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async {
           attempts += 1;
           if (attempts < 3) throw StateError('Bad state: StreamSink is closed');
@@ -212,20 +272,23 @@ void main() {
       expect(events.every((e) => !e.guardStopped), isTrue);
     });
 
-    test('P0.1 重连失败时 onFailure 标记 reconnectFailed', () async {
+    test('P0.1 重连失败时 onFailure 标记 reconnectFailed（且不再立即收敛）', () async {
       final guard = UploadFailureGuard();
       final events = <UploadFailureEvent>[];
       final error = await uploadWithRetry(
         guard: guard,
+        backoff: (_) => Duration.zero,
         upload: () async => throw TimeoutException('stall'),
         reconnect: () async => throw const SocketException('no route to host'),
         onFailure: events.add,
       );
       expect(error, isA<TimeoutException>());
-      expect(events.length, 1);
-      expect(events.single.attempt, 1);
-      expect(events.single.reconnectAttempted, isTrue);
-      expect(events.single.reconnectFailed, isTrue);
+      // 重连失败不再立即收敛：3 次预算耗尽后还有一次「无预算」的收尾尝试。
+      expect(events.map((e) => e.attempt), [1, 2, 3, 4]);
+      expect(events.take(3).every((e) => e.reconnectAttempted), isTrue);
+      expect(events.take(3).every((e) => e.reconnectFailed), isTrue);
+      expect(events.last.reconnectAttempted, isFalse);
+      expect(events.every((e) => e.connectionError), isTrue);
     });
   });
 

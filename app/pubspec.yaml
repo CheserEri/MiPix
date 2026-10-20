@@ -1,7 +1,7 @@
 name: mipix_app
 description: "MiPix 米影相册 - 纯本地相册管理与 SMB 备份"
 publish_to: 'none'
-version: 1.0.10+11
+version: 1.0.11+12
 
 environment:
   sdk: ^3.11.0

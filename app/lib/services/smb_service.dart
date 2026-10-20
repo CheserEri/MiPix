@@ -1363,7 +1363,12 @@ class SmbService {
   static bool isConnectionError(Object error) {
     if (error is TimeoutException) return true;
     if (error is SocketException) return true;
-    final msg = error.toString().toLowerCase();
+    // `SmbException extends Error` 且**没有**覆写 `toString()`，直接 `$e` 只会得到
+    // `Instance of 'SmbException'`——真正的 NT 状态名在 `message` 字段里。会话过期
+    // / 网络名删除这类致命连接错误全部走这个类型，不取 message 就永远判不出来，
+    // 只能被当作业务失败直接丢弃（现场已观测到）。
+    final msg = (error is SmbException ? error.message : error.toString())
+        .toLowerCase();
     return msg.contains('network name') ||
         msg.contains('nt_status') ||
         msg.contains('not available') ||
@@ -1372,6 +1377,17 @@ class SmbService {
         msg.contains('reset by peer') ||
         msg.contains('connection abort') ||
         msg.contains('cant send request') ||
+        // 建连阶段失败。vendored 库在协商/会话建立失败时抛出的是**裸字符串**
+        // `"Can't connect to <host>"`（见 packages/smb_connect/lib/src/connect/
+        // smb_connect.dart），既不是 SocketException 也不含 NT 状态名。它本质是
+        // 连接类错误，必须纳入重试：Wi-Fi 瞬断/网卡漫游的那几秒内，新建连接必然
+        // 全部失败，若判成「非连接错误」就会一次抖动把文件直接判死。
+        msg.contains("can't connect") ||
+        msg.contains('cant connect') ||
+        msg.contains('cannot connect') ||
+        msg.contains('failed to connect') ||
+        msg.contains('connection refused') ||
+        msg.contains('no route to host') ||
         // 本地 socket/sink 已关闭（SocketWriter.write / SocketReader2）
         msg.contains('streamsink is closed') ||
         msg.contains('stream sink is closed') ||
@@ -1498,15 +1514,16 @@ class SmbService {
     debugPrint('[backup][verify] SIZE OK local="$localPath" size=$total');
   }
 
-  /// 远端临时文件的真实大小；不存在或读取失败返回 -1（判定为不一致，fail-closed）。
+  /// 远端临时文件的真实大小；**文件确实不存在**时返回 -1。
+  ///
+  /// 读取失败**必须原样抛出**：这条链路本身要走 SMB（`file()` 是一次远端请求），
+  /// 链路中断时会抛 `SocketException(errno=103)` / `SmbException`。旧实现把任何
+  /// 异常都吞成 -1，于是上层把「读不到大小」误当成「长度不一致」，抛出一个普通
+  /// `Exception`——既不命中连接类错误判定、也不会重试，文件被永久判死（现场事故）。
+  /// 现在抛出原始异常，由 `uploadWithRetry` 按连接类错误退避重连重试。
   Future<int> _remoteFileSize(SmbConnect connect, String smbPath) async {
-    try {
-      final file = await _guard(connect.file(smbPath));
-      return file.isExists ? file.size : -1;
-    } catch (e) {
-      debugPrint('[backup][verify] remote stat error: $e');
-      return -1;
-    }
+    final file = await _guard(connect.file(smbPath));
+    return file.isExists ? file.size : -1;
   }
 
   /// 用指定连接上传一个本地文件。
