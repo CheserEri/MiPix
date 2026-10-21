@@ -197,12 +197,18 @@ class CacheService {
     await _prefs!.setString(key, jsonEncode(data));
   }
 
+  /// 相册列表缓存版本。
+  ///
+  /// v2：纯视频相册的封面改为视频首帧，旧缓存里这些相册的 `coverPath`
+  /// 仍是 null，不升版本会继续显示灰色占位。
+  static const _albumsCacheVersion = 'v2';
+
   /// 相册列表缓存键。
   ///
   /// 必须把 [albumPath] 纳入键：`getAlbums` 支持浏览子目录，只用 serverId
   /// 做键会让子目录错误地命中根目录的缓存列表。
   String _albumsKey(String serverId, String albumPath) =>
-      '${_albumCachePrefix}list_${serverId}_${albumPath.isEmpty ? '__root__' : albumPath}';
+      '${_albumCachePrefix}list_${serverId}_${albumPath.isEmpty ? '__root__' : albumPath}_$_albumsCacheVersion';
 
   Future<void> cacheAlbums(String serverId, String albumPath, List<Album> albums) async {
     await ensureInitialized();

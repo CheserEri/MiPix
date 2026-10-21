@@ -744,8 +744,6 @@ class SmbService {
 
     final mediaFiles =
         files.where((f) => !f.isDirectory() && _isMedia(f.name)).toList();
-    // 相册封面只能是图片：视频无法直接解码成缩略图。
-    final coverCandidates = mediaFiles.where((f) => _isImage(f.name)).toList();
 
     // basePath 自身是当前浏览位置，不作为它自己的子相册。
     if (mediaFiles.isNotEmpty && relative.isNotEmpty) {
@@ -758,7 +756,7 @@ class SmbService {
             connect,
             config,
             currentPath,
-            coverCandidates,
+            mediaFiles,
           ),
           count: mediaFiles.length,
           parentPath: _parentOfRemotePath(currentPath),
@@ -787,12 +785,14 @@ class SmbService {
     }
   }
 
-  /// 相册封面：优先使用用户自定义封面，否则取目录内最后修改时间最新的图片。
+  /// 相册封面：优先使用用户自定义封面，其次是目录内最新的图片；
+  /// 纯视频目录（如「所有视频」「Rokid AI」）没有图片时退而取最新的视频，
+  /// 由 UI 侧对该路径抽帧显示，避免这类相册只剩灰色占位。
   Future<String?> _resolveAlbumCover(
     SmbConnect connect,
     SmbConfig config,
     String albumPath,
-    List<SmbFile> imageFiles,
+    List<SmbFile> mediaFiles,
   ) async {
     final prefs = await _getPrefs();
     final customCoverKey = 'custom_cover_${config.id}_$albumPath';
@@ -807,12 +807,19 @@ class SmbService {
       }
     }
 
-    SmbFile? latest;
-    for (final image in imageFiles) {
-      if (latest == null || image.lastModified > latest.lastModified) {
-        latest = image;
+    SmbFile? latestImage;
+    SmbFile? latestVideo;
+    for (final file in mediaFiles) {
+      if (_isImage(file.name)) {
+        if (latestImage == null || file.lastModified > latestImage.lastModified) {
+          latestImage = file;
+        }
+      } else if (latestVideo == null ||
+          file.lastModified > latestVideo.lastModified) {
+        latestVideo = file;
       }
     }
+    final latest = latestImage ?? latestVideo;
     return latest == null ? null : '$albumPath/${latest.name}';
   }
 
