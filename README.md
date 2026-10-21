@@ -3,7 +3,7 @@
 纯本地运行的 Android 相册应用：浏览手机照片与视频，并通过 SMB 协议把照片备份到 NAS。无后端服务、无账号体系，数据只在本机与自有 SMB 服务器之间流动。
 
 - Flutter + Riverpod，仅 Android
-- 版本 `1.0.12+13`（Dart SDK `^3.11.0`）
+- 版本 `1.0.13+14`（Dart SDK `^3.11.0`）
 - compileSdk 36 / targetSdk 35 / minSdk 跟随 `flutter.minSdkVersion`
 - applicationId `com.chesereri.mipix`
 
