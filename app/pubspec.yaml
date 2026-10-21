@@ -34,5 +34,3 @@ dependency_overrides:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/branding/mipix_logo_ui.png
