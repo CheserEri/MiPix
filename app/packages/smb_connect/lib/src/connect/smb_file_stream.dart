@@ -33,19 +33,28 @@ Stream<Uint8List> smbOpenRead(
   var buffSize = min(length, smbReadBlockSize);
   var position = 0;
   Uint8List buff = Uint8List(buffSize);
-  do {
-    var remain = length - position;
-    var readLen = min(buff.length, remain);
-    var res = await smbReadFromFile(
-        file, tree, fileId, fid, buff, position + start, 0, readLen);
-    // 服务端可能短读甚至返回 0：必须按真实读到的字节数上报。原来的实现只要
-    // 请求长度等于缓冲区长度就整块 yield，短读时会把缓冲区里遗留的旧字节
-    // 当作新数据（长度不变、内容错位），这在「上传后回读校验」里是致命的。
-    if (res <= 0) break;
-    yield res == buff.length ? buff : Uint8List.view(buff.buffer, 0, res);
-    position += res;
-  } while (position < length);
-  await smbCloseFile(file, tree, fileId, fid);
+  try {
+    do {
+      var remain = length - position;
+      var readLen = min(buff.length, remain);
+      var res = await smbReadFromFile(
+          file, tree, fileId, fid, buff, position + start, 0, readLen);
+      // 服务端可能短读甚至返回 0：必须按真实读到的字节数上报。原来的实现只要
+      // 请求长度等于缓冲区长度就整块 yield，短读时会把缓冲区里遗留的旧字节
+      // 当作新数据（长度不变、内容错位），这在「上传后回读校验」里是致命的。
+      if (res <= 0) break;
+      yield res == buff.length ? buff : Uint8List.view(buff.buffer, 0, res);
+      position += res;
+    } while (position < length);
+  } finally {
+    // 消费者提前取消订阅（如视频播放器断开、拖动进度条）时也必须关闭句柄，
+    // 否则共享连接上的未关闭句柄会不断累积，最终让服务端拒绝后续 CREATE。
+    try {
+      await smbCloseFile(file, tree, fileId, fid);
+    } catch (_) {
+      // 连接已断开时关闭失败无需处理，句柄随连接一起回收。
+    }
+  }
 }
 
 void readAsync(SmbFile file, SmbTree tree, Uint8List? fileId, int fid,

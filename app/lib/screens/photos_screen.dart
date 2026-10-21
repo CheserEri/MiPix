@@ -267,8 +267,12 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     final yesterday = today.subtract(const Duration(days: 1));
     if (date == today) return '今天';
     if (date == yesterday) return '昨天';
-    // 与小米相册一致：只显示「M月d日」，不带年份与星期。
+    // 今年只显示「M月d日」；去年及更早必须带年份，否则 2025 年的照片
+    // 会被误认为今年拍的（如只显示「8月23日」）。
     // 模式里只有数字占位符，无需 zh_CN 语言包，避免启动时初始化 intl 数据。
+    if (date.year != now.year) {
+      return DateFormat('yyyy年M月d日').format(date);
+    }
     return DateFormat('M月d日').format(date);
   }
 
@@ -282,9 +286,11 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
           initialIndex: index,
         ),
       ),
-    ).then((_) {
-      // 查看器里可能删除了照片，返回后刷新列表。
-      if (mounted) ref.read(localPhotosProvider.notifier).load();
+    ).then((deleted) {
+      // 查看器里可能删除了照片，返回后仅在确有删除时刷新列表。
+      if (mounted && deleted == true) {
+        ref.read(localPhotosProvider.notifier).load();
+      }
     });
   }
 

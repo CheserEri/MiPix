@@ -142,6 +142,7 @@ flutter test
 | `INTERNET` / `ACCESS_NETWORK_STATE` / `ACCESS_WIFI_STATE` | SMB 连接与网络状态 |
 | `WAKE_LOCK` | 备份期间保持 CPU 唤醒 |
 | `READ_MEDIA_IMAGES` | Android 13+ 读取图片 |
+| `READ_MEDIA_VIDEO` | Android 13+ 读取视频（必须与图片权限同时声明，否则查询不到任何视频） |
 | `READ_MEDIA_VISUAL_USER_SELECTED` | Android 14+ 部分授权 |
 | `READ_EXTERNAL_STORAGE`（maxSdk 32） | Android 12 及以下读取媒体 |
 | `WRITE_EXTERNAL_STORAGE`（maxSdk 29） | Android 10 及以下保存到相册 |
@@ -167,10 +168,16 @@ flutter test
 - 对账（`reconcileSynced`）只按「同名 + 同大小」判断，不校验哈希；同名同大小的不同内容可能被误记为已备份。
 - 跨批次没有按「服务器 + 远端路径」互斥，两个重叠批次仍可能争用同一远端路径。
 - 保活锁的并发 `acquire` 存在计数竞态，极端情况下原生锁状态与引用计数可能不一致。
-- Android 13+ 的 Manifest 只声明了 `READ_MEDIA_IMAGES`，未声明 `READ_MEDIA_VIDEO`；视频在部分系统上可能不可见。
+- 远端视频通过本地回环 HTTP 代理在线播放，容器支持取决于 ExoPlayer：AVI / WMV 无法播放。
 - 本地照片列表只读取最近 500 张，更早的照片不会出现在「照片」页。
 - 远端相册扫描最多 8 层，深层目录不会继续展开。
 
 ## License
 
 [MIT](./LICENSE)
+
+## 致谢
+
+MiPix 的开发过程中，Mimo 与 DeepSeek 两个大模型提供了实实在在的帮助：从 SMB 视频流式播放的链路设计、视频缩略图的原生抽帧方案，到进度条手势冲突的逐层排查、Android 媒体权限的定位，以及大量代码审查、文档整理与真机问题分析，都离不开它们的支持。它们帮助这个纯本地、无后端的小项目一步步走到今天，在此致以诚挚的感谢。
+
+同时也感谢 Flutter、Riverpod、photo_manager、video_player、smb_connect 等开源项目的作者与维护者——没有这些扎实的基础设施，MiPix 无从开始。

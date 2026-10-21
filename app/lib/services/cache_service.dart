@@ -36,7 +36,10 @@ class CacheService {
   /// 缓存，旧的媒体列表会存活满 7 天 TTL。递增版本号可让升级后的首次
   /// 加载强制重新扫描一次（EXIF 时间缓存不带版本，因此不会被重复探测）。
   /// v5：媒体白名单纳入视频扩展名，旧缓存只含图片，需重新扫描才能显示视频。
-  static const _albumMediaCacheVersion = 'v5';
+  /// v6：SMB2 目录枚举提前结束（见 `Smb2FilesEnumerator`）会让半截列表被
+  /// 缓存 7 天，表现为「相册张数正确但照片只显示到某一天」。递增版本号
+  /// 使已落盘的坏缓存整体作废，升级后首次进入重新完整枚举。
+  static const _albumMediaCacheVersion = 'v6';
 
   /// 默认缓存上限：500 MB。
   static const int defaultCacheLimitBytes = 500 * 1024 * 1024;

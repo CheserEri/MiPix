@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -9,6 +10,7 @@ import '../providers/smb_provider.dart';
 import '../services/smb_service.dart';
 import '../services/photo_service.dart';
 import '../services/local_storage_service.dart';
+import '../services/remote_video_proxy.dart';
 import '../utils/mipix_theme.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:photo_manager/photo_manager.dart';
@@ -23,6 +25,18 @@ const SystemUiOverlayStyle _viewerOverlayStyle = SystemUiOverlayStyle(
   statusBarBrightness: Brightness.dark,
   systemNavigationBarColor: Colors.transparent,
   systemNavigationBarIconBrightness: Brightness.light,
+  systemNavigationBarDividerColor: Colors.transparent,
+  systemNavigationBarContrastEnforced: false,
+  systemStatusBarContrastEnforced: false,
+);
+
+/// 视频播放页的系统 UI 样式：顶部白色栏、底部白色操作栏，图标需为深色。
+const SystemUiOverlayStyle _videoChromeOverlayStyle = SystemUiOverlayStyle(
+  statusBarColor: Colors.transparent,
+  statusBarIconBrightness: Brightness.dark,
+  statusBarBrightness: Brightness.light,
+  systemNavigationBarColor: Colors.transparent,
+  systemNavigationBarIconBrightness: Brightness.dark,
   systemNavigationBarDividerColor: Colors.transparent,
   systemNavigationBarContrastEnforced: false,
   systemStatusBarContrastEnforced: false,
@@ -96,6 +110,8 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
   @override
   Widget build(BuildContext context) {
     final photo = widget.photos[_currentIndex];
+    // 视频页拥有独立的小米风格白色栏与播放控制，因此不再叠加通用黑色 UI。
+    final isVideo = photo.isVideo;
     // 限制解码尺寸：原图（如 4032×2268）全分辨率解码会产生数十 MB 位图，
     // 翻页时多页并存会拖垮光栅线程。按屏幕宽度的 2 倍解码，
     // 既大幅降低内存/解码开销，又保留一定放大画质。
@@ -122,8 +138,25 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
               itemCount: widget.photos.length,
               itemBuilder: (context, index) {
                 final item = widget.photos[index];
-                if (!widget.isRemote && item.isVideo) {
-                  return Center(child: _LocalVideoPlayer(path: item.path));
+                if (item.isVideo) {
+                  // 视频页自己负责白底顶栏、控制胶囊与底部操作栏，
+                  // 因此查看页的通用黑色半透明 UI 不再叠加。
+                  return widget.isRemote
+                      ? _RemoteVideoPlayer(
+                          key: ValueKey(index),
+                          photo: item,
+                          serverId: widget.serverId ?? '',
+                          isActive: index == _currentIndex,
+                          index: index,
+                          count: widget.photos.length,
+                        )
+                      : _LocalVideoPlayer(
+                          key: ValueKey(index),
+                          photo: item,
+                          isActive: index == _currentIndex,
+                          index: index,
+                          count: widget.photos.length,
+                        );
                 }
                 return RepaintBoundary(
                   child: _ZoomableImage(
@@ -151,6 +184,7 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
                 );
               },
             ),
+            if (!isVideo) ...[
             // 该渐变层只是装饰，必须显式忽略指针：
             // Opacity 即便为 0 仍会把命中测试交给子节点，若子层可命中
             // 就会整体遮挡下方 PageView 的翻页与捏合手势。
@@ -257,6 +291,7 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
               ),
             ),
             ),
+            ],
           ],
         ),
       ),
@@ -504,7 +539,15 @@ class _BottomActionBar extends ConsumerWidget {
   final bool isRemote;
   final String? serverId;
 
-  const _BottomActionBar({required this.photo, required this.isRemote, this.serverId});
+  /// 视频页使用白底操作栏（对齐小米相册），图标与文字改为深色。
+  final bool light;
+
+  const _BottomActionBar({
+    required this.photo,
+    required this.isRemote,
+    this.serverId,
+    this.light = false,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -518,6 +561,7 @@ class _BottomActionBar extends ConsumerWidget {
             _ActionButton(
               icon: Icons.download_outlined,
               label: '下载',
+              light: light,
               onTap: () => _downloadRemote(context),
             ),
           ],
@@ -535,26 +579,31 @@ class _BottomActionBar extends ConsumerWidget {
           _ActionButton(
             icon: Icons.ios_share,
             label: '发送',
+            light: light,
             onTap: () => _sharePhoto(context),
           ),
           _ActionButton(
             icon: Icons.edit_outlined,
             label: '编辑',
+            light: light,
             onTap: () => _notSupported(context, '编辑'),
           ),
           _ActionButton(
             icon: Icons.favorite_border,
             label: '收藏',
+            light: light,
             onTap: () => _notSupported(context, '收藏'),
           ),
           _ActionButton(
             icon: Icons.delete_outline,
             label: '删除',
+            light: light,
             onTap: () => _deleteLocal(context),
           ),
           _ActionButton(
             icon: Icons.more_horiz,
             label: '更多',
+            light: light,
             onTap: () => _showMore(context, ref, servers),
           ),
         ],
@@ -611,7 +660,7 @@ class _BottomActionBar extends ConsumerWidget {
     try {
       final deleted = await PhotoManager.editor.deleteWithIds([photo.id]);
       if (deleted.isEmpty) return; // 用户在系统确认框中取消
-      if (context.mounted) Navigator.pop(context);
+      if (context.mounted) Navigator.pop(context, true);
       messenger.showSnackBar(const SnackBar(content: Text('已删除')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('删除失败: $e')));
@@ -671,6 +720,35 @@ class _BottomActionBar extends ConsumerWidget {
     try {
       final servers = await LocalStorageService().getSmbServers();
       final server = servers.firstWhere((s) => s.id == serverId);
+      if (photo.isVideo) {
+        // 视频改为流式落盘后写入 MediaStore，避免整段视频先塞进内存。
+        final total = await SmbService().remoteFileSize(server, photo.path);
+        if (total <= 0) throw Exception('无法读取文件大小');
+        final tempDir = await getTemporaryDirectory();
+        final tempFile = File('${tempDir.path}/${photo.name}');
+        final sink = tempFile.openWrite();
+        try {
+          await for (final chunk in SmbService()
+              .openRemoteVideoRange(server, photo.path, 0, total)) {
+            sink.add(chunk);
+          }
+        } finally {
+          await sink.close();
+        }
+        await PhotoManager.editor.saveVideo(
+          tempFile,
+          relativePath: 'Movies/MiPix',
+        );
+        try {
+          await tempFile.delete();
+        } catch (_) {}
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('已保存到系统相册 Movies/MiPix')),
+          );
+        }
+        return;
+      }
       final data = await SmbService().readFile(server, photo.path);
       if (data.isEmpty) {
         throw Exception('文件内容为空');
@@ -709,16 +787,19 @@ class _ActionButton extends StatelessWidget {
   final IconData icon;
   final String label;
   final VoidCallback onTap;
+  final bool light;
 
   const _ActionButton({
     required this.icon,
     required this.label,
     required this.onTap,
+    this.light = false,
   });
 
   @override
   Widget build(BuildContext context) {
     // 对齐小米相册：图标在上、文字在下，无背景框。
+    final color = light ? const Color(0xFF1A1A1A) : Colors.white;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: onTap,
@@ -727,11 +808,11 @@ class _ActionButton extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, color: Colors.white, size: 24),
+            Icon(icon, color: color, size: 24),
             const SizedBox(height: 6),
             Text(label,
-                style: const TextStyle(
-                    color: Colors.white, fontSize: 11, fontWeight: FontWeight.w500)),
+                style: TextStyle(
+                    color: color, fontSize: 11, fontWeight: FontWeight.w500)),
           ],
         ),
       ),
@@ -739,87 +820,714 @@ class _ActionButton extends StatelessWidget {
   }
 }
 
-/// 本地视频内联播放器。
-class _LocalVideoPlayer extends StatefulWidget {
-  final String path;
+/// 本地视频页。
+class _LocalVideoPlayer extends StatelessWidget {
+  final MediaItem photo;
+  final bool isActive;
+  final int index;
+  final int count;
 
-  const _LocalVideoPlayer({required this.path});
+  const _LocalVideoPlayer({
+    super.key,
+    required this.photo,
+    required this.isActive,
+    required this.index,
+    required this.count,
+  });
 
   @override
-  State<_LocalVideoPlayer> createState() => _LocalVideoPlayerState();
+  Widget build(BuildContext context) {
+    return _VideoPage(
+      photo: photo,
+      index: index,
+      count: count,
+      isActive: isActive,
+      createController: () async =>
+          VideoPlayerController.file(File(photo.path)),
+      errorText: '无法播放该视频',
+    );
+  }
 }
 
-class _LocalVideoPlayerState extends State<_LocalVideoPlayer> {
-  VideoPlayerController? _controller;
-  bool _error = false;
+/// 远端（SMB）视频页：经本地 HTTP 代理按需读取字节，边下边播。
+class _RemoteVideoPlayer extends StatefulWidget {
+  final MediaItem photo;
+  final String serverId;
+  final bool isActive;
+  final int index;
+  final int count;
+
+  const _RemoteVideoPlayer({
+    super.key,
+    required this.photo,
+    required this.serverId,
+    required this.isActive,
+    required this.index,
+    required this.count,
+  });
 
   @override
-  void initState() {
-    super.initState();
-    _init();
-  }
+  State<_RemoteVideoPlayer> createState() => _RemoteVideoPlayerState();
+}
 
-  Future<void> _init() async {
-    final controller = VideoPlayerController.file(File(widget.path));
-    try {
-      await controller.initialize();
-      await controller.setLooping(true);
-      if (!mounted) {
-        await controller.dispose();
-        return;
-      }
-      setState(() => _controller = controller);
-      await controller.play();
-    } catch (_) {
-      await controller.dispose();
-      if (mounted) setState(() => _error = true);
+class _RemoteVideoPlayerState extends State<_RemoteVideoPlayer> {
+  /// ExoPlayer 不支持这些容器，初始化会直接失败，提前给出下载提示。
+  static const Set<String> _unsupportedExtensions = {'avi', 'wmv'};
+
+  String? _token;
+
+  Future<VideoPlayerController> _create() async {
+    final ext = widget.photo.name.toLowerCase().split('.').last;
+    if (_unsupportedExtensions.contains(ext)) {
+      throw UnsupportedError('unsupported video container: $ext');
     }
+    final servers = await LocalStorageService().getSmbServers();
+    final server = servers.firstWhere((s) => s.id == widget.serverId);
+    final handle = await RemoteVideoProxy.instance
+        .register(server, widget.photo.path, widget.photo.name);
+    _token = handle.token;
+    return VideoPlayerController.networkUrl(handle.url);
   }
 
-  @override
-  void dispose() {
-    _controller?.dispose();
-    super.dispose();
+  void _teardown() {
+    final token = _token;
+    _token = null;
+    if (token != null) RemoteVideoProxy.instance.unregister(token);
   }
 
   @override
   Widget build(BuildContext context) {
-    final controller = _controller;
-    if (_error) {
-      return const Icon(Icons.broken_image, size: 64, color: Color(0x1FFFFFFF));
+    return _VideoPage(
+      photo: widget.photo,
+      index: widget.index,
+      count: widget.count,
+      isActive: widget.isActive,
+      isRemote: true,
+      serverId: widget.serverId,
+      createController: _create,
+      onTeardown: _teardown,
+      errorText: '该视频暂不支持在线播放\n可点击下方「下载」离线观看',
+    );
+  }
+}
+
+/// 视频页统一外壳（对齐小米相册）：
+/// 黑色画面区 + 白底日期顶栏 + 悬浮胶囊控制条 + 白底底部操作栏。
+class _VideoPage extends StatefulWidget {
+  final MediaItem photo;
+  final int index;
+  final int count;
+  final bool isActive;
+  final bool isRemote;
+  final String? serverId;
+  final Future<VideoPlayerController> Function() createController;
+  final VoidCallback? onTeardown;
+  final String errorText;
+
+  const _VideoPage({
+    required this.photo,
+    required this.index,
+    required this.count,
+    required this.isActive,
+    required this.createController,
+    required this.errorText,
+    this.isRemote = false,
+    this.serverId,
+    this.onTeardown,
+  });
+
+  @override
+  State<_VideoPage> createState() => _VideoPageState();
+}
+
+class _VideoPageState extends State<_VideoPage> {
+  VideoPlayerController? _controller;
+  bool _loading = true;
+  String? _error;
+  bool _showUI = true;
+  bool _locked = false;
+  bool _muted = false;
+
+  /// 异步初始化序号：翻页/销毁后旧任务的结果必须丢弃。
+  int _serial = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loading = widget.isActive;
+    if (widget.isActive) _start();
+  }
+
+  @override
+  void didUpdateWidget(covariant _VideoPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive == oldWidget.isActive) return;
+    if (widget.isActive) {
+      _start();
+    } else {
+      // 离开该页即销毁播放器：释放解码器与 SMB 连接，回来时重新初始化。
+      _stop();
     }
-    if (controller == null) {
-      return const Center(
-        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
-      );
+  }
+
+  Future<void> _start() async {
+    final serial = ++_serial;
+    // 只会在 initState / didUpdateWidget 里触发，本帧随后就会 build，
+    // 直接改字段即可，不必在构建阶段调用 setState。
+    _loading = true;
+    _error = null;
+    _showUI = true;
+
+    VideoPlayerController? created;
+    try {
+      created = await widget.createController();
+      await created.initialize();
+    } catch (_) {
+      if (serial == _serial && mounted) {
+        setState(() {
+          _loading = false;
+          _error = widget.errorText;
+        });
+      }
+      await created?.dispose();
+      widget.onTeardown?.call();
+      return;
     }
 
-    return AspectRatio(
-      aspectRatio: controller.value.aspectRatio == 0
-          ? 16 / 9
-          : controller.value.aspectRatio,
-      child: ValueListenableBuilder<VideoPlayerValue>(
-        valueListenable: controller,
-        builder: (context, value, _) {
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              VideoPlayer(controller),
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => value.isPlaying ? controller.pause() : controller.play(),
-                child: value.isPlaying
-                    ? const SizedBox.expand()
-                    : Container(
-                        color: Colors.black26,
-                        child: const Icon(Icons.play_arrow,
-                            color: Colors.white, size: 56),
-                      ),
-              ),
-            ],
-          );
+    final controller = created;
+    if (!mounted || serial != _serial) {
+      await controller.dispose();
+      widget.onTeardown?.call();
+      return;
+    }
+
+    await controller.setLooping(false);
+    await controller.setVolume(_muted ? 0 : 1);
+    setState(() {
+      _controller = controller;
+      _loading = false;
+    });
+    await controller.play();
+  }
+
+  void _stop() {
+    _serial++;
+    final controller = _controller;
+    _controller = null;
+    controller?.dispose();
+    widget.onTeardown?.call();
+    _loading = false;
+    _error = null;
+  }
+
+  @override
+  void dispose() {
+    _serial++;
+    _controller?.dispose();
+    widget.onTeardown?.call();
+    super.dispose();
+  }
+
+  void _toggleMute() {
+    final controller = _controller;
+    if (controller == null) return;
+    setState(() => _muted = !_muted);
+    controller.setVolume(_muted ? 0 : 1);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mq = MediaQuery.of(context);
+    final controller = _controller;
+    final showChrome = widget.isActive && _showUI;
+
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: showChrome ? _videoChromeOverlayStyle : _viewerOverlayStyle,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          if (_locked) return;
+          setState(() => _showUI = !_showUI);
         },
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            const ColoredBox(color: Colors.black),
+            if (controller != null)
+              Center(
+                child: AspectRatio(
+                  aspectRatio: controller.value.aspectRatio == 0
+                      ? 16 / 9
+                      : controller.value.aspectRatio,
+                  child: VideoPlayer(controller),
+                ),
+              )
+            else if (_error != null)
+              _buildError()
+            else if (widget.isActive && _loading)
+              const Center(
+                child: CircularProgressIndicator(
+                  color: Colors.white,
+                  strokeWidth: 2,
+                ),
+              ),
+            IgnorePointer(
+              ignoring: !showChrome,
+              child: AnimatedOpacity(
+                opacity: showChrome ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 250),
+                child: Stack(
+                  children: [
+                    Positioned(
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      child: _VideoTopBar(
+                        photo: widget.photo,
+                        index: widget.index,
+                        count: widget.count,
+                        locked: _locked,
+                        onToggleLock: () =>
+                            setState(() => _locked = !_locked),
+                      ),
+                    ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (controller != null) ...[
+                            Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 24),
+                              child: _VideoControls(
+                                controller: controller,
+                                muted: _muted,
+                                onToggleMute: _toggleMute,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                          ] else
+                            const SizedBox(height: 24),
+                          Container(
+                            color: Colors.white,
+                            padding:
+                                EdgeInsets.only(bottom: mq.padding.bottom),
+                            child: _BottomActionBar(
+                              photo: widget.photo,
+                              isRemote: widget.isRemote,
+                              serverId: widget.serverId,
+                              light: true,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
+    );
+  }
+
+  Widget _buildError() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.videocam_off_outlined,
+                size: 56, color: Color(0x66FFFFFF)),
+            const SizedBox(height: 14),
+            Text(
+              _error ?? '',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 14, color: Color(0xCCFFFFFF)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 视频页顶栏：白底、左对齐日期/时间、右上角锁定。
+class _VideoTopBar extends StatelessWidget {
+  final MediaItem photo;
+  final int index;
+  final int count;
+  final bool locked;
+  final VoidCallback onToggleLock;
+
+  const _VideoTopBar({
+    required this.photo,
+    required this.index,
+    required this.count,
+    required this.locked,
+    required this.onToggleLock,
+  });
+
+  String _two(int v) => v.toString().padLeft(2, '0');
+
+  @override
+  Widget build(BuildContext context) {
+    final topInset = MediaQuery.of(context).padding.top;
+    final date = photo.modifiedAt;
+    return Container(
+      color: Colors.white,
+      padding: EdgeInsets.only(top: topInset),
+      child: SizedBox(
+        height: 56,
+        child: Row(
+          children: [
+            IconButton(
+              onPressed: () => Navigator.pop(context),
+              icon: const Icon(Icons.arrow_back_ios_new,
+                  size: 20, color: Color(0xFF1A1A1A)),
+            ),
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${date.year}年${date.month}月${date.day}日',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF1A1A1A),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '${_two(date.hour)}:${_two(date.minute)} · '
+                    '${index + 1}/$count',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFF8A8A8A),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              onPressed: onToggleLock,
+              icon: Icon(
+                locked ? Icons.lock : Icons.lock_outline,
+                size: 22,
+                color: const Color(0xFF1A1A1A),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 进度条专用拖动识别器：按下即接受手势。
+///
+/// 进度条位于 PageView 内，普通 `PanGestureRecognizer` 会与外层的横向
+/// 拖动识别器争夺手势；一旦外层先达到拖动阈值，就会误触发切换上一/下一
+/// 个视频。这里在指针按下时立刻赢得竞技场，让 PageView 收不到本次手势。
+class _EagerPanGestureRecognizer extends PanGestureRecognizer {
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    super.addAllowedPointer(event);
+    resolve(GestureDisposition.accepted);
+  }
+}
+
+/// 悬浮胶囊控制条：播放/暂停 + 细进度条 + 静音（对齐小米相册）。
+class _VideoControls extends StatefulWidget {
+  final VideoPlayerController controller;
+  final bool muted;
+  final VoidCallback onToggleMute;
+
+  const _VideoControls({
+    required this.controller,
+    required this.muted,
+    required this.onToggleMute,
+  });
+
+  @override
+  State<_VideoControls> createState() => _VideoControlsState();
+}
+
+class _VideoControlsState extends State<_VideoControls> {
+  bool _dragging = false;
+  bool _fine = false;
+  bool _resumeAfterDrag = false;
+  double _dragStartFraction = 0;
+  double _dragFraction = 0;
+  double _accumulatedDx = 0;
+
+  /// 进度条根节点必须使用 GlobalKey：拖动开始/结束时胶囊会在
+  /// 「收起 Row」与「展开 Column」之间切换，若没有 GlobalKey，进度条元素会被
+  /// 重建，正在跟踪指针的手势识别器随之销毁，拖动后半程的事件就丢给了外层
+  /// PageView，导致误切换上/下一个视频，且控件卡在拖动展开态。
+  final GlobalKey _trackKey = GlobalKey();
+
+  /// 当前进度条宽度（逻辑像素），由 LayoutBuilder 在每次布局时更新。
+  /// 展开态与收起态宽度不同，闭包里不能缓存旧值。
+  double _trackWidth = 0;
+
+  /// 开始拖动：把按下点当作新的进度起点（同时兼容点击定位）。
+  void _beginDrag(double fraction) {
+    final value = widget.controller.value;
+    _resumeAfterDrag = value.isPlaying;
+    if (_resumeAfterDrag) widget.controller.pause();
+    final start = fraction.clamp(0.0, 1.0);
+    setState(() {
+      _dragging = true;
+      _fine = false;
+      _accumulatedDx = 0;
+      _dragStartFraction = start;
+      _dragFraction = start;
+    });
+    _seekTo(start);
+  }
+
+  void _updateDrag(DragUpdateDetails details) {
+    _accumulatedDx += details.delta.dx;
+    // 上滑后把横向位移缩小到 1/5，方便逐秒微调。
+    if (details.delta.dy < -2) _fine = true;
+    final factor = _fine ? 5.0 : 1.0;
+    final width = _trackWidth <= 0 ? 1.0 : _trackWidth;
+    final fraction =
+        (_dragStartFraction + _accumulatedDx / width / factor).clamp(0.0, 1.0);
+    setState(() => _dragFraction = fraction);
+    _seekTo(fraction);
+  }
+
+  void _endDrag() {
+    setState(() {
+      _dragging = false;
+      _fine = false;
+    });
+    if (_resumeAfterDrag) {
+      _resumeAfterDrag = false;
+      widget.controller.play();
+    }
+  }
+
+  void _seekTo(double fraction) {
+    final total = widget.controller.value.duration;
+    if (total <= Duration.zero) return;
+    widget.controller.seekTo(
+      Duration(milliseconds: (total.inMilliseconds * fraction).round()),
+    );
+  }
+
+  String _format(Duration d, {bool withCentis = false}) {
+    final m = d.inMinutes;
+    final s = d.inSeconds.remainder(60);
+    final base = '${m.toString().padLeft(2, '0')}:'
+        '${s.toString().padLeft(2, '0')}';
+    if (!withCentis) return base;
+    final cs = (d.inMilliseconds.remainder(1000) ~/ 10)
+        .toString()
+        .padLeft(2, '0');
+    return '$base.$cs';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<VideoPlayerValue>(
+      valueListenable: widget.controller,
+      builder: (context, value, _) {
+        final total = value.duration;
+        final position = _dragging
+            ? Duration(
+                milliseconds:
+                    (total.inMilliseconds * _dragFraction).round())
+            : value.position;
+        final fraction = total.inMilliseconds <= 0
+            ? 0.0
+            : (position.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0);
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_dragging)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.72),
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: const Text(
+                    '上滑进入精细调节',
+                    style: TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                ),
+              ),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              height: _dragging ? 78 : 46,
+              padding: EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: _dragging ? 10 : 0,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.93),
+                borderRadius: BorderRadius.circular(_dragging ? 20 : 23),
+              ),
+              child: _dragging
+                  ? Column(
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              _format(position, withCentis: true),
+                              style: const TextStyle(
+                                fontSize: 13,
+                                color: Color(0xFF1A1A1A),
+                              ),
+                            ),
+                            const Spacer(),
+                            Text(
+                              _format(total),
+                              style: const TextStyle(
+                                fontSize: 13,
+                                color: Color(0xFF8A8A8A),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Expanded(child: _buildTrack(fraction)),
+                      ],
+                    )
+                  : Row(
+                      // 让进度条的命中区域占满胶囊高度，手指按在细条附近
+                      // （而非正好压在线条上）也能拖动进度，而不是触发翻页。
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _playPauseButton(value),
+                        const SizedBox(width: 12),
+                        Expanded(child: _buildTrack(fraction)),
+                        const SizedBox(width: 12),
+                        _muteButton(),
+                      ],
+                    ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _playPauseButton(VideoPlayerValue value) {
+    return IconButton(
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints.tightFor(width: 30, height: 30),
+      splashRadius: 18,
+      onPressed: () {
+        final controller = widget.controller;
+        if (value.isPlaying) {
+          controller.pause();
+        } else {
+          if (value.duration > Duration.zero &&
+              value.position >= value.duration) {
+            controller.seekTo(Duration.zero);
+          }
+          controller.play();
+        }
+      },
+      icon: Icon(
+        value.isPlaying ? Icons.pause : Icons.play_arrow,
+        size: 22,
+        color: const Color(0xFF2B2B2B),
+      ),
+    );
+  }
+
+  Widget _muteButton() {
+    return IconButton(
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints.tightFor(width: 30, height: 30),
+      splashRadius: 18,
+      onPressed: widget.onToggleMute,
+      icon: Icon(
+        widget.muted ? Icons.volume_off_outlined : Icons.volume_up_outlined,
+        size: 20,
+        color: const Color(0xFF2B2B2B),
+      ),
+    );
+  }
+
+  Widget _buildTrack(double fraction) {
+    return LayoutBuilder(
+      key: _trackKey,
+      builder: (context, constraints) {
+        _trackWidth = constraints.maxWidth;
+        return RawGestureDetector(
+          behavior: HitTestBehavior.opaque,
+          gestures: {
+            _EagerPanGestureRecognizer:
+                GestureRecognizerFactoryWithHandlers<_EagerPanGestureRecognizer>(
+              _EagerPanGestureRecognizer.new,
+              (recognizer) {
+                recognizer.onStart = (d) => _beginDrag(
+                    (d.localPosition.dx / _trackWidth).clamp(0.0, 1.0));
+                recognizer.onUpdate = _updateDrag;
+                recognizer.onEnd = (_) => _endDrag();
+                recognizer.onCancel = _endDrag;
+              },
+            ),
+          },
+          child: Center(
+            child: SizedBox(
+              height: 14,
+              child: Stack(
+                alignment: Alignment.centerLeft,
+                clipBehavior: Clip.none,
+                children: [
+                  Container(
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFC7C7C5),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+                  FractionallySizedBox(
+                    widthFactor: fraction,
+                    child: Container(
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF767677),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    ),
+                  ),
+                  if (_dragging)
+                    Align(
+                      alignment: Alignment(-1 + 2 * fraction, 0),
+                      child: Container(
+                        width: 13,
+                        height: 13,
+                        decoration: const BoxDecoration(
+                          color: Color(0xFF767677),
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -846,16 +1554,9 @@ class _RemotePhotoViewerState extends State<_RemotePhotoViewer> {
   Uint8List? _imageData;
   bool _loading = true;
 
-  /// 远程视频暂不支持播放：直接给占位提示，避免把整段视频读进内存再解码失败。
-  bool get _isVideo => SmbService.isVideoName(widget.remotePath);
-
   @override
   void initState() {
     super.initState();
-    if (_isVideo) {
-      _loading = false;
-      return;
-    }
     _load();
   }
 
@@ -876,23 +1577,6 @@ class _RemotePhotoViewerState extends State<_RemotePhotoViewer> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isVideo) {
-      return Container(
-        color: Colors.black,
-        alignment: Alignment.center,
-        child: const Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.play_circle_outline, size: 64, color: Color(0x1FFFFFFF)),
-            SizedBox(height: 12),
-            Text(
-              '暂不支持播放在线视频',
-              style: TextStyle(fontSize: 14, color: Color(0x99FFFFFF)),
-            ),
-          ],
-        ),
-      );
-    }
     if (_loading) {
       return Container(
         color: Colors.black,

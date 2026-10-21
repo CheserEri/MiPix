@@ -3,13 +3,17 @@ package com.chesereri.mipix
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
 
 /**
  * 备份传输期间的保活锁宿主。
@@ -28,6 +32,7 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private val channelName = "mipix/keepalive"
     private val permissionChannelName = "mipix/permission"
+    private val thumbnailChannelName = "mipix/video_thumbnail"
 
     /// 位置信息权限申请的回调标识（任意不冲突的值即可）。
     private val mediaLocationRequestCode = 0x4D50
@@ -59,6 +64,56 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, thumbnailChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "frame" -> generateVideoFrame(call, result)
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 从视频 URL 抽取一帧作为缩略图。
+     *
+     * 远端视频在 Dart 侧由回环 HTTP 代理暴露成 `http://127.0.0.1:...`，
+     * 这里用系统的 MediaMetadataRetriever 读取（支持 http 与 Range），
+     * 解码一帧后压成 JPEG 返回。整个过程放在后台线程，避免卡住 UI。
+     */
+    private fun generateVideoFrame(call: MethodCall, result: MethodChannel.Result) {
+        val url = call.argument<String>("url")
+        if (url.isNullOrEmpty()) {
+            result.error("bad_args", "url is required", null)
+            return
+        }
+        val timeMs = (call.argument<Number>("timeMs") ?: 1000).toLong()
+        Thread {
+            var retriever: MediaMetadataRetriever? = null
+            try {
+                retriever = MediaMetadataRetriever()
+                retriever.setDataSource(url, HashMap<String, String>())
+                val bitmap = retriever.getFrameAtTime(
+                    timeMs * 1000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                )
+                if (bitmap == null) {
+                    result.success(null)
+                } else {
+                    val out = ByteArrayOutputStream()
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 82, out)
+                    bitmap.recycle()
+                    result.success(out.toByteArray())
+                }
+            } catch (_: Exception) {
+                // 编码容器不受支持或代理读取失败时，返回空让 Dart 侧展示占位图。
+                result.success(null)
+            } finally {
+                try {
+                    retriever?.release()
+                } catch (_: Exception) {
+                }
+            }
+        }.start()
     }
 
     /**

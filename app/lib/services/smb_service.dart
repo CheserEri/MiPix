@@ -670,6 +670,12 @@ class SmbService {
       }
     }
 
+    // 刷新前记录旧的相册张数：扫描后只失效张数变化相册的媒体缓存。
+    // 否则卡片已经显示新张数，点进相册仍会命中旧媒体列表缓存。
+    final previousAlbums = refresh
+        ? await _cacheService.getCachedAlbums(config.id, currentPath)
+        : null;
+
     int retries = 3;
     while (retries-- > 0) {
       try {
@@ -686,6 +692,17 @@ class SmbService {
 
         albums.sort((a, b) => a.name.compareTo(b.name));
         await _cacheService.cacheAlbums(config.id, currentPath, albums);
+        if (previousAlbums != null) {
+          final previousCounts = {for (final a in previousAlbums) a.id: a.count};
+          for (final album in albums) {
+            if (previousCounts[album.id] != album.count) {
+              await _cacheService.invalidateAlbumMediaItems(
+                config.id,
+                album.id,
+              );
+            }
+          }
+        }
         return albums;
       } on SmbException catch (e) {
         final msg = e.toString().toLowerCase();
@@ -955,6 +972,69 @@ class SmbService {
       return Uint8List.fromList(bytes);
     } finally {
       await connect.close();
+    }
+  }
+
+  /// 远端路径归一化为 SMB 绝对路径。
+  String _fullRemotePath(SmbConfig config, String remotePath) {
+    return remotePath.startsWith('/')
+        ? _buildSMBPath(config, remotePath.substring(1))
+        : _buildSMBPath(config, remotePath);
+  }
+
+  /// 读取远端文件的字节长度（视频代理生成 `Content-Range` 用）。
+  ///
+  /// 使用独立连接：共享池连接会被缩略图/列表请求排队，而长度探测只发生
+  /// 在一次播放会话的开头，单独建连更省事，也不会干扰池内连接。
+  Future<int> remoteFileSize(SmbConfig config, String remotePath) async {
+    int retries = 2;
+    while (retries-- > 0) {
+      SmbConnect? connect;
+      try {
+        connect = await _connectAuthGated(config);
+        final file = await connect.file(_fullRemotePath(config, remotePath));
+        return file.size;
+      } on SmbException catch (e) {
+        debugPrint(
+            '[smb] videoSize smbErr retries=$retries path=$remotePath ${_errStr(e)}');
+        if (!_isConnectionError(e) || retries == 0) rethrow;
+        await _retryBackoff(retries + 1);
+      } catch (e) {
+        debugPrint(
+            '[smb] videoSize err retries=$retries path=$remotePath ${_errStr(e)}');
+        if (retries == 0) rethrow;
+        await _retryBackoff(retries + 1);
+      } finally {
+        if (connect != null) await _closeQuietly(connect);
+      }
+    }
+    return -1;
+  }
+
+  /// 打开远端视频 `[start, end)` 字节区间的流。
+  ///
+  /// 视频播放是一次长时间的顺序读取，必须用独立连接并保持到流结束：
+  /// 复用共享池连接会与其他 SMB 请求互相排队，造成播放卡顿。
+  /// 调用方取消订阅（播放器断开、拖动进度条）时，`finally` 会关闭连接，
+  /// 避免远端会话泄漏。
+  Stream<Uint8List> openRemoteVideoRange(
+    SmbConfig config,
+    String remotePath,
+    int start,
+    int end,
+  ) async* {
+    final connect = await _connectAuthGated(config);
+    try {
+      final file = await connect.file(_fullRemotePath(config, remotePath));
+      final size = file.size;
+      final realEnd = end > size ? size : end;
+      if (start < 0 || start >= realEnd) return;
+      final stream = await connect.openRead(file, start, realEnd);
+      await for (final chunk in stream.timeout(_stallTimeout)) {
+        yield chunk;
+      }
+    } finally {
+      await _closeQuietly(connect);
     }
   }
 

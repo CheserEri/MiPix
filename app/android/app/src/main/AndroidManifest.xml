@@ -8,8 +8,11 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
-    <!-- Android 13+：读取图片 -->
+    <!-- Android 13+：读取图片与视频。
+         两者必须同时声明：只声明图片权限时，MediaStore 查询看不到任何视频，
+         相册里也就不会出现视频（相机/截屏录屏等相册会缺失视频）。 -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
     <!-- Android 14+：仅选择部分照片时的授权 -->
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
     <!-- Android 10+：读取照片 EXIF 中的位置信息（GPS）。

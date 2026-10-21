@@ -11,6 +11,7 @@ import '../providers/photo_provider.dart';
 import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
 import '../services/smb_service.dart';
+import '../services/video_thumbnail_service.dart';
 import '../services/photo_service.dart';
 import '../services/local_storage_service.dart';
 import '../utils/mipix_theme.dart';
@@ -187,8 +188,10 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
           serverId: isRemote ? widget.albumId : null,
         ),
       ),
-    ).then((_) {
-      if (mounted) _refresh();
+    ).then((deleted) {
+      // 只有查看器里确实删除了照片才需要重载列表；否则重载会把分页
+      // 退回到第一页，返回时滚动位置也跟着丢失（老照片页跳回近期页）。
+      if (mounted && deleted == true) _refresh();
     });
   }
 
@@ -642,7 +645,7 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
           fit: StackFit.expand,
           children: [
             if (isRemote)
-              _RemoteImage(serverId: widget.albumId, remotePath: item.path)
+              _RemoteImage(serverId: widget.albumId, item: item)
             else
               LocalMediaThumb(item: item),
             // 设封面场景：选中瓦片加蓝色描边。
@@ -769,7 +772,11 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
     final yesterday = today.subtract(const Duration(days: 1));
     if (date == today) return '今天';
     if (date == yesterday) return '昨天';
-    // 与小米相册一致：只显示「M月d日」，不带年份与星期。
+    // 今年只显示「M月d日」；去年及更早必须带年份，否则 2025 年的照片
+    // 会被误认为今年拍的（如只显示「8月23日」）。
+    if (date.year != now.year) {
+      return DateFormat('yyyy年M月d日').format(date);
+    }
     return DateFormat('M月d日').format(date);
   }
 
@@ -935,11 +942,11 @@ class _SelectionActionBar extends StatelessWidget {
 
 class _RemoteImage extends StatefulWidget {
   final String serverId;
-  final String remotePath;
+  final MediaItem item;
 
   const _RemoteImage({
     required this.serverId,
-    required this.remotePath,
+    required this.item,
   });
 
   @override
@@ -951,18 +958,17 @@ class _RemoteImageState extends State<_RemoteImage> {
   bool _loading = true;
   static final _loadingController = _ImageLoadingController();
 
-  /// 视频无法当作图片解码，直接用播放占位块渲染，跳过缩略图请求。
-  bool get _isVideo => SmbService.isVideoName(widget.remotePath);
+  bool get _isVideo => widget.item.isVideo;
 
   @override
   void initState() {
     super.initState();
     if (_isVideo) {
-      _loading = false;
+      _initVideoThumb();
       return;
     }
     // 内存缓存命中时同步展示，避免列表滚动/重建时重复加载。
-    final cached = SmbService.peekThumbnail(widget.serverId, widget.remotePath);
+    final cached = SmbService.peekThumbnail(widget.serverId, widget.item.path);
     if (cached != null && cached.isNotEmpty) {
       _imageData = cached;
       _loading = false;
@@ -971,11 +977,45 @@ class _RemoteImageState extends State<_RemoteImage> {
     }
   }
 
+  /// 视频瓦片：优先用视频缩略图服务的缓存，否则在后台抽帧。
+  void _initVideoThumb() {
+    final service = VideoThumbnailService.instance;
+    final peeked = service.peek(serverId: widget.serverId, item: widget.item);
+    if (peeked != null) {
+      _imageData = peeked;
+      _loading = false;
+    } else if (service.knows(serverId: widget.serverId, item: widget.item)) {
+      // 之前抽帧失败过：直接显示固定占位，避免滚动时反复重试。
+      _loading = false;
+    } else {
+      _loadVideoThumb();
+    }
+  }
+
+  Future<void> _loadVideoThumb() async {
+    try {
+      final servers = await LocalStorageService().getSmbServers();
+      final server =
+          servers.firstWhere((s) => s.id == widget.serverId);
+      final data = await VideoThumbnailService.instance
+          .load(server: server, item: widget.item);
+      if (mounted) {
+        setState(() {
+          _imageData = data;
+          _loading = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
   Future<void> _load() async {
     try {
       final servers = await LocalStorageService().getSmbServers();
       final server = servers.firstWhere((s) => s.id == widget.serverId);
-      final data = await _loadingController.loadImage(server, widget.remotePath);
+      final data =
+          await _loadingController.loadImage(server, widget.item.path);
       if (mounted) {
         setState(() {
           _imageData = data;
@@ -991,14 +1031,52 @@ class _RemoteImageState extends State<_RemoteImage> {
   Widget build(BuildContext context) {
     final palette = MiPixPalette.of(context);
     if (_isVideo) {
-      return Container(
-        color: palette.fill,
-        alignment: Alignment.center,
-        child: Icon(
-          Icons.play_circle_outline,
-          size: 36,
-          color: palette.textSecondary.withValues(alpha: 0.7),
-        ),
+      if (_loading) {
+        return Container(
+          color: palette.fill,
+          child: Center(
+            child: SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(
+                color: palette.textSecondary.withValues(alpha: 0.5),
+                strokeWidth: 1.6,
+              ),
+            ),
+          ),
+        );
+      }
+      final thumb = _imageData;
+      if (thumb == null) {
+        return Container(
+          color: palette.fill,
+          alignment: Alignment.center,
+          child: Icon(
+            Icons.play_circle_outline,
+            size: 36,
+            color: palette.textSecondary.withValues(alpha: 0.7),
+          ),
+        );
+      }
+      // 与本地视频瓦片一致：封面 + 居中播放角标。
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          Image.memory(
+            thumb,
+            fit: BoxFit.cover,
+            cacheWidth: 400,
+            errorBuilder: (_, __, ___) => Container(
+              color: palette.fill,
+              child: Icon(Icons.videocam,
+                  color: palette.textSecondary.withValues(alpha: 0.6)),
+            ),
+          ),
+          const Center(
+            child: Icon(Icons.play_circle_fill,
+                color: Colors.white70, size: 36),
+          ),
+        ],
       );
     }
     if (_loading) {
