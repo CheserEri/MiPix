@@ -26,6 +26,9 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     with AutomaticKeepAliveClientMixin {
   final ScrollController _scrollController = ScrollController();
 
+  /// 正在追加下一页（用于底部加载指示）。
+  bool _loadingMore = false;
+
   /// 标签页切换时不销毁本页。否则每次回到「照片」都会重新挂载 →
   /// initState 再次 load() → 重新扫描媒体库并闪一次转圈。
   @override
@@ -34,10 +37,27 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
   @override
   void initState() {
     super.initState();
+    _scrollController.addListener(_onScroll);
     // 进入页面时请求权限并加载照片。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) ref.read(localPhotosProvider.notifier).load();
     });
+  }
+
+  /// 滚动到接近底部时追加更早的照片，直到覆盖整个媒体库。
+  void _onScroll() {
+    if (_scrollController.position.pixels >=
+        _scrollController.position.maxScrollExtent - 600) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _loadMore() async {
+    final notifier = ref.read(localPhotosProvider.notifier);
+    if (_loadingMore || !notifier.hasMore) return;
+    setState(() => _loadingMore = true);
+    await notifier.loadMore();
+    if (mounted) setState(() => _loadingMore = false);
   }
 
   @override
@@ -69,6 +89,16 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
     // 列表刷新后在「非顶部」被插入新内容时补偿滚动偏移，使当前可视内容保持
     // 不动；位于顶部时不补偿，让新照片自然地出现在顶部。
     ref.listen<AsyncValue<List<MediaItem>>>(localPhotosProvider, (prev, next) {
+      final prevItems = prev?.valueOrNull;
+      final nextItems = next.valueOrNull;
+      // 尾部追加（加载更多）不补偿偏移，否则会把正在浏览的列表整体往下推。
+      if (prevItems != null &&
+          nextItems != null &&
+          prevItems.isNotEmpty &&
+          nextItems.isNotEmpty &&
+          prevItems.first.id == nextItems.first.id) {
+        return;
+      }
       final pos =
           _scrollController.hasClients ? _scrollController.position : null;
       if (pos == null || pos.pixels <= 1) return;
@@ -172,6 +202,14 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
               subtitle: '设备上还没有可显示的图片或视频',
             );
           }
+          // 首屏不足一屏时自动补下一页，否则没有滚动事件可触发加载更多。
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted || !_scrollController.hasClients) return;
+            if (ref.read(localPhotosProvider.notifier).hasMore &&
+                _scrollController.position.maxScrollExtent <= 0) {
+              _loadMore();
+            }
+          });
           final grouped = _groupByDate(photos);
           return CustomScrollView(
             controller: _scrollController,
@@ -228,6 +266,22 @@ class _PhotosScreenState extends ConsumerState<PhotosScreen>
                   ),
                 ),
               ],
+              if (_loadingMore)
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    child: Center(
+                      child: SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: palette.accent,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               const SliverPadding(padding: EdgeInsets.only(bottom: 24)),
             ],
           );

@@ -237,26 +237,35 @@ class PhotoService {
     );
   }
 
-  /// 读取某个相册下的资源，按时间倒序分页。
+  /// 本地浏览每页数量（相册内页与「照片」页加载更多均使用）。
+  static const int mediaPageSize = 200;
+
+  /// 「照片」页首屏数量，之后按 [mediaPageSize] 滚动追加。
+  static const int recentPhotoPageSize = 500;
+
+  /// 读取某个相册下的一页资源，按时间倒序。
+  ///
+  /// 虚拟相册与普通相册都按 `page × pageSize` 的**绝对区间**取数，返回的永远
+  /// 是单页数据。此前虚拟相册用「前缀」语义（取 0..(page+1)*size），分页追加
+  /// 时会把前面的数据重复返回，且截屏录屏被写死为最多 2000 条。
   static Future<List<MediaItem>> getMediaItems(
     String albumId, {
     int page = 0,
-    int pageSize = 200,
+    int pageSize = mediaPageSize,
   }) async {
-    if (pageSize <= 0) return [];
+    if (pageSize <= 0 || page < 0) return [];
+    final start = page * pageSize;
 
     switch (albumId) {
       case SystemAlbum.all:
-        return _allMedia(RequestType.common, count: (page + 1) * pageSize);
+        return _toMediaItems(
+          await _assetsOfAll(RequestType.common, start, pageSize),
+        );
       case SystemAlbum.videos:
-        return _toMediaItems(await _videoAssets((page + 1) * pageSize));
+        return _toMediaItems(await _videoAssetsRange(start, pageSize));
       case SystemAlbum.screenshots:
         // 截屏录屏合并自 Screenshots + ScreenRecorder 两个桶。
-        return _allMedia(
-          RequestType.common,
-          count: 2000,
-          filter: _isScreenshotPath,
-        );
+        return _toMediaItems(await _screenshotAssetsRange(start, pageSize));
     }
 
     final path = await AssetPathEntity.fromId(
@@ -267,10 +276,81 @@ class PhotoService {
     return _toMediaItems(assets);
   }
 
+  /// 相册（含虚拟相册）的资源总数，用于判断分页是否还有更多。
+  static Future<int> mediaCountOf(String albumId) async {
+    switch (albumId) {
+      case SystemAlbum.all:
+        return totalMediaCount();
+      case SystemAlbum.videos:
+        return _videoCount();
+      case SystemAlbum.screenshots:
+        return _screenshotCount();
+    }
+    try {
+      final path = await AssetPathEntity.fromId(
+        albumId,
+        filterOption: _descOrder,
+      );
+      return await path.assetCountAsync;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// 全库媒体（图片 + 视频）总数。
+  static Future<int> totalMediaCount() async {
+    try {
+      final path = await _allPath(RequestType.common);
+      return path == null ? 0 : await path.assetCountAsync;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// 读取全库媒体的一段（按创建时间倒序），供「照片」页滚动分页。
+  static Future<List<MediaItem>> getMediaRange({
+    required int start,
+    int count = mediaPageSize,
+  }) async {
+    if (count <= 0 || start < 0) return [];
+    return _toMediaItems(
+      await _assetsOfAll(RequestType.common, start, count),
+    );
+  }
+
   /// 读取"所有照片"（含视频），按时间倒序。
   static Future<List<MediaItem>> getRecentPhotos({int count = 500}) async {
     if (count <= 0) return [];
     return _allMedia(RequestType.common, count: count);
+  }
+
+  /// 全量枚举本地媒体（图片 + 视频）的绝对路径，供「全部备份」使用。
+  ///
+  /// 只解析路径，不读取尺寸与文件大小，避免上万张时产生大量跨端调用和 stat；
+  /// 分批读取，调用方无需一次性持有整库的 [MediaItem]。
+  static Future<List<String>> getAllMediaPaths({
+    int batchSize = 200,
+    void Function(int loaded, int total)? onProgress,
+  }) async {
+    final path = await _allPath(RequestType.common);
+    if (path == null) return [];
+    final total = await path.assetCountAsync;
+    final result = <String>[];
+    final seen = <String>{};
+    for (var start = 0; start < total; start += batchSize) {
+      final assets = await path.getAssetListRange(
+        start: start,
+        end: (start + batchSize).clamp(0, total),
+      );
+      if (assets.isEmpty) break;
+      for (final asset in assets) {
+        final direct = _directPath(asset);
+        final p = direct ?? await _resolvePath(asset);
+        if (p != null && p.isNotEmpty && seen.add(p)) result.add(p);
+      }
+      onProgress?.call(start + assets.length, total);
+    }
+    return result;
   }
 
   /// 返回指定本地文件在系统媒体库中的拍摄时间（MediaStore DATE_TAKEN）。
@@ -444,6 +524,74 @@ class PhotoService {
     }
     merged.sort((a, b) => b.createDateTime.compareTo(a.createDateTime));
     return merged.length > count ? merged.sublist(0, count) : merged;
+  }
+
+  /// 全库媒体的绝对区间取数（`[start, start + count)`）。
+  static Future<List<AssetEntity>> _assetsOfAll(
+    RequestType type,
+    int start,
+    int count,
+  ) async {
+    if (count <= 0 || start < 0) return [];
+    final path = await _allPath(type);
+    if (path == null) return [];
+    return path.getAssetListRange(start: start, end: start + count);
+  }
+
+  /// 视频的绝对区间取数：优先「全部视频」虚拟相册，否则合并各视频目录。
+  static Future<List<AssetEntity>> _videoAssetsRange(int start, int count) async {
+    if (count <= 0 || start < 0) return [];
+    final allPath = await _allPath(RequestType.video);
+    if (allPath != null && await allPath.assetCountAsync > 0) {
+      return allPath.getAssetListRange(start: start, end: start + count);
+    }
+    final merged = await _videoAssets(start + count);
+    if (start >= merged.length) return [];
+    return merged.sublist(start, (start + count).clamp(0, merged.length));
+  }
+
+  /// 截屏 / 录屏对应的系统桶（MIUI 上为 Screenshots、ScreenRecorder）。
+  static Future<List<AssetPathEntity>> _screenshotBuckets() async {
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.common,
+      hasAll: false,
+      filterOption: _descOrder,
+    );
+    return paths.where((p) {
+      final name = p.name.trim().toLowerCase();
+      return name == 'screenshots' || name == 'screenrecorder';
+    }).toList();
+  }
+
+  static Future<int> _screenshotCount() async {
+    var total = 0;
+    for (final bucket in await _screenshotBuckets()) {
+      try {
+        total += await bucket.assetCountAsync;
+      } catch (_) {
+        // 单个桶读取失败不影响总数统计。
+      }
+    }
+    return total;
+  }
+
+  /// 截屏录屏的绝对区间取数：两个桶各取前缀，合并排序后切片。
+  static Future<List<AssetEntity>> _screenshotAssetsRange(
+    int start,
+    int count,
+  ) async {
+    if (count <= 0) return [];
+    final buckets = await _screenshotBuckets();
+    if (buckets.isEmpty) return [];
+    final merged = <AssetEntity>[];
+    for (final bucket in buckets) {
+      merged.addAll(
+        await bucket.getAssetListRange(start: 0, end: start + count),
+      );
+    }
+    merged.sort((a, b) => b.createDateTime.compareTo(a.createDateTime));
+    if (start >= merged.length) return [];
+    return merged.sublist(start, (start + count).clamp(0, merged.length));
   }
 
   /// 相册封面路径：图片直接返回其文件路径；**视频必须先抽帧落盘成 JPEG**。

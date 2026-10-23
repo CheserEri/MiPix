@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
@@ -24,10 +25,19 @@ class LocalPhotosNotifier extends StateNotifier<AsyncValue<List<MediaItem>>> {
 
   final Ref _ref;
 
+  /// 媒体库总数，用于判断是否还有更早的照片未加载。
+  int _total = 0;
+  bool _loadingMore = false;
+
+  bool get hasMore => (state.valueOrNull?.length ?? 0) < _total;
+
+  bool get loadingMore => _loadingMore;
+
   /// 读取本地照片。
   ///
-  /// 已有数据时保持旧数据静默刷新（不回到 loading），
-  /// 避免切页或手动刷新时闪出一次转圈。
+  /// 首屏只取 [PhotoService.recentPhotoPageSize] 张，其余靠 [loadMore] 滚动追加；
+  /// 已有数据时保持旧数据静默刷新（不回到 loading），避免切页或手动刷新时闪出
+  /// 一次转圈。
   ///
   /// [fromChange] 为 true 表示这次刷新由系统媒体库变更（如截图）触发，
   /// 此时会记录相对上次列表新增的照片 id，让界面只让「新照片」淡入。
@@ -36,10 +46,21 @@ class LocalPhotosNotifier extends StateNotifier<AsyncValue<List<MediaItem>>> {
     try {
       final access = await _ref.read(localAccessProvider.notifier).ensure();
       if (!access.canRead) {
+        _total = 0;
         state = const AsyncValue.data([]);
         return;
       }
-      final photos = await PhotoService.getRecentPhotos(count: 500);
+      // 已经加载过更早的内容时，刷新保持当前窗口大小，避免滚动位置被抽走。
+      final previous = state.valueOrNull?.length ?? 0;
+      final count = previous > PhotoService.recentPhotoPageSize
+          ? previous
+          : PhotoService.recentPhotoPageSize;
+      final results = await Future.wait([
+        PhotoService.getMediaRange(start: 0, count: count),
+        PhotoService.totalMediaCount(),
+      ]);
+      final photos = results[0] as List<MediaItem>;
+      _total = results[1] as int;
       if (fromChange && state.hasValue) {
         final oldIds = state.value!.map((p) => p.id).toSet();
         final added = photos
@@ -53,6 +74,33 @@ class LocalPhotosNotifier extends StateNotifier<AsyncValue<List<MediaItem>>> {
       state = AsyncValue.data(photos);
     } catch (e, st) {
       state = AsyncValue.error(e, st);
+    }
+  }
+
+  /// 追加下一页更早的照片（按创建时间倒序）。
+  Future<void> loadMore() async {
+    if (_loadingMore || !hasMore) return;
+    final current = state.valueOrNull;
+    if (current == null) return;
+    _loadingMore = true;
+    try {
+      final next = await PhotoService.getMediaRange(
+        start: current.length,
+        count: PhotoService.mediaPageSize,
+      );
+      if (!mounted) return;
+      if (next.isEmpty) {
+        _total = current.length;
+        return;
+      }
+      // 期间可能有新照片插入导致偏移，按 id 去重避免重复瓦片。
+      final seen = current.map((e) => e.id).toSet();
+      final appended = next.where((e) => seen.add(e.id)).toList();
+      state = AsyncValue.data([...current, ...appended]);
+    } catch (e) {
+      debugPrint('[photos] 加载更多失败：$e');
+    } finally {
+      _loadingMore = false;
     }
   }
 }

@@ -20,6 +20,9 @@ class TransfersScreen extends ConsumerStatefulWidget {
 
 class _TransfersScreenState extends ConsumerState<TransfersScreen>
     with AutomaticKeepAliveClientMixin {
+  /// 「全部备份」正在枚举整个媒体库（可能包含尚未加载的更早内容）。
+  bool _preparingAll = false;
+
   /// 标签页切换时不销毁本页，避免每次回到「传输」重新构建列表。
   @override
   bool get wantKeepAlive => true;
@@ -43,6 +46,10 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     final transfersAsync = ref.watch(transfersProvider);
     final unsynced = ref.watch(unsyncedPhotosProvider);
 
+    // 本地列表是分页加载的：「照片」页首屏 500 张，之后滚动追加。
+    // 还有未加载的更早内容时，不能把「已加载窗口」当成整个媒体库。
+    final hasUnloaded = ref.read(localPhotosProvider.notifier).hasMore;
+
     final palette = MiPixPalette.of(context);
     // 失败的上传项数量：>0 时在队列标题处提供「重试失败」续传入口。
     final failedUploadCount = (transfersAsync.valueOrNull ?? const <TransferTask>[])
@@ -62,15 +69,23 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
           SliverToBoxAdapter(
             child: _sectionHeader(
               '未同步',
-              subtitle: '共 ${unsynced.length} 张',
+              subtitle: hasUnloaded
+                  ? '已加载 ${unsynced.length} 项待同步'
+                  : '共 ${unsynced.length} 张',
               switcher: true,
-              action: unsynced.isEmpty
+              action: (unsynced.isEmpty && !hasUnloaded)
                   ? null
                   : TextButton.icon(
-                      onPressed: () => _backupAll(unsynced),
-                      icon: Icon(Icons.cloud_upload,
-                          size: 18, color: palette.accent),
-                      label: Text('全部备份',
+                      onPressed: _preparingAll ? null : _backupAll,
+                      icon: _preparingAll
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(Icons.cloud_upload,
+                              size: 18, color: palette.accent),
+                      label: Text(_preparingAll ? '正在统计' : '全部备份',
                           style: TextStyle(color: palette.accent)),
                     ),
             ),
@@ -79,8 +94,12 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
-                child: Text('本地照片都已同步到 SMB 服务器',
-                    style: TextStyle(color: palette.textSecondary, fontSize: 13)),
+                child: Text(
+                    hasUnloaded
+                        ? '还有更早的相片尚未加载；点击「全部备份」会统计并备份整个媒体库（含视频）。'
+                        : '本地照片都已同步到 SMB 服务器',
+                    style: TextStyle(
+                        color: palette.textSecondary, fontSize: 13)),
               ),
             ),
           const SliverToBoxAdapter(child: SizedBox(height: 12)),
@@ -335,8 +354,35 @@ class _TransfersScreenState extends ConsumerState<TransfersScreen>
     );
   }
 
-  Future<void> _backupAll(List<MediaItem> photos) async {
-    await _backup(photos.map((p) => p.path).toList());
+  /// 全部备份：先枚举整个媒体库（图片 + 视频），再按已备份记录过滤。
+  ///
+  /// 不能用「照片」页已加载的窗口：那是分页数据，首屏只有 500 张，
+  /// 用户点「全部备份」时更早的内容还没进内存。
+  Future<void> _backupAll() async {
+    if (_preparingAll) return;
+    setState(() => _preparingAll = true);
+    try {
+      final paths = await PhotoService.getAllMediaPaths();
+      if (!mounted) return;
+      final synced = ref.read(syncedForCurrentServerProvider);
+      final pending = paths.where((p) => !synced.contains(p)).toList();
+      if (pending.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('本地照片与视频都已同步到 SMB 服务器')),
+        );
+        return;
+      }
+      // 枚举完成后交回按钮状态，避免整个上传期间都显示「正在统计」。
+      setState(() => _preparingAll = false);
+      await _backup(pending);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('读取本地媒体库失败：$e')),
+      );
+    } finally {
+      if (mounted) setState(() => _preparingAll = false);
+    }
   }
 
   /// 续传：把队列里失败的上传项重新排队备份（断网恢复后使用）。

@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/models.dart';
@@ -99,8 +100,77 @@ class LocalLibraryNotifier extends StateNotifier<AsyncValue<LocalLibrary>> {
   }
 }
 
-final albumItemsProvider = FutureProvider.family<List<MediaItem>, String>(
-  (ref, albumId) async {
-    return await PhotoService.getMediaItems(albumId);
-  },
+/// 本地相册内页的分页数据源。
+///
+/// 每页 [PhotoService.mediaPageSize] 条，滚动到底由页面调用 [loadMore] 追加，
+/// 不再把相册内容截断在固定数量。
+final albumItemsProvider = StateNotifierProvider.family<LocalAlbumItemsNotifier,
+    AsyncValue<List<MediaItem>>, String>(
+  (ref, albumId) => LocalAlbumItemsNotifier(albumId),
 );
+
+class LocalAlbumItemsNotifier extends StateNotifier<AsyncValue<List<MediaItem>>> {
+  LocalAlbumItemsNotifier(this.albumId) : super(const AsyncValue.loading());
+
+  final String albumId;
+
+  int _total = 0;
+  bool _loadingMore = false;
+
+  bool get hasMore => (state.valueOrNull?.length ?? 0) < _total;
+
+  bool get loadingMore => _loadingMore;
+
+  /// 重新读取已加载的窗口（首屏一页；已滚过更早内容时保持当前长度）。
+  Future<void> load() async {
+    if (!state.hasValue) state = const AsyncValue.loading();
+    try {
+      const pageSize = PhotoService.mediaPageSize;
+      final previous = state.valueOrNull?.length ?? 0;
+      final pages = previous > pageSize ? (previous / pageSize).ceil() : 1;
+      final results = await Future.wait([
+        PhotoService.getMediaItems(
+          albumId,
+          page: 0,
+          pageSize: pages * pageSize,
+        ),
+        PhotoService.mediaCountOf(albumId),
+      ]);
+      _total = results[1] as int;
+      if (!mounted) return;
+      state = AsyncValue.data(results[0] as List<MediaItem>);
+    } catch (e, st) {
+      if (!mounted) return;
+      state = AsyncValue.error(e, st);
+    }
+  }
+
+  /// 追加下一页更早的内容。
+  Future<void> loadMore() async {
+    if (_loadingMore || !hasMore) return;
+    final current = state.valueOrNull;
+    if (current == null) return;
+    _loadingMore = true;
+    try {
+      const pageSize = PhotoService.mediaPageSize;
+      final next = await PhotoService.getMediaItems(
+        albumId,
+        page: (current.length / pageSize).ceil(),
+        pageSize: pageSize,
+      );
+      if (!mounted) return;
+      if (next.isEmpty) {
+        _total = current.length;
+        return;
+      }
+      // 期间可能有新增导致偏移，按 id 去重避免重复瓦片。
+      final seen = current.map((e) => e.id).toSet();
+      final appended = next.where((e) => seen.add(e.id)).toList();
+      state = AsyncValue.data([...current, ...appended]);
+    } catch (e) {
+      debugPrint('[album] 加载更多失败：$e');
+    } finally {
+      _loadingMore = false;
+    }
+  }
+}

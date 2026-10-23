@@ -55,6 +55,9 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   /// 本次动态刷新相对上次新增的照片 id：只让这些瓦片播放入场动画。
   Set<String> _newIds = {};
 
+  /// 本地相册正在追加下一页（用于显示底部加载指示）。
+  bool _loadingMoreLocal = false;
+
   final ScrollController _scrollController = ScrollController();
 
   /// 4 列密排，与小米相册一致。
@@ -69,6 +72,14 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
+    if (widget.isLocal) {
+      // 本地相册改为分页数据源，进入时主动加载首屏。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          ref.read(albumItemsProvider(widget.albumId).notifier).load();
+        }
+      });
+    }
   }
 
   @override
@@ -80,26 +91,35 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
   void _onScroll() {
     if (_scrollController.position.pixels >=
         _scrollController.position.maxScrollExtent - 500) {
-      if (!widget.isLocal) {
-        _loadMore();
-      }
+      _loadMore();
     }
   }
 
   void _loadMore() {
-    if (!widget.isLocal) {
-      final path = ref.read(smbCurrentPathProvider);
-      ref
-          .read(smbItemsPagedProvider((serverId: widget.albumId, path: path))
-              .notifier)
-          .loadMore();
+    if (widget.isLocal) {
+      _loadMoreLocal();
+      return;
     }
+    final path = ref.read(smbCurrentPathProvider);
+    ref
+        .read(smbItemsPagedProvider((serverId: widget.albumId, path: path))
+            .notifier)
+        .loadMore();
+  }
+
+  /// 本地相册分页：滚动到底追加下一页，直到与相册总数对齐。
+  Future<void> _loadMoreLocal() async {
+    final notifier = ref.read(albumItemsProvider(widget.albumId).notifier);
+    if (_loadingMoreLocal || !notifier.hasMore) return;
+    setState(() => _loadingMoreLocal = true);
+    await notifier.loadMore();
+    if (mounted) setState(() => _loadingMoreLocal = false);
   }
 
   /// 刷新当前相册内容（返回查看器删除照片后也会调用）。
   void _refresh() {
     if (widget.isLocal) {
-      ref.invalidate(albumItemsProvider(widget.albumId));
+      ref.read(albumItemsProvider(widget.albumId).notifier).load();
     } else {
       final path = ref.read(smbCurrentPathProvider);
       ref
@@ -276,7 +296,7 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
     if (widget.isLocal) {
       // 系统媒体库变化（如本相册内新增截图）时自动刷新，无需手动刷新。
       ref.listen(mediaChangeTickProvider, (_, __) {
-        ref.invalidate(albumItemsProvider(widget.albumId));
+        ref.read(albumItemsProvider(widget.albumId).notifier).load();
       });
       // 记录本次刷新增的照片 id，只让新瓦片播放入场动画。
       ref.listen<AsyncValue<List<MediaItem>>>(
@@ -285,6 +305,12 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
           final prevItems = prev?.valueOrNull;
           final nextItems = next.valueOrNull;
           if (prevItems == null || nextItems == null) return;
+          // 尾部追加（加载更早的内容）不是新增照片，不播放入场动画。
+          if (prevItems.isNotEmpty &&
+              nextItems.isNotEmpty &&
+              prevItems.first.id == nextItems.first.id) {
+            return;
+          }
           final prevIds = prevItems.map((e) => e.id).toSet();
           final added = nextItems
               .where((e) => !prevIds.contains(e.id))
@@ -341,6 +367,16 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
                 subtitle: '该相册里还没有可显示的内容',
               );
             }
+            // 首屏不足一屏时自动补下一页，否则没有滚动事件可触发加载更多。
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted || !_scrollController.hasClients) return;
+              final notifier =
+                  ref.read(albumItemsProvider(widget.albumId).notifier);
+              if (notifier.hasMore &&
+                  _scrollController.position.maxScrollExtent <= 0) {
+                _loadMoreLocal();
+              }
+            });
             final grouped = _groupByDate(items);
             return CustomScrollView(
               controller: _scrollController,
@@ -406,6 +442,22 @@ class _PhotoGridScreenState extends ConsumerState<PhotoGridScreen> {
                     ),
                   ),
                 ],
+                if (_loadingMoreLocal)
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      child: Center(
+                        child: SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: palette.accent,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
                 const SliverPadding(padding: EdgeInsets.only(bottom: 24)),
               ],
             );
