@@ -1,7 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'providers/app_provider.dart';
+import 'services/cache_service.dart';
+import 'services/video_thumbnail_service.dart';
 import 'screens/main_screen.dart';
 import 'utils/mipix_theme.dart';
 
@@ -19,6 +22,8 @@ void main() {
   ));
 
   runApp(const ProviderScope(child: MiPixApp()));
+  unawaited(CacheService().clearExpiredCache().catchError((_) {}));
+  unawaited(VideoThumbnailService.instance.clearExpiredCache().catchError((_) {}));
 }
 
 class MiPixApp extends ConsumerWidget {

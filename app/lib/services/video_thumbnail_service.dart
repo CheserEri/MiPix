@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/models.dart';
+import 'cache_service.dart';
 import 'remote_video_proxy.dart';
 
 /// 远端视频缩略图服务。
@@ -27,6 +28,7 @@ class VideoThumbnailService {
 
   static const int _maxConcurrent = 2;
   static const int _memoryLimit = 300;
+  static const int _diskCacheLimitBytes = 100 * 1024 * 1024;
 
   /// 抽帧时刻：跳过开头可能存在的黑屏/片头，1 秒处通常已有正常画面。
   static const int _frameTimeMs = 1000;
@@ -36,6 +38,7 @@ class VideoThumbnailService {
   int _active = 0;
 
   Future<Directory>? _cacheDirFuture;
+  int _writesSincePrune = 0;
 
   /// 同步读取内存缓存（命中失败时返回 null，用 [knows] 区分“没查过”）。
   Uint8List? peek({required String serverId, required MediaItem item}) =>
@@ -124,7 +127,9 @@ class VideoThumbnailService {
   }
 
   void _remember(String key, Uint8List? bytes) {
-    if (_memory.length >= _memoryLimit) _memory.clear();
+    if (_memory.length >= _memoryLimit) {
+      _memory.remove(_memory.keys.first);
+    }
     _memory[key] = bytes;
   }
 
@@ -150,6 +155,12 @@ class VideoThumbnailService {
       final file =
           File('${dir.path}${Platform.pathSeparator}$key.jpg');
       if (!await file.exists()) return null;
+      final stat = await file.stat();
+      if (DateTime.now().difference(stat.modified) >
+          Duration(days: await CacheService().getCacheRetentionDays())) {
+        await file.delete();
+        return null;
+      }
       final bytes = await file.readAsBytes();
       return bytes.isEmpty ? null : bytes;
     } catch (_) {
@@ -163,8 +174,80 @@ class VideoThumbnailService {
       final file =
           File('${dir.path}${Platform.pathSeparator}$key.jpg');
       await file.writeAsBytes(bytes, flush: false);
+      _writesSincePrune++;
+      if (_writesSincePrune >= 20) {
+        _writesSincePrune = 0;
+        await _pruneDiskCache(dir);
+      }
     } catch (_) {
       // 磁盘缓存失败不影响本次显示，下次进入仍可重新抽帧。
+    }
+  }
+
+  /// Bound the otherwise independent video cache and remove expired entries.
+  Future<void> _pruneDiskCache(Directory dir) async {
+    try {
+      final retention =
+          Duration(days: await CacheService().getCacheRetentionDays());
+      final entries = <File>[];
+      for (final entity in dir.listSync(followLinks: false)) {
+        if (entity is! File) continue;
+        final stat = await entity.stat();
+        if (DateTime.now().difference(stat.modified) > retention) {
+          await entity.delete();
+        } else {
+          entries.add(entity);
+        }
+      }
+      entries.sort(
+        (a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync()),
+      );
+      var total = 0;
+      final sizes = <File, int>{};
+      for (final file in entries) {
+        final size = await file.length();
+        sizes[file] = size;
+        total += size;
+      }
+      for (final file in entries) {
+        if (total <= _diskCacheLimitBytes) break;
+        await file.delete();
+        total -= sizes[file] ?? 0;
+      }
+    } catch (_) {
+      // Pruning is best effort and must not interrupt thumbnail display.
+    }
+  }
+
+  Future<void> clearExpiredCache() async {
+    try {
+      await _pruneDiskCache(await _cacheDir());
+    } catch (_) {
+      // Cleanup is best effort.
+    }
+  }
+
+  Future<int> getCacheSize() async {
+    try {
+      final dir = await _cacheDir();
+      var total = 0;
+      for (final entity in dir.listSync(followLinks: false)) {
+        if (entity is File) total += await entity.length();
+      }
+      return total;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  Future<void> clearCache() async {
+    _memory.clear();
+    try {
+      final dir = await _cacheDir();
+      if (await dir.exists()) await dir.delete(recursive: true);
+      await dir.create(recursive: true);
+    } catch (_) {
+      // Cache removal is best effort.
     }
   }
 }

@@ -3,7 +3,7 @@
 纯本地运行的 Android 相册应用：浏览手机照片与视频，并通过 SMB 协议把照片备份到 NAS。无后端服务、无账号体系，数据只在本机与自有 SMB 服务器之间流动。
 
 - Flutter + Riverpod，仅 Android
-- 版本 `1.0.14+15`（Dart SDK `^3.11.0`）
+- 版本 `1.0.16+17`（Dart SDK `^3.11.0`）
 - compileSdk 36 / targetSdk 35 / minSdk 跟随 `flutter.minSdkVersion`
 - applicationId `com.chesereri.mipix`
 
@@ -64,6 +64,46 @@
 - 每个 worker 使用独立连接，断链后重建；小文件走 worker 池并发（并发数由设置页控制），大文件串行独占多连接，避免连接争抢。
 - 上传失败会立即写入传输队列，批次结束再统一落盘；重建连接、续传偏移与最终失败原因都有结构化日志。
 - 批次期间通过 MethodChannel `mipix/keepalive` 持有 `PARTIAL_WAKE_LOCK` 与 `WifiLock`，引用计数归零时释放。
+
+## 时间与日期
+
+远端媒体在界面上的日期与排序按以下优先级确定，取到即停止：
+
+1. **EXIF 拍摄时间**（仅 JPEG）：读文件头 64 KiB，取 `DateTimeOriginal(0x9003)`，缺失时取 `DateTime(0x0132)`；
+2. **文件名日期**：`IMG_20241003_060118`、`20241005_110451`、`Screenshot_2022-01-21-09-11-45`、`wx_camera_1688264063704`（13 位毫秒时间戳）等常见命名；
+3. **SMB 文件修改时间（mtime）**。
+
+探测结果按「文件路径 → 时间」缓存 7 天并增量落盘；若整批探测因连接或读取问题全部失败，则不写入媒体列表缓存，下次进入自动重试。备份上传在 `rename` 完成后会把远端文件的修改/创建时间回写为手机相册的拍摄时间，因此**新备份的照片不需要再对 NAS 做额外处理**。
+
+批量复制 / 迁移相册目录时，必须使用保留时间戳的方式，否则所有文件的 mtime 会变成复制当天，界面（以及其他任何按 mtime 排序的软件）都会把整批文件归到同一天。下面命令里的目录均为示例，替换为实际路径即可：
+
+```powershell
+# Windows：/COPY:DAT 保留数据、属性与时间戳，/DCOPY:T 保留目录时间戳
+robocopy "D:\Photos\MiGallery" "E:\Backup\MiGallery" /E /COPY:DAT /DCOPY:T /R:2 /W:2 /MT:8 /LOG:migallery_copy.log
+```
+
+```bash
+# NAS / Linux：-a 已包含 -t（保留 mtime）；-X 保留扩展属性
+rsync -aHAX --info=progress2 "/path/to/MiGallery/" "/path/to/backup/MiGallery/"
+```
+
+Windows 资源管理器的复制本身会保留文件修改时间，但不保留目录时间；不要用勾选了「不保留时间戳」的第三方同步工具。
+
+### 一次性修正 NAS 上已有的时间（可选）
+
+批量拷贝进 NAS 的旧文件，mtime 已被覆盖成拷贝日。若希望其他客户端（Synology Photos、Windows 资源管理器）也按拍摄时间显示，可在 NAS 本机用 exiftool 做一次修正（先备份，再执行；`/path/to/MiGallery` 替换为实际目录）：
+
+```bash
+# 1) 盘点：导出每个文件当前的 EXIF 拍摄时间与 mtime，留作回滚依据
+exiftool -r -csv -FileName -DateTimeOriginal -QuickTime:CreateDate -FileModifyDate \
+         /path/to/MiGallery > migallery_before.csv
+
+# 2) 把 mtime 同步为拍摄时间；没有 EXIF 的文件会自动跳过，不会被改动
+exiftool -r -P "-FileModifyDate<DateTimeOriginal" /path/to/MiGallery
+exiftool -r -P "-FileModifyDate<QuickTime:CreateDate" /path/to/MiGallery
+```
+
+应用端已按 EXIF → 文件名 → mtime 兜底，这一步不是必需的；跳过它只会让「其他软件」看到的日期仍然不准。
 
 ## 缓存与并发
 

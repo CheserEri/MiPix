@@ -433,9 +433,14 @@ class SmbService {
           }
         }
         // 按 EXIF 拍摄时间校准排序：优先 DateTimeOriginal，回退文件 mtime。
-        await _enrichWithExifDates(config, path, items, onProgress: onProgress);
+        final calibrationFailed = await _enrichWithExifDates(config, path, items,
+            onProgress: onProgress);
         final sorted = _sortByDateDesc(items);
-        await _cacheService.cacheAlbumMediaItems(config.id, path, sorted);
+        // 校准整体失败时不要把 mtime 版列表写进 7 天缓存：否则用户会连续一周
+        // 看到「日期全停在批量导入日」，且没有任何机会自愈。下次进入会重扫。
+        if (!calibrationFailed) {
+          await _cacheService.cacheAlbumMediaItems(config.id, path, sorted);
+        }
         return sorted;
       } on SmbException catch (e) {
         final msg = e.toString().toLowerCase();
@@ -481,13 +486,16 @@ class SmbService {
   /// - 每处理若干项即增量写入缓存，扫描被中断后下次可续传；
   /// - 通过 [onProgress] 汇报进度，供 UI 显示进度条。
   /// 任一项失败都静默回退到已有的文件 mtime，不影响列表可用性。
-  Future<void> _enrichWithExifDates(
+  ///
+  /// 返回 `true` 表示「本次校准整体失败」（拿不到连接，或每个待探测文件都抛错），
+  /// 调用方据此跳过媒体列表缓存，让下次进入重新尝试。
+  Future<bool> _enrichWithExifDates(
     SmbConfig config,
     String albumPath,
     List<MediaItem> items, {
     ScanProgressCallback? onProgress,
   }) async {
-    if (items.isEmpty) return;
+    if (items.isEmpty) return false;
     final total = items.length;
 
     final dates = await _cacheService.getCachedExifDates(config.id, albumPath);
@@ -495,35 +503,68 @@ class SmbService {
     // 先应用缓存结果，并筛出仍需探测的项；非 JPEG 无 EXIF，直接算作已处理。
     final needProbe = <int>[];
     var done = 0;
+    // 本次靠文件名日期兜底的项数（仅用于日志与「是否值得缓存」的判断）。
+    var named = 0;
     for (var i = 0; i < items.length; i++) {
       final ms = dates[items[i].path];
       if (ms != null) {
         items[i] = items[i].copyWith(modifiedAt: DateTime.fromMillisecondsSinceEpoch(ms));
         done++;
-      } else if (items[i].mimeType.startsWith('image/jpeg')) {
+        continue;
+      }
+      // 没有缓存的 EXIF 时，先用文件名里的日期兜底：视频/PNG/DNG 只能靠它，
+      // 没有 EXIF 的 JPEG 也会先取到它，后续探测成功再由 EXIF 覆盖。
+      final fromName = _parseDateFromFileName(items[i].name);
+      if (fromName != null) {
+        items[i] = items[i].copyWith(modifiedAt: fromName);
+        named++;
+      }
+      if (items[i].mimeType.startsWith('image/jpeg')) {
         needProbe.add(i);
       } else {
         done++;
       }
     }
     onProgress?.call(done, total);
-    if (needProbe.isEmpty) return;
+    debugPrint('[smb][exif] path=$albumPath done=$done '
+        'needProbe=${needProbe.length} filenameDates=$named');
+    if (needProbe.isEmpty) return false;
 
     // 为本次扫描建立一批独立连接。若 NAS 限制并发连接数，则用已建立的数量降级运行。
     final connections = <SmbConnect>[];
+    // 只有本方法自己新建的连接才在这里关闭；回退复用的池化连接不能关，
+    // 否则后续缩略图/原图读取会全部失效。
+    final ownedConnections = <SmbConnect>[];
     try {
       for (var i = 0; i < _exifScanConnections; i++) {
         try {
-          connections.add(await _connectAuthGated(config));
+          final conn = await _connectAuthGated(config);
+          connections.add(conn);
+          ownedConnections.add(conn);
         } catch (_) {
           break;
         }
       }
-      // 一条连接都建不起来时（网络异常等）直接放弃探测，列表仍按 mtime 展示。
-      if (connections.isEmpty) return;
+      // 一条独立连接都建不起来时（NAS 限制同用户会话数等），退化为复用主连接
+      // 串行探测：慢一些，但不能直接放弃校准——否则整个目录会带着 mtime 写进
+      // 7 天媒体列表缓存，表现为「照片日期全部停在批量导入的那一天」。
+      if (connections.isEmpty) {
+        try {
+          connections.add(await _getConnection(config));
+          debugPrint('[smb][exif] fallback-pool path=$albumPath');
+        } catch (_) {
+          // 确实拿不到任何连接，只能按 mtime 展示。
+        }
+      }
+      if (connections.isEmpty) {
+        debugPrint('[smb][exif] no-connection path=$albumPath');
+        return true;
+      }
 
       var next = 0;
       var sincePersist = 0;
+      var resolved = 0;
+      var failed = 0;
 
       Future<void> worker(SmbConnect conn) async {
         while (true) {
@@ -538,9 +579,15 @@ class SmbService {
             if (date != null) {
               items[idx] = items[idx].copyWith(modifiedAt: date);
               dates[items[idx].path] = date.millisecondsSinceEpoch;
+              resolved++;
             }
-          } catch (_) {
-            // 单个文件探测失败静默回退文件 mtime，不中断整体扫描。
+          } catch (e) {
+            // 单个文件探测失败静默回退文件 mtime，不中断整体扫描；只打印前几条，
+            // 便于定位是「文件确实没有 EXIF」还是「读取/解析整体失败」。
+            if (failed < 5) {
+              debugPrint('[smb][exif] probe-fail path=${items[idx].path} ${_errStr(e)}');
+            }
+            failed++;
           }
 
           done++;
@@ -554,8 +601,14 @@ class SmbService {
 
       await Future.wait(connections.map(worker));
       await _cacheService.cacheExifDates(config.id, albumPath, dates);
+      debugPrint('[smb][exif] path=$albumPath jpeg=${needProbe.length} '
+          'resolved=$resolved failed=$failed conns=${connections.length}');
+      // 全部待探测文件都抛错 = 系统性失败（连接/读取问题），不是「确实没有 EXIF」；
+      // 此时不要固化列表缓存，交给下次进入重试。若文件名已兜底出日期，缓存仍然
+      // 可用（下次 EXIF 缓存过期后会再尝试一次），避免每次进入都全量重扫。
+      return resolved == 0 && failed == needProbe.length && named == 0;
     } finally {
-      for (final conn in connections) {
+      for (final conn in ownedConnections) {
         try {
           await conn.close();
         } catch (_) {
@@ -563,6 +616,73 @@ class SmbService {
         }
       }
     }
+  }
+
+  /// 从文件名推断拍摄时间，供没有 EXIF 的文件兜底（视频、PNG、DNG、无 EXIF 的 JPEG）。
+  ///
+  /// 只认明确的「日期 + 时间」组合或 13 位毫秒时间戳，避免把普通编号误当日期：
+  /// - `IMG_20241003_060118` / `MVIMG_20250204_165108` / `VID_20250101_120000`
+  /// - `20241005_110451` / `illust_121195365_20241105_031947`
+  /// - `Screenshot_2022-01-21-09-11-45` / `Screenrecorder-2023-05-01-10-00-00`
+  /// - `wx_camera_1688264063704` / `mmexport1688264063704`（毫秒时间戳）
+  ///
+  /// 解析不到、或年月日时分秒非法时返回 null，调用方继续回退文件 mtime。
+  DateTime? _parseDateFromFileName(String name) {
+    final base = name.replaceAll(RegExp(r'\.[A-Za-z0-9]+$'), '');
+
+    // 13 位毫秒时间戳：微信导出、部分相机原始文件名。
+    final epoch = RegExp(r'(?<!\d)(1\d{12})(?!\d)').firstMatch(base);
+    if (epoch != null) {
+      final ms = int.parse(epoch.group(1)!);
+      final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+      if (dt.year >= 1990 && dt.year <= 2100) return dt;
+    }
+
+    // 日期 + 时间：20241003_060118、2024-10-03 06:01:18、2022-01-21-09-11-45。
+    // 末尾允许 3 位毫秒（Pixel 的 PXL_20241003_060118123 命名）。
+    final full = RegExp(
+      r'(?<!\d)((?:19|20)\d{2})[-_.]?(\d{2})[-_.]?(\d{2})[ _T-]+'
+      r'(\d{2})[-_.:]?(\d{2})[-_.:]?(\d{2})(?:\d{3})?(?!\d)',
+    ).firstMatch(base);
+    if (full != null) {
+      final dt = _checkedDate(
+        int.parse(full.group(1)!),
+        int.parse(full.group(2)!),
+        int.parse(full.group(3)!),
+        int.parse(full.group(4)!),
+        int.parse(full.group(5)!),
+        int.parse(full.group(6)!),
+      );
+      if (dt != null) return dt;
+    }
+
+    // 只有日期：20241005、2024-10-05（按当天 0 点处理，分组只用到年月日）。
+    final dateOnly = RegExp(
+      r'(?<!\d)((?:19|20)\d{2})[-_.]?(\d{2})[-_.]?(\d{2})(?!\d)',
+    ).firstMatch(base);
+    if (dateOnly != null) {
+      return _checkedDate(
+        int.parse(dateOnly.group(1)!),
+        int.parse(dateOnly.group(2)!),
+        int.parse(dateOnly.group(3)!),
+        0,
+        0,
+        0,
+      );
+    }
+    return null;
+  }
+
+  /// 校验并构造日期；年月日越界（如 2024-02-30）返回 null。
+  DateTime? _checkedDate(
+      int year, int month, int day, int hour, int minute, int second) {
+    if (year < 1990 || year > 2100) return null;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    if (hour > 23 || minute > 59 || second > 59) return null;
+    final dt = DateTime(year, month, day, hour, minute, second);
+    // Dart 会把 2 月 30 日规范化成 3 月 1 日，这里据此判断原始日期是否合法。
+    if (dt.year != year || dt.month != month || dt.day != day) return null;
+    return dt;
   }
 
   /// 用指定连接读取文件头部并解析 EXIF 拍摄时间；失败/无 EXIF 时返回 null。
@@ -924,7 +1044,9 @@ class SmbService {
           result = Uint8List.fromList(bytes);
         }
 
-        await _cacheService.cacheImage(config.id, remotePath, result);
+        if (useCache) {
+          await _cacheService.cacheImage(config.id, remotePath, result);
+        }
         return result;
       } on SmbException catch (e) {
         debugPrint('[smb] readFile smbErr retries=$retries path=$remotePath ${_errStr(e)}');
@@ -1102,18 +1224,23 @@ class SmbService {
       // 局部读取失败时回退到全量读取。
     }
 
-    // 2) 回退：全量读取原图后再缩放生成缩略图（原图本身也会被缓存）。
+    // 2) 回退：全量读取原图后再缩放生成缩略图。
     //
-    // 这里必须走单连接（[readFile] 的 useParallel: false）：网格会 8 路并发加载
-    // 缩略图，若比照原图查看走 4 连接并行分块，8 路并发将同时新建 32 条 SMB
-    // 会话，Win7 服务端会因会话耗尽而拒绝（SmbAuthException/断链），
-    // 结果就是「无内嵌 EXIF 缩略图且 ≥512KiB 的照片」缩略图全部碎图。
+    // 这里不要缓存原图（useCache: false）：浏览几千张的相册时，若每张缩略图
+    // 都顺带把整张原图落盘，缓存配额会被瞬间灌满并触发反复淘汰，缩略图也
+    // 跟着被清掉，表现为「一直加载、缓存越用越满」。原图缓存只在用户真正
+    // 查看原图 / 另存 / 分享时建立。
+    //
+    // 必须走单连接（[readFile] 的 useParallel: false）：网格会 3 路并发加载
+    // 缩略图，若比照原图查看走 4 连接并行分块，会同时新建大量 SMB 会话，
+    // Win7 服务端会因会话耗尽而拒绝（SmbAuthException/断链），结果就是
+    // 「无内嵌 EXIF 缩略图且 ≥512KiB 的照片」缩略图全部碎图。
     // 缩略图只需把整图缩到 200px，走共享池连接顺序读取即可，且天然受益于
     // 连接复用与请求串行化。
     final originalData = await readFile(
       config,
       remotePath,
-      useCache: true,
+      useCache: false,
       useParallel: false,
     );
     final thumbnail = await _cacheService.generateAndCacheThumbnail(

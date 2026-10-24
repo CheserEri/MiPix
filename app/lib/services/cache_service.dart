@@ -39,10 +39,15 @@ class CacheService {
   /// v6：SMB2 目录枚举提前结束（见 `Smb2FilesEnumerator`）会让半截列表被
   /// 缓存 7 天，表现为「相册张数正确但照片只显示到某一天」。递增版本号
   /// 使已落盘的坏缓存整体作废，升级后首次进入重新完整枚举。
-  static const _albumMediaCacheVersion = 'v6';
+  /// v7：EXIF 探测的连接建立失败时曾静默回退 mtime 并把结果缓存 7 天，
+  /// 表现为「整批照片都停在 NAS 批量导入的那一天」。递增版本号丢弃这批
+  /// 未校准的列表，配合探测失败时的连接回退，升级后首次进入重新校准。
+  static const _albumMediaCacheVersion = 'v7';
 
   /// 默认缓存上限：500 MB。
   static const int defaultCacheLimitBytes = 500 * 1024 * 1024;
+  static const _cacheRetentionDaysKey = 'cache_retention_days';
+  static const int defaultCacheRetentionDays = 30;
 
   Directory? _cacheDirRef;
   Directory get _cacheDir => _cacheDirRef!;
@@ -79,6 +84,32 @@ class CacheService {
   Future<int> getCacheLimit() async {
     await ensureInitialized();
     return _prefs!.getInt(_cacheLimitKey) ?? defaultCacheLimitBytes;
+  }
+
+  Future<int> getCacheRetentionDays() async {
+    await ensureInitialized();
+    return _prefs!.getInt(_cacheRetentionDaysKey) ?? defaultCacheRetentionDays;
+  }
+
+  Future<void> setCacheRetentionDays(int days) async {
+    await ensureInitialized();
+    await _prefs!.setInt(_cacheRetentionDaysKey, days);
+    await clearExpiredCache();
+  }
+
+  Future<({int originals, int thumbnails})> getCacheBreakdown() async {
+    await ensureInitialized();
+    var originals = 0;
+    var thumbnails = 0;
+    for (final entity in _cacheDir.listSync()) {
+      if (entity is! File) continue;
+      if (_isThumbnailCacheFile(entity.path)) {
+        thumbnails += await entity.length();
+      } else if (entity.path.contains(_imageCachePrefix)) {
+        originals += await entity.length();
+      }
+    }
+    return (originals: originals, thumbnails: thumbnails);
   }
 
   Future<void> setCacheLimit(int bytes) async {
@@ -300,7 +331,8 @@ class CacheService {
     final file = File(path.join(_cacheDir.path, '$_imageCachePrefix${serverId}_$safeName'));
     if (!file.existsSync()) return null;
     final stat = await file.stat();
-    if (DateTime.now().difference(stat.modified) > _defaultCacheDuration) {
+    if (DateTime.now().difference(stat.modified) >
+        Duration(days: await getCacheRetentionDays())) {
       await file.delete();
       return null;
     }
@@ -312,11 +344,8 @@ class CacheService {
     final safeName = _sanitizePath(imagePath);
     final file = File(path.join(_cacheDir.path, '$_thumbnailCachePrefix${serverId}_$safeName'));
     if (!file.existsSync()) return null;
-    final stat = await file.stat();
-    if (DateTime.now().difference(stat.modified) > _defaultCacheDuration) {
-      await file.delete();
-      return null;
-    }
+    // Thumbnail cache is intentionally retained until quota eviction or a
+    // user-triggered clear; reopening a large SMB album can reuse it.
     return await file.readAsBytes();
   }
 
@@ -332,9 +361,21 @@ class CacheService {
   int _writesSinceLimitCheck = 0;
   static const _limitCheckInterval = 20;
 
+  /// 两次上限检查的最小间隔。相册有几千张时，`enforceCacheLimit` 需要遍历并
+  /// stat 整个缓存目录，若只按写入次数触发，会在批量加载时反复全盘扫描，
+  /// 既拖慢加载又让手机发热。
+  static const _limitCheckMinGap = Duration(seconds: 30);
+  DateTime? _lastLimitCheck;
+
   Future<void> _maybeEnforceLimit() async {
     _writesSinceLimitCheck++;
     if (_writesSinceLimitCheck < _limitCheckInterval) return;
+    final now = DateTime.now();
+    if (_lastLimitCheck != null &&
+        now.difference(_lastLimitCheck!) < _limitCheckMinGap) {
+      return;
+    }
+    _lastLimitCheck = now;
     _writesSinceLimitCheck = 0;
     await enforceCacheLimit();
   }
@@ -365,6 +406,7 @@ class CacheService {
 
   Future<void> clearExpiredCache() async {
     await ensureInitialized();
+    final retention = Duration(days: await getCacheRetentionDays());
     final keys = _prefs!.getKeys().where((k) => k.startsWith(_albumCachePrefix));
     for (final key in keys) {
       final data = _prefs!.getString(key);
@@ -381,11 +423,11 @@ class CacheService {
       }
     }
     final files = _cacheDir.listSync().where((f) =>
-      f.path.contains(_imageCachePrefix) || _isThumbnailCacheFile(f.path)
+      f.path.contains(_imageCachePrefix)
     );
     for (final file in files) {
       final stat = await file.stat();
-      if (DateTime.now().difference(stat.modified) > _defaultCacheDuration) {
+      if (DateTime.now().difference(stat.modified) > retention) {
         await file.delete();
       }
     }

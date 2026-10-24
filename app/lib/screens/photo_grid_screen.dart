@@ -1010,7 +1010,21 @@ class _RemoteImageState extends State<_RemoteImage> {
   bool _loading = true;
   static final _loadingController = _ImageLoadingController();
 
+  /// 当前瓦片的请求令牌：瓦片销毁时置位，队列会跳过它。
+  _ImageRequestToken? _requestToken;
+
+  /// 队列满时请求可能被丢弃，这里在瓦片仍挂载时自动重试，避免留下裂图。
+  Timer? _retryTimer;
+  int _retryAttempt = 0;
+
   bool get _isVideo => widget.item.isVideo;
+
+  @override
+  void dispose() {
+    _requestToken?.cancelled = true;
+    _retryTimer?.cancel();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -1063,19 +1077,32 @@ class _RemoteImageState extends State<_RemoteImage> {
   }
 
   Future<void> _load() async {
+    final token = _ImageRequestToken();
+    _requestToken = token;
     try {
       final servers = await LocalStorageService().getSmbServers();
       final server = servers.firstWhere((s) => s.id == widget.serverId);
-      final data =
-          await _loadingController.loadImage(server, widget.item.path);
-      if (mounted) {
-        setState(() {
-          _imageData = data;
-          _loading = false;
+      final data = await _loadingController.loadImage(
+        server,
+        widget.item.path,
+        token,
+      );
+      if (!mounted || token.cancelled) return;
+      if (data.isEmpty && _retryAttempt < 2) {
+        // 请求可能在队列已满时被丢弃；瓦片仍挂载就再试一次，而不是显示裂图。
+        _retryAttempt++;
+        _retryTimer?.cancel();
+        _retryTimer = Timer(const Duration(milliseconds: 1200), () {
+          if (mounted && !token.cancelled) _load();
         });
+        return;
       }
+      setState(() {
+        _imageData = data;
+        _loading = false;
+      });
     } catch (_) {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && !token.cancelled) setState(() => _loading = false);
     }
   }
 
@@ -1117,7 +1144,7 @@ class _RemoteImageState extends State<_RemoteImage> {
           Image.memory(
             thumb,
             fit: BoxFit.cover,
-            cacheWidth: 400,
+            cacheWidth: 256,
             errorBuilder: (_, __, ___) => Container(
               color: palette.fill,
               child: Icon(Icons.videocam,
@@ -1149,7 +1176,7 @@ class _RemoteImageState extends State<_RemoteImage> {
     return Image.memory(
       _imageData!,
       fit: BoxFit.cover,
-      cacheWidth: 400,
+      cacheWidth: 256,
       errorBuilder: (_, __, ___) => Container(
         color: palette.fill,
         child: Icon(Icons.broken_image,
@@ -1159,12 +1186,29 @@ class _RemoteImageState extends State<_RemoteImage> {
   }
 }
 
+class _ImageRequestToken {
+  /// 瓦片销毁后置位，队列出队时直接跳过，不再发起 SMB 读取。
+  bool cancelled = false;
+}
+
 class _ImageLoadingController {
-  static const int maxConcurrent = 8;
+  // SMB requests are expensive and scrolling quickly can otherwise queue work
+  // for thousands of tiles that are no longer on screen.
+  static const int maxConcurrent = 3;
+
+  /// 队列上限按「约 10 行可见 + 预加载」估算，太小会误伤当前可见的瓦片。
+  static const int maxPendingRequests = 48;
   int _activeRequests = 0;
   final Queue<_PendingImageRequest> _queue = Queue<_PendingImageRequest>();
 
-  Future<Uint8List> loadImage(SmbConfig server, String remotePath) async {
+  Future<Uint8List> loadImage(
+    SmbConfig server,
+    String remotePath,
+    _ImageRequestToken token,
+  ) async {
+    _dropCancelled();
+    if (token.cancelled) return Uint8List(0);
+
     if (_activeRequests < maxConcurrent) {
       _activeRequests++;
       try {
@@ -1174,10 +1218,30 @@ class _ImageLoadingController {
         _processQueue();
       }
     } else {
+      // Keep the queue bounded. Complete the oldest request with an empty
+      // result so its widget can settle; the tile schedules a short retry
+      // while it is still mounted.
+      if (_queue.length >= maxPendingRequests) {
+        final stale = _queue.removeAt(0);
+        if (!stale.completer.isCompleted) {
+          stale.completer.complete(Uint8List(0));
+        }
+      }
       final completer = Completer<Uint8List>();
-      _queue.add(_PendingImageRequest(server, remotePath, completer));
+      _queue.add(_PendingImageRequest(server, remotePath, completer, token));
       return completer.future;
     }
+  }
+
+  /// 丢弃已销毁瓦片的排队请求；对应的 future 以空结果结束，调用方不再使用。
+  void _dropCancelled() {
+    _queue.removeWhere((request) {
+      if (!request.token.cancelled) return false;
+      if (!request.completer.isCompleted) {
+        request.completer.complete(Uint8List(0));
+      }
+      return true;
+    });
   }
 
   Future<Uint8List> _doLoadImage(SmbConfig server, String remotePath) async {
@@ -1194,6 +1258,12 @@ class _ImageLoadingController {
   void _processQueue() {
     while (_activeRequests < maxConcurrent && _queue.isNotEmpty) {
       final request = _queue.removeAt(0);
+      if (request.token.cancelled) {
+        if (!request.completer.isCompleted) {
+          request.completer.complete(Uint8List(0));
+        }
+        continue;
+      }
       _activeRequests++;
       _doLoadImage(request.server, request.remotePath).then((data) {
         request.completer.complete(data);
@@ -1211,14 +1281,17 @@ class _PendingImageRequest {
   final SmbConfig server;
   final String remotePath;
   final Completer<Uint8List> completer;
+  final _ImageRequestToken token;
 
-  _PendingImageRequest(this.server, this.remotePath, this.completer);
+  _PendingImageRequest(this.server, this.remotePath, this.completer, this.token);
 }
 
 class Queue<E> {
   final List<E> _list = [];
   void add(E e) => _list.add(e);
   E removeAt(int index) => _list.removeAt(index);
+  void removeWhere(bool Function(E) test) => _list.removeWhere(test);
   bool get isEmpty => _list.isEmpty;
   bool get isNotEmpty => _list.isNotEmpty;
+  int get length => _list.length;
 }

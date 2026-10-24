@@ -7,6 +7,7 @@ import '../providers/smb_provider.dart';
 import '../providers/transfer_provider.dart';
 import '../services/cache_service.dart';
 import '../services/smb_service.dart';
+import '../services/video_thumbnail_service.dart';
 import '../utils/mipix_theme.dart';
 import 'smb_screen.dart';
 
@@ -425,6 +426,10 @@ class _CacheSectionState extends State<_CacheSection> {
   final CacheService _cache = CacheService();
   int? _size;
   int? _limit;
+  int? _retentionDays;
+  int _originalSize = 0;
+  int _thumbnailSize = 0;
+  int _videoSize = 0;
   bool _busy = false;
 
   @override
@@ -437,10 +442,17 @@ class _CacheSectionState extends State<_CacheSection> {
     await _cache.init();
     final size = await _cache.getCacheSize();
     final limit = await _cache.getCacheLimit();
+    final retention = await _cache.getCacheRetentionDays();
+    final breakdown = await _cache.getCacheBreakdown();
+    final videoSize = await VideoThumbnailService.instance.getCacheSize();
     if (!mounted) return;
     setState(() {
-      _size = size;
+      _size = size + videoSize;
       _limit = limit;
+      _retentionDays = retention;
+      _originalSize = breakdown.originals;
+      _thumbnailSize = breakdown.thumbnails;
+      _videoSize = videoSize;
     });
   }
 
@@ -463,7 +475,7 @@ class _CacheSectionState extends State<_CacheSection> {
         backgroundColor: palette.surface,
         title: Text('清除缓存', style: TextStyle(color: palette.textPrimary)),
         content: Text(
-          '将删除已缓存的缩略图与原图（约 ${_size == null ? '--' : _formatBytes(_size!)}），'
+          '将删除照片缩略图、原图和视频封面缓存（约 ${_size == null ? '--' : _formatBytes(_size!)}），'
           '下次浏览时会重新从 SMB 加载。',
           style: TextStyle(color: palette.textSecondary),
         ),
@@ -484,6 +496,7 @@ class _CacheSectionState extends State<_CacheSection> {
     setState(() => _busy = true);
     await _cache.clearAllCache();
     SmbService.clearThumbnailMemoryCache();
+    await VideoThumbnailService.instance.clearCache();
     await _refresh();
     if (!mounted) return;
     setState(() => _busy = false);
@@ -525,7 +538,7 @@ class _CacheSectionState extends State<_CacheSection> {
             ),
             const SizedBox(height: 8),
             Text(
-              '超出后自动优先清理最早的缓存原图',
+              '照片缓存超出后优先清理原图；视频封面另限 100 MB',
               style: TextStyle(color: palette.textSecondary, fontSize: 12),
             ),
             const SizedBox(height: 12),
@@ -554,6 +567,48 @@ class _CacheSectionState extends State<_CacheSection> {
     await _refresh();
   }
 
+  Future<void> _pickRetention() async {
+    final palette = MiPixPalette.of(context);
+    const options = <int>[7, 30, 90];
+    final chosen = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        decoration: BoxDecoration(
+          color: palette.surface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('原图与视频封面保留时间', style: TextStyle(
+              color: palette.textPrimary, fontSize: 18, fontWeight: FontWeight.w600,
+            )),
+            const SizedBox(height: 8),
+            Text('缩略图长期保留；到期后清理原图与视频封面。',
+                style: TextStyle(color: palette.textSecondary, fontSize: 12)),
+            const SizedBox(height: 12),
+            ...options.map((days) => ListTile(
+                  title: Text('$days 天', style: TextStyle(
+                    color: days == _retentionDays
+                        ? palette.accent : palette.textPrimary,
+                  )),
+                  trailing: days == _retentionDays
+                      ? Icon(Icons.check, color: palette.accent, size: 20)
+                      : null,
+                  onTap: () => Navigator.pop(ctx, days),
+                )),
+          ],
+        ),
+      ),
+    );
+    if (chosen == null) return;
+    await _cache.setCacheRetentionDays(chosen);
+    await VideoThumbnailService.instance.clearExpiredCache();
+    await _refresh();
+  }
+
   @override
   Widget build(BuildContext context) {
     return _Section(
@@ -561,16 +616,27 @@ class _CacheSectionState extends State<_CacheSection> {
       children: [
         _SettingsRow(
           title: '已用缓存',
-          subtitle: _size == null ? '统计中…' : _formatBytes(_size!),
+          subtitle: _size == null
+              ? '统计中…'
+              : '照片 ${_formatBytes(_originalSize + _thumbnailSize)} · 视频 ${_formatBytes(_videoSize)}',
+        ),
+        _SettingsRow(
+          title: '照片缓存明细',
+          subtitle: '缩略图 ${_formatBytes(_thumbnailSize)} · 原图 ${_formatBytes(_originalSize)}',
         ),
         _SettingsRow(
           title: '缓存上限',
-          subtitle: _limit == null ? '统计中…' : _formatBytes(_limit!),
+          subtitle: _limit == null ? '统计中…' : '${_formatBytes(_limit!)}（照片缓存）',
           onTap: _pickLimit,
         ),
         _SettingsRow(
+          title: '自动清理周期',
+          subtitle: _retentionDays == null ? '读取中…' : '原图与视频封面保留 ${_retentionDays!} 天；缩略图长期保留',
+          onTap: _pickRetention,
+        ),
+        _SettingsRow(
           title: '清除缓存',
-          subtitle: _busy ? '正在清理…' : '删除所有已缓存的缩略图与原图',
+          subtitle: _busy ? '正在清理…' : '删除照片和视频封面缓存',
           showDivider: false,
           onTap: _busy ? null : _clearCache,
         ),
